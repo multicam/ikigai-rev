@@ -5,6 +5,8 @@ You're joining a codebase you've never seen before. This guide is your method fo
 
 The specifications you produce are how you build your understanding. They're also how you communicate that understanding to others. Treat them as the source of truth for behavior.
 
+You must not ask for topics to explore, you have to apply the following instructions.
+
 ---
 
 ## Core Principle

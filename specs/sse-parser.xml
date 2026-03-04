@@ -1,0 +1,196 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<specification topic="SSE Parser">
+
+  <topic-statement>
+    The SSE parser processes a stream of raw byte chunks into discrete, parsed
+    Server-Sent Events.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Parser creation, data accumulation, event extraction, and done-marker
+      detection.
+    </in-scope>
+
+    <boundary name="Streaming data source">
+      The caller delivers raw byte chunks of any size, in any order, at any
+      time. The parser makes no assumptions about chunk boundaries. The source
+      of those bytes — HTTP response body, file, pipe — is outside scope.
+    </boundary>
+
+    <boundary name="Event consumer">
+      The caller receives extracted events and decides what to do with them.
+      How events are interpreted, routed, or acted upon is outside scope.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Parser state">
+      <field name="buffer" type="byte array" note="accumulates all fed data; null-terminated; grows but never shrinks" />
+      <field name="current length" type="unsigned integer" note="number of valid bytes in the buffer" />
+      <field name="capacity" type="unsigned integer" note="total allocated size of the buffer" />
+    </contract>
+
+    <contract name="Event">
+      <field name="event type" type="text" required="false" nullable="true" note="null when no event: field appeared in the event block" />
+      <field name="data" type="text" required="false" nullable="true" note="null when no data: field appeared in the event block" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <parser-creation order="1">
+      A new parser is created with an internal buffer pre-allocated at 4096
+      bytes. The buffer is zeroed, the current length is set to zero, and the
+      buffer is null-terminated. The capacity is recorded as 4096.
+
+      If memory allocation fails at any point during creation, the process
+      aborts immediately. No error is returned.
+    </parser-creation>
+
+    <data-accumulation order="2">
+      Raw byte data of a specified length is appended to the parser's internal
+      buffer.
+
+      <zero-length-feed order="1">
+        If the specified length is zero, the operation completes immediately
+        with no change to the buffer, regardless of what the data pointer
+        contains.
+      </zero-length-feed>
+
+      <buffer-growth order="2">
+        Before appending, the parser checks whether the current buffer can hold
+        the incoming data plus a null terminator. If not, the capacity is
+        doubled repeatedly until the buffer is large enough. The buffer is then
+        reallocated at the new capacity. If reallocation fails, the process
+        aborts immediately. The buffer never shrinks — capacity only increases.
+      </buffer-growth>
+
+      <byte-copy order="3">
+        The incoming bytes are copied verbatim into the buffer immediately
+        after any existing data. The current length is increased by the number
+        of bytes fed. A null terminator is written at the new end position,
+        maintaining the buffer as a valid C string even though the content may
+        contain arbitrary bytes.
+      </byte-copy>
+    </data-accumulation>
+
+    <event-extraction order="3">
+      The parser scans its buffer for the earliest event-terminating delimiter
+      and, when one is found, extracts and returns a parsed event. If no
+      complete event is available, nothing is returned.
+
+      <delimiter-detection order="1">
+        Two delimiter forms are recognized: a pair of line feeds (`\n\n`,
+        consuming 2 bytes) and a pair of CRLF sequences (`\r\n\r\n`,
+        consuming 4 bytes). The parser searches for both simultaneously.
+
+        The delimiter that appears earliest in the buffer is used. When only
+        one form is present, that form is used. When both are present, the one
+        at a lower byte offset wins. If neither delimiter is present, nothing
+        is returned and the buffer is unchanged.
+
+        <notable reason="CRLF cannot be confused with LF">
+          The two-byte sequence `\r\n\r\n` does not contain `\n\n` as a
+          substring, because the character at offset 2 within `\r\n\r\n` is
+          `\r`, not `\n`. The two searches are therefore always independent and
+          never refer to overlapping positions.
+        </notable>
+      </delimiter-detection>
+
+      <buffer-consumption order="2">
+        Once a delimiter is chosen, the event text is defined as all bytes
+        before the delimiter's starting position. The consumed region — event
+        text plus delimiter — is removed from the buffer. Any bytes that
+        follow the delimiter are shifted to the beginning of the buffer, and
+        the current length is updated accordingly. Capacity is not changed.
+      </buffer-consumption>
+
+      <line-parsing order="3">
+        The event text is split into lines by scanning for `\n` characters
+        only. Each line is classified by its prefix:
+
+        <event-field-line order="1">
+          A line at least 6 characters long that begins with the literal text
+          `event:` causes the event type field to be set. The characters
+          immediately after `event:` form the value. If the first of those
+          characters is a space, exactly one space is stripped. All remaining
+          characters up to the end of the line become the event type value. If
+          the event block contains multiple `event:` lines, each one replaces
+          the previous value; the last `event:` line in the block determines
+          the final event type.
+
+          <notable reason="carriage return included in value">
+            Line splitting uses only `\n` as a separator. If a line ends with
+            `\r\n` (CRLF), the `\r` is included in the computed line length
+            and therefore becomes part of the extracted event type value. For
+            example, an event block terminated by `\r\n\r\n` whose internal
+            lines are also CRLF-terminated will produce an event type that ends
+            with a carriage return character.
+          </notable>
+        </event-field-line>
+
+        <data-field-line order="2">
+          A line at least 5 characters long that begins with the literal text
+          `data:` contributes to the data payload. The characters immediately
+          after `data:` form the content. If the first of those characters is a
+          space, exactly one space is stripped. All remaining characters up to
+          the end of the line are the content for this line.
+
+          The first `data:` line in a block initializes the data payload to
+          that content. Each subsequent `data:` line appends a single `\n`
+          character followed by the new content to the payload. The final data
+          value is the concatenation of all data lines, joined by `\n`.
+
+          A `data:` line with no characters after the colon (or only a single
+          space that is stripped) contributes an empty string to the payload.
+          If it is the first data line, the payload is initialized to an empty
+          string. If it is a subsequent line, a `\n` followed by an empty
+          string is appended (adding a trailing newline to the existing
+          payload).
+
+          <notable reason="carriage return included in value">
+            The same carriage return inclusion described for event-field lines
+            applies to data lines when internal lines use CRLF endings.
+          </notable>
+        </data-field-line>
+
+        <unrecognized-lines order="3">
+          Any line that does not meet the `event:` prefix condition and does
+          not meet the `data:` prefix condition is silently ignored. This
+          includes lines shorter than 5 characters, comment lines beginning
+          with `:`, and lines beginning with any other field name such as `id:`
+          or `retry:`.
+        </unrecognized-lines>
+      </line-parsing>
+
+      <empty-event order="4">
+        When the delimiter appears at the very start of the buffer (event text
+        length is zero), the extracted event has a null event type and null
+        data. No lines are processed.
+      </empty-event>
+
+      <returned-event order="5">
+        The returned event is allocated on the caller-provided memory context.
+        Its event type field and data field, when present, are also owned by
+        that same event object and are released when the event is released. The
+        event type is null when no `event:` line appeared in the block. The
+        data is null when no `data:` line appeared in the block.
+      </returned-event>
+    </event-extraction>
+
+    <done-marker-detection order="4">
+      An event is tested to determine whether it signals end-of-stream.
+
+      If the event's data field is null, the result is false.
+
+      If the event's data field is exactly the 6-character string `[DONE]`
+      (case-sensitive, with no leading or trailing whitespace), the result is
+      true.
+
+      For any other data value, the result is false.
+    </done-marker-detection>
+
+  </behavior>
+
+</specification>
