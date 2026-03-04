@@ -1,0 +1,120 @@
+<specification topic="Database Connection">
+
+  <topic-statement>
+    The database connection system establishes and manages a PostgreSQL connection,
+    applies schema migrations on initialization, and suppresses all server notices
+    for the lifetime of the connection.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Connection string validation, connection establishment, notice processor
+      installation, automatic schema migration, transaction control, and
+      connection teardown via memory-managed lifecycle.
+    </in-scope>
+
+    <boundary name="Schema Migration">
+      How SQL migration scripts are discovered and applied is handled by the
+      database migration subsystem. This topic invokes migration but does not
+      implement it.
+    </boundary>
+
+    <boundary name="PostgreSQL">
+      Actual TCP/socket connection management, authentication, and protocol
+      handling are delegated entirely to the libpq client library.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Connection Context">
+      <field name="connection" type="opaque handle" note="the established PostgreSQL connection; null before initialization or after teardown" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <initialization order="1">
+      Two initialization paths are available. The standard path accepts a data
+      directory and constructs the migrations directory path automatically as
+      a subdirectory named "migrations" within it. The test path accepts an
+      explicit migrations directory, bypassing the construction step. Both
+      paths converge on the same connection and migration logic.
+
+      <connection-string-validation order="1">
+        The connection string must be non-empty and must begin with one of the
+        recognized prefixes: "postgresql://", "postgres://", or a key-value
+        format recognized by the PostgreSQL library. If the string is empty or
+        does not match a recognized format, an error is returned immediately
+        without attempting a connection.
+      </connection-string-validation>
+
+      <connection-establishment order="2">
+        The connection string is passed verbatim to the PostgreSQL client
+        library. No parameter manipulation, DNS pre-resolution, or connection
+        string transformation is performed. If the library reports the connection
+        as not successfully established, the library's own error message is
+        returned as the error detail.
+
+        <notable reason="no retry or reconnection">
+          Connection establishment is a single attempt. There is no retry loop,
+          exponential backoff, or automatic reconnection after failures or
+          disconnects.
+        </notable>
+      </connection-establishment>
+
+      <notice-suppression order="3">
+        Immediately after connection, a notice processor is installed that
+        silently discards all server notices, warnings, and informational
+        messages. No notice is logged, counted, or passed to any observer.
+
+        <notable reason="suppression is total and irreversible">
+          All PostgreSQL notice output is suppressed for the duration of the
+          connection. There is no mechanism to re-enable notices or to selectively
+          suppress by severity or message content. This prevents server notices
+          from appearing on standard error, which would corrupt the terminal
+          display in alternate screen buffer mode.
+        </notable>
+      </notice-suppression>
+
+      <schema-migration order="4">
+        After a successful connection, schema migrations are applied
+        automatically. If migration fails, the connection context is released
+        and the migration error is returned to the caller. There is no option
+        to skip migration during initialization.
+
+        <shared topic="Database Schema Migration">
+          Pending migration scripts are discovered in the migrations directory,
+          sorted by their numeric prefix, and applied in order against the
+          established connection. Only scripts with numbers greater than the
+          current schema version are applied.
+        </shared>
+      </schema-migration>
+    </initialization>
+
+    <transaction-control order="2">
+      Three explicit transaction operations are supported:
+
+      - Begin: starts a new transaction.
+      - Commit: commits the current transaction.
+      - Rollback: rolls back the current transaction.
+
+      Each operation executes the corresponding SQL statement and returns a
+      result indicating success or failure. No implicit transaction management
+      is performed; callers are responsible for balancing begin, commit, and
+      rollback.
+    </transaction-control>
+
+    <connection-teardown order="3">
+      The connection context is tied to the memory hierarchy of the allocating
+      component. When the owning memory context is released, a registered
+      cleanup function automatically closes the PostgreSQL connection and
+      nulls the internal handle. No explicit teardown call is required.
+
+      If the connection handle is already null at teardown time (for example,
+      if initialization failed partway through), the cleanup function is a
+      no-op.
+    </connection-teardown>
+
+  </behavior>
+
+</specification>

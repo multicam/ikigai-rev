@@ -1,0 +1,110 @@
+<specification topic="Fork Argument Parsing">
+
+  <topic-statement>
+    The fork argument parsing system extracts an optional model override and
+    an optional system prompt from the raw argument string of the fork
+    command, and applies or inherits provider configuration for the child
+    agent.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Tokenization of fork command arguments, extraction of the model
+      specification flag and the quoted prompt string, validation of argument
+      syntax, application of a model override to a child agent, and
+      inheritance of provider configuration from a parent agent.
+    </in-scope>
+
+    <boundary name="Agent Fork">
+      How the child agent is created, how its conversation history is
+      initialized, and how it is integrated into the REPL are handled by the
+      agent fork subsystem. This topic covers only the argument parsing phase
+      and the resulting configuration changes to the child agent record.
+    </boundary>
+
+    <boundary name="Model Selection">
+      How model names are parsed into provider and thinking-level components
+      is delegated to the model selection subsystem.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Fork Arguments">
+      <field name="model specification" type="string or absent" note="value following the --model flag; absent if flag not present" />
+      <field name="system prompt" type="string or absent" note="content extracted from between double quotes; absent if no quoted string present" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <argument-parsing order="1">
+      The raw argument string is tokenized to extract two optional components:
+      a model specification and a quoted system prompt. The two components may
+      appear in either order.
+
+      The model specification is indicated by the flag "--model" followed by
+      a whitespace-delimited token. If "--model" appears without a following
+      token, a syntax error is returned.
+
+      The system prompt is enclosed in double quotes. The content between the
+      opening and closing quote is extracted verbatim. If an opening quote is
+      present without a matching closing quote, a syntax error is returned.
+      An empty quoted string (two adjacent double-quote characters) is valid
+      and produces an empty prompt string.
+
+      Any non-whitespace text that is neither part of the "--model" flag, its
+      value, nor a quoted string is treated as a syntax error.
+
+      <notable reason="parsing is order-independent">
+        The "--model" flag and the quoted string may appear in any order
+        relative to each other. "/fork --model gpt-x \"prompt\"" and
+        "/fork \"prompt\" --model gpt-x" are equivalent.
+      </notable>
+
+      <notable reason="empty argument string is valid">
+        An absent or whitespace-only argument string is accepted without error.
+        Both the model specification and the system prompt are treated as
+        absent.
+      </notable>
+    </argument-parsing>
+
+    <model-override-application order="2">
+      When a model specification is present in the parsed arguments, it is
+      applied to the child agent. The specification is parsed by the model
+      selection subsystem to extract a provider identifier, a model name, and
+      an optional thinking level.
+
+      If the model name is not recognized, an error is returned. If a thinking
+      level is specified, it is applied to the child agent. If no thinking
+      level is specified, the child agent's thinking level is not modified at
+      this stage.
+
+      The child agent's provider and model fields are updated to the resolved
+      values.
+
+      <notable reason="thinking level is conditional">
+        The model specification string may optionally include a thinking level
+        in the form "model/level". If the level component is absent, the child
+        agent's existing thinking level is preserved.
+      </notable>
+    </model-override-application>
+
+    <provider-config-inheritance order="3">
+      When no model specification is present in the parsed arguments, the
+      child agent inherits the parent agent's provider configuration. The
+      parent's provider identifier, model name, and thinking level are copied
+      to the child agent.
+
+      If either the parent's provider or model field is absent (null), that
+      field is not copied.
+
+      <notable reason="root agents may have null provider and model">
+        A parent agent that has not yet made an LLM request may have null
+        provider and model fields. Inheritance skips null fields silently,
+        leaving the child with no provider or model configured.
+      </notable>
+    </provider-config-inheritance>
+
+  </behavior>
+
+</specification>

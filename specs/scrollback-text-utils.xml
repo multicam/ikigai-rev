@@ -1,0 +1,89 @@
+<specification topic="Scrollback Text Utilities">
+
+  <topic-statement>
+    The scrollback text utilities measure the visible display width of text
+    by excluding ANSI control sequences and applying Unicode character widths.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Display width calculation with ANSI sequence exclusion, newline counting,
+      trailing whitespace trimming, and warning-formatted string construction.
+    </in-scope>
+
+    <boundary name="ANSI Parsing">
+      Detection of CSI escape sequence boundaries is delegated to the ANSI
+      parsing subsystem. This topic uses that detection but does not implement it.
+    </boundary>
+
+    <boundary name="Scrollback Buffer">
+      Where and how the returned widths and formatted strings are used in
+      display layout is handled by the scrollback buffer and layout subsystems.
+    </boundary>
+  </scope>
+
+  <behavior>
+
+    <display-width-calculation order="1">
+      The visible display width of a text string is measured by walking the
+      string byte by byte and applying the following logic at each position:
+
+      1. If the current position begins an ANSI CSI escape sequence, the
+         entire sequence is skipped. No width is counted for it. Scanning
+         resumes after the sequence ends.
+      2. Otherwise, the Unicode codepoint at the current position is decoded
+         from its UTF-8 encoding. The codepoint's display width is added to
+         the running total:
+         - Combining characters and other zero-width codepoints contribute 0.
+         - Narrow characters contribute 1.
+         - Wide characters (such as CJK ideographs and many emoji) contribute 2.
+         - Newline characters are explicitly excluded and contribute 0.
+      3. If a byte sequence is not valid UTF-8, the invalid portion is treated
+         as a single character of width 1, and scanning advances by one byte.
+
+      The result is the sum of all per-codepoint widths, excluding ANSI
+      sequences and newlines.
+
+      <notable reason="ANSI sequences are completely invisible to width calculation">
+        Terminal color and formatting codes embedded in the text do not
+        affect the measured width. The display width reflects only the
+        printable characters a terminal would render.
+      </notable>
+    </display-width-calculation>
+
+    <newline-counting order="2">
+      The number of newline characters in a string is counted by a separate
+      pass that applies the same ANSI-skipping logic. CSI sequences are skipped
+      before codepoint decoding, so escape sequences that happen to contain
+      bytes with the value of a newline are not counted as newlines.
+
+      Only the literal newline character is counted. Carriage returns and other
+      line-ending variants are not counted.
+    </newline-counting>
+
+    <trailing-whitespace-trimming order="3">
+      Trailing whitespace is removed from a string by scanning backward from
+      the end and removing space, tab, newline, and carriage return characters.
+      The scan stops at the first character that is not one of these four byte
+      values.
+
+      If the input is null or empty, an empty string is returned. The operation
+      affects only the trailing portion of the string; leading whitespace and
+      internal whitespace are preserved.
+    </trailing-whitespace-trimming>
+
+    <warning-formatting order="4">
+      A warning string is constructed by prepending a warning symbol and a
+      space to the provided text. If color output is enabled and a color code
+      has been configured, the result is wrapped in ANSI 256-color terminal
+      escape sequences using the configured color, with a reset sequence
+      appended. If color output is disabled or no color code is configured,
+      the plain symbol-prefixed string is returned without escape sequences.
+
+      The warning symbol is the Unicode warning sign character (⚠). The
+      input text must not be null.
+    </warning-formatting>
+
+  </behavior>
+
+</specification>

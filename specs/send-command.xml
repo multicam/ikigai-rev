@@ -1,0 +1,108 @@
+<specification topic="Send Command">
+
+  <topic-statement>
+    The send command delivers a text message to a named agent's mailbox and
+    wakes the recipient via a best-effort PostgreSQL notification.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Argument parsing, message body size enforcement, in-memory recipient
+      validation, database recipient status validation, mail insertion, and
+      conditional notification.
+    </in-scope>
+
+    <boundary name="Mail Storage">
+      How the message is persisted in the database is handled by the mail
+      storage subsystem. This topic invokes insertion but does not implement it.
+    </boundary>
+
+    <boundary name="Database Notifications">
+      The PostgreSQL NOTIFY mechanism is used to wake a waiting recipient. The
+      notification channel semantics and consumption are out of scope.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Send Command Arguments">
+      <field name="recipient identifier" type="string" note="agent UUID or unique prefix; extracted from command arguments" />
+      <field name="message body" type="string" note="quoted string; maximum 4095 bytes" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <argument-parsing order="1">
+      The command arguments are parsed in the form: a recipient identifier
+      followed by a double-quoted message body. Leading and trailing whitespace
+      between the two parts is skipped.
+
+      The message body must be enclosed in double quotes. If the opening or
+      closing quote is absent, a usage error is appended to the scrollback and
+      the command completes without sending.
+
+      The message body is extracted verbatim from between the quotes. If the
+      body length reaches 4095 bytes (not counting the closing quote), a size
+      error is appended to the scrollback and the command completes without
+      sending.
+
+      <notable reason="4095-byte hard limit">
+        The maximum body length is enforced by a fixed-size stack buffer. A
+        body of exactly 4095 characters is the maximum accepted; a body of
+        4096 or more bytes is rejected.
+      </notable>
+    </argument-parsing>
+
+    <in-memory-recipient-lookup order="2">
+      The recipient identifier is looked up in the current REPL's loaded
+      agent list. If no matching agent is found, an error is appended to the
+      scrollback and the command completes.
+
+      <notable reason="in-memory lookup does not filter by session">
+        Agents from other sessions that are currently loaded in the REPL are
+        eligible recipients. The in-memory lookup is not session-scoped.
+      </notable>
+    </in-memory-recipient-lookup>
+
+    <database-recipient-validation order="3">
+      The recipient agent's record is retrieved from the database. If the
+      agent does not exist in the database, an error is returned. If the
+      agent's status is not "running", delivery is refused with a "recipient
+      is dead" error. Only running agents may receive mail.
+    </database-recipient-validation>
+
+    <message-body-validation order="4">
+      An empty message body (zero bytes after parsing) is rejected. An error
+      is returned without inserting any database record.
+    </message-body-validation>
+
+    <mail-insertion order="5">
+      A mail message is created with the sender's identifier, the recipient's
+      identifier, the body text, and a timestamp set to the current Unix time.
+      The message is inserted into the mail storage. If insertion fails, an
+      error is returned.
+    </mail-insertion>
+
+    <recipient-notification order="6">
+      After successful insertion, a PostgreSQL NOTIFY is sent on the channel
+      named for the recipient agent, using the payload "mail". This wakes any
+      recipient that is blocking in a wait operation.
+
+      The NOTIFY is sent only when the database connection is not currently
+      inside a transaction. If the connection is in a transaction, the
+      notification is silently skipped.
+
+      If the NOTIFY itself fails, the error is silently discarded. Message
+      delivery via the mailbox is considered successful regardless of whether
+      the notification was sent.
+
+      <notable reason="notification is best-effort">
+        A recipient blocked in a wait operation discovers the message on its
+        next polling interval (up to 50 milliseconds) if the notification was
+        not delivered. No retry of the notification is attempted.
+      </notable>
+    </recipient-notification>
+
+  </behavior>
+
+</specification>

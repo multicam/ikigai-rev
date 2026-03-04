@@ -1,0 +1,97 @@
+<specification topic="Agent List">
+
+  <topic-statement>
+    The agent list command queries the database for all agents in the current
+    session and displays them as a formatted tree showing their hierarchy,
+    status, and count.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Database query for session agents, breadth-first tree traversal for
+      display ordering, per-agent line formatting, depth-based indentation,
+      status indicators, and scrollback output.
+    </in-scope>
+
+    <boundary name="Agent Database Layer">
+      How agents are stored and retrieved from the database is handled by the
+      agent database layer. This topic invokes that layer but does not
+      implement it.
+    </boundary>
+  </scope>
+
+  <behavior>
+
+    <database-query order="1">
+      All agents belonging to the current session are retrieved from the
+      database. The query returns both running and dead agents. Any arguments
+      supplied to the command are ignored.
+    </database-query>
+
+    <tree-traversal order="2">
+      The agents are arranged into a tree using breadth-first traversal. Root
+      agents — those with no parent — are enqueued first. For each dequeued
+      agent, its children are found by scanning the full agent list for agents
+      whose parent identifier matches the current agent's identifier. Those
+      children are enqueued after their parent, along with a depth value one
+      greater than the parent's depth. Root agents have depth zero.
+
+      This traversal produces a display order in which each agent appears
+      immediately before its subtree.
+
+      <notable reason="O(N²) child search">
+        Finding children of each agent requires scanning the entire agent list.
+        No index is maintained. The traversal cost grows quadratically with the
+        number of agents in the session.
+      </notable>
+    </tree-traversal>
+
+    <line-formatting order="3">
+      Each agent is formatted as a single line appended to the current agent's
+      scrollback.
+
+      Root agents (depth zero) receive a marker prefix character: an asterisk
+      if the agent is also the current active agent, or a space otherwise.
+      They are followed by their full UUID and the literal label " - root".
+
+      Non-root agents (depth one or greater) are indented with four spaces per
+      depth level (counting from one), then prefixed with "+-- ", followed by
+      their full UUID.
+
+      Dead agents have " [dead]" appended after their UUID.
+
+      <notable reason="256-byte line buffer">
+        Each line is assembled into a 256-byte fixed buffer. If a combination
+        of indentation and UUID content exceeds this limit, the line is silently
+        truncated.
+      </notable>
+    </line-formatting>
+
+    <header-and-summary order="4">
+      A header line reading "Agent Hierarchy:" is appended to the scrollback
+      before the agent lines. After all agent lines, a summary line is appended
+      in the format "N running, M dead", where N and M are counts accumulated
+      during the traversal.
+    </header-and-summary>
+
+    <data-source order="5">
+      The display is built from the database query result, not from the
+      in-memory agent list. Agents that have been reaped (and thus removed
+      from memory) do not appear. Agents from other sessions do not appear.
+
+      <notable reason="database is authoritative">
+        Using the database as the source of truth means the display reflects
+        the persisted state, including agents that may not be loaded in the
+        current REPL instance.
+      </notable>
+    </data-source>
+
+    <error-behavior order="6">
+      If the database query fails, an error is returned and no output is
+      appended to the scrollback. If any scrollback append fails, an error is
+      returned immediately.
+    </error-behavior>
+
+  </behavior>
+
+</specification>

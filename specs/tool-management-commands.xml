@@ -1,0 +1,104 @@
+<specification topic="Tool Management Commands">
+
+  <topic-statement>
+    The tool management commands allow the user to inspect the active tool
+    registry and reload it from disk, updating the set of tools available to
+    the LLM.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      The inspect command (listing all tools or showing a single tool's
+      schema) and the refresh command (clearing and rebuilding the registry
+      from tool discovery and internal tool registration).
+    </in-scope>
+
+    <boundary name="Tool Discovery">
+      How external tool executables are located in the file system and how
+      their schemas are obtained by invoking them is handled by the tool
+      discovery subsystem.
+    </boundary>
+
+    <boundary name="Tool Registry">
+      How the registry is structured, how entries are stored and sorted, and
+      how lookups are performed is handled by the tool registry subsystem.
+    </boundary>
+
+    <boundary name="Document Cache">
+      How the per-agent document cache stores and retrieves previously fetched
+      documents is out of scope. The refresh command clears the cache but does
+      not implement it.
+    </boundary>
+  </scope>
+
+  <behavior>
+
+    <inspect-command order="1">
+      The inspect command displays information about the tool registry.
+
+      <list-mode order="1">
+        When invoked with no argument, all registered tools are listed. For
+        each tool, the name and path are shown. Internal tools show a fixed
+        "(internal)" placeholder in place of a filesystem path. If the
+        registry contains no tools, a message indicating no tools are
+        available is displayed instead of a list.
+      </list-mode>
+
+      <detail-mode order="2">
+        When invoked with a tool name as its argument, the schema of the named
+        tool is displayed in pretty-printed JSON format, preceded by the tool's
+        name and path. If the named tool is not found in the registry, a
+        message indicating the tool was not found is displayed. A tool not
+        found condition is not treated as an error; the command returns
+        successfully.
+      </detail-mode>
+
+      All output is appended to the current agent's scrollback.
+    </inspect-command>
+
+    <refresh-command order="2">
+      The refresh command rebuilds the tool registry and clears the document
+      cache.
+
+      <registry-reset order="1">
+        All entries are removed from the tool registry, leaving it empty.
+      </registry-reset>
+
+      <cache-reset order="2">
+        The current agent's document cache is cleared. This ensures that any
+        cached tool schemas are evicted and will be re-fetched on the next
+        access.
+      </cache-reset>
+
+      <rediscovery order="3">
+        Tool discovery is run across the three tool directories (system, user,
+        and project). Each qualifying tool executable is invoked to obtain its
+        schema and is added to the registry.
+      </rediscovery>
+
+      <internal-tool-registration order="4">
+        The built-in internal tools are registered after external discovery
+        completes. An internal tool with the same name as a discovered external
+        tool replaces it.
+      </internal-tool-registration>
+
+      <sort order="5">
+        The registry is sorted alphabetically by tool name after all tools are
+        registered.
+      </sort>
+
+      <reporting order="6">
+        A message reporting the total number of tools now in the registry is
+        appended to the current agent's scrollback.
+      </reporting>
+
+      <notable reason="refresh rebuilds from the filesystem">
+        The refresh command reflects changes to tool executables on disk
+        since the last initialization or refresh. New tools become visible,
+        removed tools disappear, and updated schemas take effect.
+      </notable>
+    </refresh-command>
+
+  </behavior>
+
+</specification>

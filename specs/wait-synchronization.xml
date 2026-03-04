@@ -1,0 +1,215 @@
+<specification topic="Wait Synchronization">
+
+  <topic-statement>
+    The wait synchronization system blocks the calling agent until a message
+    arrives from any sender or until a specified set of target agents each
+    reach a terminal state.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Two wait modes (next-message and fan-in), PostgreSQL LISTEN/NOTIFY setup
+      and teardown, poll loop with select and timeout, interrupted-turn detection,
+      fan-in state tracking per target agent, and result rendering.
+    </in-scope>
+
+    <boundary name="Mailbox">
+      Whether a message exists in the mailbox, and reading or deleting that
+      message, is delegated to the mail storage layer. This topic queries the
+      mailbox but does not implement it.
+    </boundary>
+
+    <boundary name="Agent State">
+      Whether a target agent is idle or dead is read from the agent record.
+      How that record is updated is outside this scope.
+    </boundary>
+
+    <boundary name="REPL Threading">
+      How the REPL detects that a background tool thread has completed and
+      invokes the completion callback is handled by the REPL event loop.
+      This topic participates in that protocol but does not implement it.
+    </boundary>
+
+    <boundary name="Scrollback Rendering">
+      How the formatted result strings are displayed to the user is handled
+      by the event rendering layer.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Next-Message Result">
+      <field name="from identifier" type="string" nullable="true" note="UUID of the agent that sent the message; null on timeout or error" />
+      <field name="message" type="string" note="message body, or a status string such as 'Timeout' or 'Interrupted'" />
+    </contract>
+
+    <contract name="Fan-in Entry">
+      <field name="agent identifier" type="string" note="UUID of the target agent" />
+      <field name="agent name" type="string" note="display name of the target agent; 'undefined' if lookup failed" />
+      <field name="status" type="string" note="one of: running, received, idle, dead" />
+      <field name="message" type="string" nullable="true" note="message body; only present when status is 'received'" />
+    </contract>
+
+    <contract name="Fan-in Result">
+      <field name="entries" type="array of Fan-in Entry" note="one entry per target agent, in the order targets were specified" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <invocation order="1">
+      The wait command is invoked with an optional timeout (in seconds) and an
+      optional list of target agent identifiers. When no targets are listed,
+      next-message mode is used. When one or more targets are listed, fan-in
+      mode is used. Execution is dispatched to a background thread so the REPL
+      remains responsive. The calling agent's state transitions to executing-tool
+      for the duration of the wait.
+    </invocation>
+
+    <next-message-mode order="2">
+      In next-message mode, the system waits for any message sent to the calling
+      agent's mailbox from any sender.
+
+      <setup order="1">
+        A PostgreSQL notification channel is registered for the calling agent.
+        The mailbox is checked immediately before entering the poll loop. If a
+        message is already present, it is consumed and the wait completes without
+        entering the loop.
+      </setup>
+
+      <poll-loop order="2">
+        The poll loop repeats until a message is received, the timeout expires,
+        or the interrupted flag is set.
+
+        Each iteration:
+        1. The interrupted flag is checked. If true, the wait ends with the text
+           "Interrupted" as the result message and a null sender.
+        2. Elapsed time is calculated using a monotonic clock. If the timeout
+           has expired, the wait ends with the text "Timeout" as the result
+           message and a null sender.
+        3. A file descriptor watch is set on the database connection socket with
+           a timeout capped at 50 milliseconds. If the watch returns a socket
+           error (other than an interrupted system call), the loop exits.
+        4. Pending database notifications are consumed from the connection.
+        5. The mailbox is checked. If a message is present, it is consumed, the
+           sender identifier and message body are recorded, and the loop exits.
+
+        <notable reason="mailbox is polled regardless of notification">
+          The mailbox is checked after every socket event and after every 50
+          millisecond poll interval expiration, whether or not a notification
+          was received. The notification is used only to wake the socket watch
+          early; the actual message is always retrieved by querying the mailbox.
+        </notable>
+
+        <notable reason="notification payload is discarded">
+          The content of any PostgreSQL notification payload is stored in a local
+          context structure but never read or acted upon. Only the fact that the
+          socket became readable triggers the mailbox check.
+        </notable>
+      </poll-loop>
+
+      <teardown order="3">
+        The notification channel registration is cancelled before the function
+        returns, regardless of the exit reason.
+      </teardown>
+    </next-message-mode>
+
+    <fan-in-mode order="3">
+      In fan-in mode, the system waits until each target agent has either sent
+      a message to the calling agent's mailbox, entered an idle state, or died.
+
+      <setup order="1">
+        A notification channel is registered for the calling agent. A notification
+        channel is also registered for each target agent. The result entries array
+        is initialized with one entry per target agent, all in status "running"
+        and with name "undefined". A batch lookup of target agent display names
+        is attempted; if successful, the "undefined" placeholders are replaced.
+        If the name lookup fails for any reason, the "undefined" values are
+        retained without error.
+      </setup>
+
+      <poll-loop order="2">
+        The poll loop repeats until all targets are resolved, the timeout expires,
+        or the interrupted flag is set.
+
+        Each iteration:
+        1. The interrupted flag is checked. If true, the loop exits immediately.
+           Unresolved targets remain in "running" status.
+        2. Elapsed time is calculated. If the timeout has expired, the loop exits.
+           Unresolved targets remain in "running" status.
+        3. Each target's entry is updated:
+           - If the entry's status is already not "running", it is skipped (the
+             check is idempotent once resolved).
+           - The calling agent's mailbox is checked for a message from this
+             specific target. If found, the message is consumed, the entry status
+             is set to "received", and the message body is stored.
+           - If no message was found, the target agent's record is retrieved. If
+             the agent's status is "dead", the entry status is set to "dead". If
+             the agent is idle, the entry status is set to "idle".
+        4. If all entries have a status other than "running", the loop exits.
+        5. A file descriptor watch is set on the database connection socket with
+           a timeout capped at 50 milliseconds. If an unrecoverable socket error
+           occurs, the loop exits.
+        6. Pending database notifications are consumed.
+
+        <notable reason="50ms timeout minimum">
+          Because the socket watch is capped at 50 milliseconds, a timeout value
+          shorter than 50 milliseconds may not be honored precisely. The first
+          iteration will block for up to 50 milliseconds before recalculating
+          elapsed time.
+        </notable>
+      </poll-loop>
+
+      <teardown order="3">
+        The notification channel registrations for the calling agent and all
+        target agents are cancelled before the function returns.
+      </teardown>
+    </fan-in-mode>
+
+    <result-rendering order="4">
+      After the background thread completes, the completion callback renders
+      the result to the calling agent's scrollback.
+
+      For next-message mode: the sender identifier and message body are rendered
+      as a single entry.
+
+      For fan-in mode: a "Fan-in results:" header is rendered, followed by one
+      line per target entry showing the agent identifier, status, and — when the
+      status is "received" — the message body.
+    </result-rendering>
+
+    <database-connection-failure order="5">
+      If the database socket file descriptor is unavailable after notification
+      channel registration, the notification registration is cancelled and the
+      wait completes immediately. For next-message mode, the result message is
+      set to "Database connection error" with a null sender. For fan-in mode,
+      all notification channels are cancelled and the function returns with
+      entries in their initialized state.
+
+      <notable reason="error is not surfaced as a command error">
+        Database connection failure causes the wait to complete with a sentinel
+        message rather than returning an error result to the REPL. The user sees
+        a result entry rather than an error notification.
+      </notable>
+    </database-connection-failure>
+
+  </behavior>
+
+  <state-transitions>
+    <transition trigger="wait command invoked">
+      Calling agent enters executing-tool state
+    </transition>
+    <transition trigger="background thread completes">
+      Calling agent returns to idle state (via REPL completion callback)
+    </transition>
+    <transition trigger="target sends message (fan-in)">
+      Target entry status transitions from "running" to "received"
+    </transition>
+    <transition trigger="target agent becomes idle (fan-in)">
+      Target entry status transitions from "running" to "idle"
+    </transition>
+    <transition trigger="target agent dies (fan-in)">
+      Target entry status transitions from "running" to "dead"
+    </transition>
+  </state-transitions>
+
+</specification>

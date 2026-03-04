@@ -1,0 +1,118 @@
+<specification topic="Agent Reap">
+
+  <topic-statement>
+    The agent reap system removes dead agents from memory and marks them as
+    reaped in the database, freeing their resources while preserving their
+    audit trail.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Bulk and targeted reap modes, descendant collection, database status
+      updates, in-memory removal, current-agent switching when the active
+      agent or its ancestor is reaped, and result reporting to the scrollback.
+    </in-scope>
+
+    <boundary name="Agent Termination">
+      How an agent is killed and its status set to dead is handled by the
+      agent termination subsystem. Reap operates only on agents that are
+      already dead.
+    </boundary>
+
+    <boundary name="Database">
+      Marking agents as reaped in the database is delegated to the database
+      layer. The reap operation calls into that layer but does not implement
+      the underlying SQL.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Reap Command Arguments">
+      <field name="target identifier" type="string or absent" note="optional agent UUID or unique prefix; absent triggers bulk mode" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <mode-selection order="1">
+      The reap command operates in one of two modes based on whether a target
+      identifier is supplied.
+
+      When no argument is given, bulk mode is used: all dead agents currently
+      loaded in the REPL are collected as victims.
+
+      When an argument is given, targeted mode is used: the argument is
+      matched against the in-memory agent list as a UUID or unique prefix. If
+      no match is found, a warning is appended to the scrollback and the
+      command completes without reaping. If the prefix matches more than one
+      agent, a warning about ambiguity is appended and the command completes
+      without reaping. If the matched agent is not dead, a warning is appended
+      and the command completes without reaping.
+    </mode-selection>
+
+    <bulk-collection order="2">
+      In bulk mode, all agents in the REPL's in-memory agent list whose dead
+      flag is set are collected as victims. If no dead agents are found, a
+      message is appended to the scrollback and the command completes without
+      reaping.
+    </bulk-collection>
+
+    <targeted-collection order="3">
+      In targeted mode, the matched agent and all of its descendants are
+      collected as victims, regardless of whether the descendants are dead or
+      alive. Descendants are collected by depth-first traversal through the
+      in-memory agent list. The collection is bounded at 256 total agents
+      (target plus descendants).
+
+      <notable reason="descendants of a targeted agent are always included">
+        Targeted reap collects both dead and alive descendants of the target.
+        This prevents orphaned subtrees from remaining in memory after their
+        parent is reaped.
+      </notable>
+    </targeted-collection>
+
+    <current-agent-safety-check order="4">
+      Before removing any agent, the system checks whether the current active
+      agent or any of its ancestors appears in the victim list. If so, the
+      current agent must be switched before reaping begins.
+
+      A replacement agent is found by scanning the in-memory agent list for
+      the first agent that is not in the victim list. If no such agent exists,
+      reaping is aborted: a warning is appended to the scrollback and the
+      command returns without making any changes.
+
+      <notable reason="current agent is switched before memory is freed">
+        The active agent is redirected to a surviving agent before any victim
+        is freed. This prevents the REPL from holding a reference to a
+        deallocated agent context.
+      </notable>
+    </current-agent-safety-check>
+
+    <removal order="5">
+      Each victim is processed in the collected order.
+
+      For each victim, the operation checks whether the agent is still present
+      in the in-memory list (a victim may have been removed when its parent
+      was reaped earlier in the same pass). If still present, the agent is
+      removed from the in-memory list and its status is set to reaped in the
+      database. The agent's memory allocation is then freed.
+
+      Database rows are not deleted. Marking an agent as reaped preserves the
+      audit trail while signaling that the agent's in-memory resources have
+      been released.
+    </removal>
+
+    <result-reporting order="6">
+      After all victims are processed, a message is appended to the current
+      agent's scrollback reporting the total number of agents reaped.
+    </result-reporting>
+
+    <error-behavior order="7">
+      If a database operation fails during removal, the error is returned and
+      no further victims are processed. In-memory removal of already-processed
+      victims is not undone.
+    </error-behavior>
+
+  </behavior>
+
+</specification>

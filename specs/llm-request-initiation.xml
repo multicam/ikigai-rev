@@ -1,0 +1,125 @@
+<specification topic="LLM Request Initiation">
+
+  <topic-statement>
+    The LLM request initiation system constructs a user message from typed
+    input, persists it to the database, and starts an asynchronous provider
+    stream that will deliver the model's response.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Model presence check, user message creation and in-memory addition,
+      database persistence of the user message, response state clearing,
+      idle flag update, state transition to waiting, lazy provider
+      initialization, LLM request construction, and async stream start.
+    </in-scope>
+
+    <boundary name="LLM Response Handling">
+      What happens as the stream delivers text and tool call events is handled
+      by the LLM response handling subsystem. This topic covers only the
+      initiation of the request.
+    </boundary>
+
+    <boundary name="Provider Implementation">
+      How each provider constructs HTTP requests, handles authentication, and
+      delivers streaming events is handled by the individual provider
+      implementations. This topic invokes the provider through a standard
+      interface.
+    </boundary>
+
+    <boundary name="Token Cache">
+      How the token cache tracks per-turn token usage is handled by the token
+      cache subsystem. This topic records the start of a new turn.
+    </boundary>
+
+    <boundary name="Newline Dispatch">
+      Whether user input triggers a slash command or an LLM request is decided
+      by the newline action handler. This topic receives only confirmed LLM
+      message text.
+    </boundary>
+  </scope>
+
+  <behavior>
+
+    <model-check order="1">
+      Before any action, the presence of a configured model is verified. If
+      no model is configured, an error message is appended to the scrollback
+      and the function returns. No message is created, no database record is
+      written, and the agent's state is not changed.
+    </model-check>
+
+    <user-message-creation order="2">
+      A user-role message object is created from the input text and added to
+      the agent's in-memory conversation array. If a token cache is present,
+      a new turn marker is recorded in the cache.
+    </user-message-creation>
+
+    <database-persistence order="3">
+      If a database connection and valid session identifier are present, the
+      user message is persisted with kind "user". The persistence record
+      includes JSON metadata containing the model name, temperature, and
+      maximum completion token count drawn from the current configuration.
+
+      If persistence fails, a warning is logged and execution continues.
+      The message already exists in memory and the agent proceeds to contact
+      the provider regardless.
+
+      <notable reason="database failure is non-fatal">
+        A failed database write does not prevent the LLM request from being
+        sent. The in-memory message is the authoritative record; the database
+        is an optional persistence layer at this stage.
+      </notable>
+    </database-persistence>
+
+    <response-state-clearing order="4">
+      The accumulated assistant response text from any previous exchange is
+      discarded. The streaming line buffer is cleared. The tool iteration
+      counter is reset to zero. This prepares the agent to receive a fresh
+      response stream.
+    </response-state-clearing>
+
+    <idle-flag-update order="5">
+      If a database connection is present, the agent's idle flag in the
+      database is set to false, signaling that the agent is actively processing.
+      Errors from this update are ignored.
+    </idle-flag-update>
+
+    <state-transition order="6">
+      The agent transitions to the waiting-for-LLM state. This shows the
+      activity spinner and hides the input buffer in the display.
+    </state-transition>
+
+    <provider-initialization order="7">
+      The provider instance is obtained lazily: if a cached provider exists
+      on the agent, it is reused. If not, a new provider is created based on
+      the agent's configured provider name.
+
+      If provider creation fails (for example, due to missing credentials),
+      the error message is appended to the scrollback, the agent transitions
+      back to idle, and the function returns. No LLM request is sent.
+    </provider-initialization>
+
+    <request-construction order="8">
+      The LLM request is assembled from the agent's current conversation
+      messages, system prompt, tool registry (filtered by any active toolset
+      filter), and thinking level configuration. If request construction fails,
+      the error is appended to the scrollback, the agent transitions to idle,
+      and the function returns.
+    </request-construction>
+
+    <async-stream-start order="9">
+      The provider's stream is started. Two callbacks are registered: one
+      for incoming stream events (text deltas, tool call events, errors, done
+      events), and one for completion. The function returns immediately; the
+      provider operates asynchronously in the background.
+
+      A flag is set on the agent to signal the REPL event loop that an
+      in-progress stream requires polling.
+
+      If stream start fails, the error is appended to the scrollback and the
+      agent transitions to idle.
+    </async-stream-start>
+
+  </behavior>
+
+</specification>

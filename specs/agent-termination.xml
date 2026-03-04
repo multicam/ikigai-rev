@@ -1,0 +1,160 @@
+<specification topic="Agent Termination">
+
+  <topic-statement>
+    The agent termination system kills a target agent and all of its descendants
+    in a single atomic database transaction, then propagates the dead state into
+    memory and notifies waiting parent agents.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Descendant collection, transactional database status updates, audit event
+      recording, in-memory dead-flag propagation, scrollback status messages,
+      parent notification via PostgreSQL NOTIFY, and current-agent switching
+      when the active agent is the kill target.
+    </in-scope>
+
+    <boundary name="Database">
+      Marking agents as dead, inserting audit events, and committing transactions
+      are delegated to the database layer. The schema and transaction guarantees
+      are outside this scope.
+    </boundary>
+
+    <boundary name="Agent Navigation">
+      How the REPL switches the active agent to the parent after a self-kill is
+      implemented by the agent navigation subsystem. This topic invokes the switch
+      but does not implement it.
+    </boundary>
+
+    <boundary name="Inter-agent Messaging">
+      The NOTIFY sent to waiting parent agents travels through the PostgreSQL
+      notification channel. The semantics of that channel and how waiting agents
+      consume it are outside this scope.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Kill Audit Event">
+      <field name="kind" type="string" note="always 'agent_killed'" />
+      <field name="recording agent" type="string" note="UUID of the agent that issued the kill command, not the target" />
+      <field name="killed_by" type="string" note="always 'user'" />
+      <field name="target" type="string" note="UUID of the primary kill target" />
+      <field name="cascade" type="boolean" note="always true" />
+      <field name="count" type="integer" note="total number of agents killed, including all descendants and the target" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <precondition-checks order="1">
+      Before the kill begins, the system waits for any in-progress fork operation
+      to complete by polling until a fork-pending flag clears.
+
+      If no target is specified, the calling agent kills itself. If the calling
+      agent is the root agent (has no parent), self-kill is refused and a warning
+      is appended to the scrollback.
+
+      If a target is specified by identifier, the target is located in the active
+      agent list. If not found, a warning is appended and the command completes
+      without error. If the target is the root agent, the kill is refused and a
+      warning is appended.
+    </precondition-checks>
+
+    <descendant-collection order="2">
+      All descendants of the target are collected through depth-first traversal.
+      Each agent's children are recursed into fully before the agent itself is
+      added to the collection. This produces a bottom-up ordering: leaf descendants
+      appear before their ancestors.
+
+      The collection is bounded at 256 total agents (descendants, excluding the
+      target itself).
+    </descendant-collection>
+
+    <database-transaction order="3">
+      A database transaction is opened. All the following operations are
+      performed within that transaction. If any step fails, the transaction is
+      rolled back and no database changes are applied.
+
+      <mark-descendants-dead order="1">
+        Each collected descendant is marked as dead in the database, in the
+        order they were collected (bottom-up). The dead status includes a
+        termination timestamp.
+      </mark-descendants-dead>
+
+      <mark-target-dead order="2">
+        The primary target agent is marked as dead in the database.
+      </mark-target-dead>
+
+      <record-audit-event order="3">
+        A single audit event of kind "agent_killed" is inserted into the
+        conversation history of the agent that issued the kill command — not
+        the target. The event carries JSON metadata including the target's
+        identifier, the literal string "user" as the killer, the cascade flag
+        set to true, and the total count of killed agents (descendants plus
+        target).
+
+        <notable reason="event is recorded in the killer's history, not the target's">
+          The target agent's own conversation history receives no record of
+          its termination. The kill event appears only in the history of the
+          agent that issued the command.
+        </notable>
+      </record-audit-event>
+
+      <commit order="4">
+        The transaction is committed. If the commit fails, the error is returned.
+        All subsequent in-memory changes proceed only after a successful commit.
+      </commit>
+    </database-transaction>
+
+    <memory-propagation order="4">
+      After the transaction commits, in-memory state is updated.
+
+      <mark-target-dead-in-memory order="1">
+        The target agent's dead flag is set to true. A message describing the
+        termination (including the cascade count) is appended to the target's
+        scrollback. If the target has a parent agent, a PostgreSQL NOTIFY is
+        sent on the parent's notification channel with the payload "dead", to
+        wake any agent waiting for the target to reach a terminal state.
+      </mark-target-dead-in-memory>
+
+      <mark-descendants-dead-in-memory order="2">
+        Each descendant has its dead flag set to true and receives a scrollback
+        message. If the descendant has a parent, a NOTIFY is sent to the parent's
+        channel.
+      </mark-descendants-dead-in-memory>
+
+      <notify-precondition order="3">
+        NOTIFY is sent only when the database connection is in an idle state
+        (not inside a transaction). Because the commit has already completed at
+        this stage, this precondition is normally satisfied.
+
+        <notable reason="NOTIFY failure after successful commit">
+          If NOTIFY fails after the transaction has committed, the function
+          returns an error even though the database changes are permanent and
+          the dead flags are already set in memory. The kill succeeded; only
+          the wakeup notification was lost.
+        </notable>
+      </notify-precondition>
+    </memory-propagation>
+
+    <active-agent-switch order="5">
+      After memory propagation, the REPL context is updated to reflect the
+      current navigation state.
+
+      <self-kill order="1">
+        If the target was the currently active agent, the REPL switches to the
+        parent agent. A message is appended to the parent's scrollback identifying
+        the terminated agent (by a truncated form of its identifier). If no
+        parent exists at this point, an error is returned.
+      </self-kill>
+
+      <descendant-kill order="2">
+        If the target was not the currently active agent, a message is appended
+        to the active agent's scrollback stating how many agents were killed.
+        No navigation change occurs.
+      </descendant-kill>
+    </active-agent-switch>
+
+  </behavior>
+
+</specification>

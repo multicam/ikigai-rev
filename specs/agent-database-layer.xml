@@ -1,0 +1,143 @@
+<specification topic="Agent Database Layer">
+
+  <topic-statement>
+    The agent database layer persists agent lifecycle status transitions,
+    provider configuration, and idle state to PostgreSQL, and retrieves
+    agent records for session restoration and navigation.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Agent record insertion, status transitions (running → dead → reaped),
+      idle flag management, provider and model update, and retrieval queries
+      (single agent, session-scoped list, global list).
+    </in-scope>
+
+    <boundary name="Agent State Machine">
+      When state transitions occur in memory (IDLE, WAITING_FOR_LLM,
+      EXECUTING_TOOL) is managed by the agent state machine. This topic
+      covers only the persistent database representation.
+    </boundary>
+
+    <boundary name="Schema Migration">
+      The agents and messages tables are created by the migration system.
+      This topic assumes the schema exists.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Agent Record">
+      <field name="identifier" type="UUID string" />
+      <field name="name" type="string" nullable="true" />
+      <field name="parent identifier" type="UUID string" nullable="true" note="null for the root agent" />
+      <field name="status" type="string" note="one of: running, dead, reaped" />
+      <field name="created at" type="integer" note="Unix timestamp" />
+      <field name="ended at" type="integer" note="Unix timestamp when marked dead; zero when not yet dead" />
+      <field name="fork message id" type="string" note="identifier of the message in the parent's history at which this agent was forked; zero for the root agent" />
+      <field name="session id" type="integer" />
+      <field name="provider" type="string" nullable="true" />
+      <field name="model" type="string" nullable="true" />
+      <field name="thinking level" type="string" nullable="true" note="one of: low, med, high, min" />
+      <field name="idle" type="boolean" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <agent-insertion order="1">
+      A new agent record is inserted with status "running", the provided
+      identifier, name, parent identifier, session identifier, fork message
+      id, and creation timestamp. The thinking level integer is mapped to
+      a string at insertion time: 1 maps to "low", 2 to "med", 3 to "high",
+      and any other value maps to "min".
+    </agent-insertion>
+
+    <status-transitions order="2">
+
+      <mark-dead order="1">
+        The agent's status is changed to "dead" and an ended-at timestamp is
+        recorded. The update targets only agents whose current status is
+        "running". If the agent is already dead (or reaped), the update
+        matches no rows and the operation succeeds silently without error.
+        This makes the operation idempotent.
+      </mark-dead>
+
+      <mark-reaped order="2">
+        A single named agent's status is changed to "reaped". The update
+        is unconditional: it does not check the agent's current status. Any
+        status value (including "running") is overwritten.
+
+        <notable reason="no current-status guard">
+          Unlike mark-dead, mark-reaped has no precondition on the current
+          status. An agent can be transitioned to "reaped" from any state.
+        </notable>
+      </mark-reaped>
+
+      <reap-all-dead order="3">
+        All agents with status "dead" are updated to status "reaped" in a
+        single bulk operation. No agent identifier is specified; every dead
+        agent in the database is affected.
+      </reap-all-dead>
+
+    </status-transitions>
+
+    <idle-flag order="3">
+      The idle flag is a boolean on each agent record that is independent
+      of the status field. It can be set to either true or false. There is
+      no precondition on the current idle value or on the agent's status.
+      The flag is updated unconditionally by identifier.
+    </idle-flag>
+
+    <provider-update order="4">
+      The provider name, model name, and thinking level for an agent can be
+      updated atomically. Any of the three fields may be null. If the agent
+      identifier does not match any record, the update affects no rows and
+      returns success without error.
+
+      <notable reason="silent no-op on missing agent">
+        The caller cannot distinguish between a successful update and a
+        no-op caused by the agent not existing.
+      </notable>
+    </provider-update>
+
+    <retrieval order="5">
+
+      <get-single-agent order="1">
+        A single agent record is retrieved by identifier. All fields are
+        returned. If no matching record exists, an error is returned. Null
+        ended-at timestamps in the database are coerced to zero in the
+        returned record.
+      </get-single-agent>
+
+      <list-running-agents order="2">
+        All agents with status "running" are returned, ordered by creation
+        timestamp. This query is not scoped to any session; it returns
+        running agents from all sessions in the database. If no running
+        agents exist, an empty result is returned without error.
+      </list-running-agents>
+
+      <list-active-agents order="3">
+        Agents with status "running" or "dead" belonging to a specific
+        session are returned, ordered by creation timestamp. Agents with
+        status "reaped" are excluded. This query is session-scoped.
+
+        <notable reason="session scope differs between list operations">
+          List-running returns agents globally across all sessions, while
+          list-active is confined to a single session. The distinction
+          determines which operation is appropriate for restoration versus
+          session-local display.
+        </notable>
+      </list-active-agents>
+
+      <get-last-message-id order="4">
+        The highest message identifier associated with a given agent is
+        returned by querying the messages table rather than the agents table.
+        If the agent has no messages, zero is returned. This value is used
+        to record the fork point when creating a child agent.
+      </get-last-message-id>
+
+    </retrieval>
+
+  </behavior>
+
+</specification>

@@ -1,0 +1,158 @@
+<specification topic="Shared Context Initialization">
+
+  <topic-statement>
+    The shared context initialization system sets up the terminal, dual
+    database connections, tool registry, and command history in a fixed
+    sequence, with graceful degradation at each optional step.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Terminal initialization (interactive and headless modes), stdout and
+      stderr redirection, render system initialization, dual database
+      connection setup, session identifier placeholder, command history
+      loading, tool discovery and registration, internal tool registration
+      ordering, and memory-managed cleanup registration.
+    </in-scope>
+
+    <boundary name="Tool Discovery">
+      How tool executables are found in the filesystem and registered is
+      handled by the tool discovery subsystem. This topic invokes discovery
+      and provides the directory paths.
+    </boundary>
+
+    <boundary name="Database Connection">
+      How each PostgreSQL connection is established and migrated is handled
+      by the database connection subsystem. This topic provides the connection
+      string and receives connection handles.
+    </boundary>
+
+    <boundary name="Terminal">
+      How raw mode and the alternate screen buffer are configured is handled
+      by the terminal subsystem. This topic initiates terminal setup.
+    </boundary>
+  </scope>
+
+  <behavior>
+
+    <terminal-initialization order="1">
+      Two paths are taken depending on whether a pre-created terminal is
+      provided:
+
+      <headless-path order="1">
+        If a pre-created terminal handle is supplied, it is adopted as-is.
+        Stdout and stderr are not redirected. This path is used when running
+        without a real TTY, allowing the caller to supply a controlled
+        terminal substitute.
+      </headless-path>
+
+      <interactive-path order="2">
+        If no terminal handle is supplied, a new terminal is initialized,
+        putting the TTY into raw mode and entering the alternate screen
+        buffer. If terminal initialization fails, the shared context is
+        released and an error is returned.
+
+        After successful terminal initialization, stdout (file descriptor 1)
+        and stderr (file descriptor 2) are both redirected to /dev/null. This
+        prevents any library or system output from bypassing the alternate
+        screen buffer and corrupting the display. The redirection is permanent
+        for the process lifetime.
+
+        <notable reason="stdio redirection is interactive-only">
+          Stdout and stderr are only redirected when running interactively.
+          Headless mode leaves the original file descriptors intact, making
+          logging and debugging output visible to callers.
+        </notable>
+      </interactive-path>
+    </terminal-initialization>
+
+    <render-initialization order="2">
+      The render system is initialized using the terminal's screen dimensions
+      and TTY file descriptor. If initialization fails, the terminal is
+      cleaned up and an error is returned.
+    </render-initialization>
+
+    <dual-database-connections order="3">
+      Database connection is optional. If the configuration does not specify
+      a host, database name, and user, both connection handles are set to null
+      and no connection is attempted.
+
+      If the configuration is complete, a connection string is constructed and
+      two separate connections are established:
+
+      <main-connection order="1">
+        The first connection is the main database context used for all
+        agent-specific operations: inserting messages, updating agent state,
+        persisting events, and running schema migrations. If this connection
+        fails, the shared context is released and an error is returned.
+      </main-connection>
+
+      <worker-connection order="2">
+        The second connection is reserved for the wait synchronization system,
+        which runs LISTEN/NOTIFY polling in a background thread. Having a
+        separate connection prevents the blocking poll loop from interfering
+        with main-thread database operations. If this connection fails, the
+        shared context is released and an error is returned.
+
+        <notable reason="both connections use identical parameters">
+          Both connections are established with the same connection string,
+          connecting to the same database. They differ only in which subsystem
+          uses them, not in credentials or database.
+        </notable>
+      </worker-connection>
+    </dual-database-connections>
+
+    <command-history-loading order="4">
+      The command history buffer is created and populated from the history
+      file on disk. If loading fails, a warning is logged and initialization
+      continues with an empty history. History loading failure does not abort
+      startup.
+    </command-history-loading>
+
+    <tool-registration order="5">
+      Tools are registered in three phases:
+
+      <external-discovery order="1">
+        Executable tool files are discovered from three directories in order:
+        the system tools directory, the user tools directory, and the project
+        tools directory. All discovered tools are registered in the tool
+        registry. If discovery fails, a warning is logged and initialization
+        continues with whatever tools were registered before the failure.
+      </external-discovery>
+
+      <internal-registration order="2">
+        Built-in internal tools are registered after external discovery
+        completes. Because registration overwrites any existing entry with
+        the same name, internal tools take precedence over any external tool
+        with the same name.
+
+        <notable reason="internal tools shadow external tools">
+          The registration order is intentional. An external tool file named
+          the same as a built-in internal tool will be replaced by the
+          internal implementation.
+        </notable>
+      </internal-registration>
+
+      <registry-sort order="3">
+        After all tools are registered, the registry is sorted alphabetically
+        by tool name. This ordering is preserved for all subsequent lookups
+        and display.
+      </registry-sort>
+    </tool-registration>
+
+    <session-identifier order="6">
+      The session identifier is initialized to zero. The actual session
+      record is created later during REPL initialization, after the shared
+      context is fully set up.
+    </session-identifier>
+
+    <cleanup-registration order="7">
+      A cleanup function is registered with the memory management system.
+      When the shared context is released, the cleanup function terminates
+      the terminal session (restoring the original screen buffer and terminal
+      mode) if one was established.
+    </cleanup-registration>
+
+  </behavior>
+
+</specification>

@@ -1,0 +1,182 @@
+<specification topic="Database Schema Migration">
+
+  <topic-statement>
+    The database schema migration system applies SQL scripts in version order to
+    bring the schema to the current version.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Version detection, migration file discovery and parsing, ordered execution
+      of pending migration SQL scripts, and error reporting.
+    </in-scope>
+
+    <boundary name="PostgreSQL">
+      This topic submits SQL strings to the database connection and receives
+      status codes and error messages in return. The database enforces
+      transactional semantics within each migration file; this topic does not
+      control transaction boundaries.
+    </boundary>
+
+    <boundary name="File System">
+      This topic reads the contents of migration files identified by scanning a
+      directory. File access errors are translated into domain-specific error
+      messages and returned to the caller.
+    </boundary>
+
+    <boundary name="Database Connection">
+      This topic receives an established PostgreSQL connection. Opening,
+      configuring, or closing the connection is outside this scope.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Migration Input">
+      <field name="database connection" type="opaque handle" note="established PostgreSQL connection" />
+      <field name="migrations directory path" type="string" note="path to directory containing .sql files" />
+    </contract>
+
+    <contract name="Migration File">
+      <field name="migration number" type="integer" note="extracted from filename prefix; 3 or 4 decimal digits" />
+      <field name="file path" type="string" note="absolute path to the .sql file" />
+    </contract>
+
+    <contract name="Result">
+      <field name="outcome" type="result" note="OK on full success; ERR with IO code on file system failure; ERR with DB_MIGRATE code on SQL execution failure" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <detecting-current-version order="1">
+      Before examining any migration files, the system queries the schema
+      metadata table for the current schema version. The query retrieves at most
+      one row.
+
+      <fresh-database order="1">
+        If the schema metadata table does not yet exist, the query fails with a
+        database error. This condition is treated as version zero — the same as
+        a fresh, empty database. No error is reported.
+      </fresh-database>
+
+      <version-present order="2">
+        If the table exists and contains at least one row, the version value from
+        the first returned row is parsed as a decimal integer. If the value
+        parses cleanly (no trailing non-digit characters, non-negative, within
+        integer range), it is used as the current version.
+      </version-present>
+
+      <version-invalid order="3">
+        If the stored version value fails to parse as a valid non-negative
+        integer, the current version is treated as zero. No error is reported.
+
+        <notable reason="silent fallback">
+          A corrupted or out-of-range version value silently causes all
+          migrations to be re-applied from the beginning, which may fail if the
+          schema already partially exists.
+        </notable>
+      </version-invalid>
+    </detecting-current-version>
+
+    <discovering-migration-files order="2">
+      The migrations directory is opened for reading. If the directory cannot be
+      opened, an IO error is returned immediately with no migrations applied.
+
+      <filename-parsing order="1">
+        Each directory entry is examined. An entry is accepted as a migration
+        file only when its name satisfies all of the following conditions:
+
+        - The name is at least 9 characters long.
+        - The name ends with the exact suffix ".sql".
+        - The name begins with exactly 3 or 4 consecutive decimal digit
+          characters.
+        - The character immediately following the digit prefix is a hyphen "-".
+        - The digit prefix parses as a non-negative integer within the range of
+          a signed integer.
+
+        The standard directory pseudo-entries "." and ".." are skipped without
+        parsing.
+
+        <notable reason="silent discard">
+          Any entry that fails any of these conditions is silently skipped. No
+          warning or error is produced. A file named "002_wrong-separator.sql"
+          (underscore instead of hyphen) or "002-missing-extension.txt" is
+          discarded without notice.
+        </notable>
+      </filename-parsing>
+
+      <sorting order="2">
+        All accepted entries are sorted in ascending order by their numeric
+        migration number before any SQL is executed.
+      </sorting>
+    </discovering-migration-files>
+
+    <applying-pending-migrations order="3">
+      Each accepted migration entry is examined in sorted order. A migration is
+      applied only when its number is strictly greater than the current version.
+      Migrations whose number is less than or equal to the current version are
+      skipped without reading their files.
+
+      <reading-the-file order="1">
+        The SQL file is read into memory in full. If the file cannot be opened,
+        its size cannot be determined, or its contents cannot be read, an IO
+        error is returned immediately. The specific error message varies by
+        failure mode:
+
+        - Cannot open: "Cannot open migration file"
+        - Cannot seek within the file: "Cannot seek migration file"
+        - Cannot determine file size: "Cannot get migration file size"
+        - File exceeds the maximum readable size: "Migration file too large"
+        - Any other read failure: "Failed to read migration file"
+      </reading-the-file>
+
+      <executing-the-sql order="2">
+        The full file contents are submitted to the database as a single
+        statement string. The database executes them in one call.
+
+        <notable reason="transaction responsibility">
+          Each migration file is responsible for its own transaction boundaries.
+          The migration system does not wrap the file contents in BEGIN or
+          COMMIT. If a migration file omits transaction control, partial changes
+          may be committed if the file fails partway through execution.
+        </notable>
+      </executing-the-sql>
+
+      <checking-the-result order="3">
+        After execution, the status of the database response is inspected. The
+        execution is considered successful only when the status indicates either
+        a successful command or a result set. Any other status causes an
+        immediate DB_MIGRATE error return carrying the database's own error
+        message and the migration number that failed. Subsequent migrations are
+        not attempted.
+
+        <notable reason="partial application">
+          When a migration fails, all previously applied migrations in the same
+          run remain committed. There is no rollback of successfully completed
+          migrations. The database is left in a partially-migrated state
+          requiring manual recovery.
+        </notable>
+      </checking-the-result>
+
+      <version-update order="4">
+        The migration system itself does not update the schema metadata table
+        after each migration. Version advancement is expected to be part of
+        the SQL in the migration file. If a migration file omits the version
+        update, the current version remains unchanged after that migration
+        executes, and subsequent runs re-apply the same migration.
+
+        <notable reason="version tracking delegation">
+          Incorrect or missing version update statements within migration files
+          can cause migrations to be executed repeatedly on subsequent runs.
+        </notable>
+      </version-update>
+    </applying-pending-migrations>
+
+    <successful-completion order="4">
+      When all pending migrations have been applied without error, the system
+      returns success. All temporary working memory is released.
+    </successful-completion>
+
+  </behavior>
+
+</specification>

@@ -1,0 +1,125 @@
+<specification topic="Control Socket Client">
+
+  <topic-statement>
+    The control socket client sends JSON command requests over a Unix domain
+    socket connection and reads JSON responses, providing programmatic access
+    to the running ikigai process.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Connection establishment, request serialization, response buffering for
+      three command types, and connection teardown.
+    </in-scope>
+
+    <boundary name="Socket Path">
+      The caller supplies the socket path explicitly. The client does not
+      discover the path from the environment, from a file, or from the process
+      tree.
+    </boundary>
+
+    <boundary name="Control Socket Server">
+      Command dispatch, response generation, and the server-side command
+      handlers are covered by the control socket server specification.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Request">
+      <field name="type" type="string" note="command name; one of read_framebuffer, send_keys, read_token_cache" />
+      <field name="keys" type="string" required="false" note="send_keys only; key string injected directly without JSON escaping" />
+    </contract>
+
+    <contract name="Response">
+      <field name="content" type="JSON string" note="server response, newline-terminated; structure is command-specific" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <connection order="1">
+      A Unix domain stream socket is created and connected to the provided
+      path. If the socket path exceeds the operating system's maximum allowed
+      length, the socket is closed and an error is returned. If the connection
+      attempt fails, the socket is closed and an error is returned.
+
+      The returned file descriptor is the sole identifier for the connection.
+      All subsequent operations require the caller to pass this descriptor.
+    </connection>
+
+    <protocol order="2">
+      Communication uses line-delimited JSON. Each request is a JSON object
+      serialized as a single line ending with a newline character. Each response
+      is a JSON object serialized as a single line ending with a newline character.
+      There are no length-prefix headers.
+
+      The client sends one request and then reads one response before the
+      exchange is complete. There is no multiplexing and no validation that
+      responses correspond to specific requests.
+    </protocol>
+
+    <read-framebuffer-command order="3">
+      A request of type "read_framebuffer" is serialized and sent. The response
+      is read into a 65536-byte buffer using a read loop. Each read operation's
+      result is checked for a newline byte; when a newline is found in the most
+      recently received chunk, the loop exits. The loop also exits when the
+      buffer is full. The buffered response string is returned to the caller.
+    </read-framebuffer-command>
+
+    <send-keys-command order="4">
+      A request of type "send_keys" is constructed by inserting the key string
+      directly into a JSON template. The key string is not JSON-escaped; if it
+      contains characters that are special in JSON (quotation marks, backslashes,
+      newlines), the resulting JSON is malformed.
+
+      After sending, a single read of up to 4096 bytes is performed on a
+      stack-allocated buffer. The response is not returned to the caller. Instead,
+      the response buffer is scanned for the substring "error"; if found, an
+      error is returned. Otherwise, success is returned.
+
+      <notable reason="no JSON escaping on key string">
+        The key string is embedded verbatim into the JSON request. Callers are
+        responsible for ensuring that the key string is valid within a JSON
+        string context, or for accepting undefined behavior on malformed output.
+      </notable>
+
+      <notable reason="single non-looping read">
+        Unlike the other commands, send_keys reads the response with a single
+        system call rather than a loop. If the server sends a response longer
+        than 4096 bytes, the remainder is left in the socket buffer and will
+        corrupt subsequent reads.
+      </notable>
+    </send-keys-command>
+
+    <read-token-cache-command order="5">
+      A request of type "read_token_cache" is serialized and sent. The response
+      is read into a 4096-byte buffer using the same loop strategy as
+      read_framebuffer: reading until a newline is detected in the last chunk
+      or the buffer is full. The buffered response string is returned to the
+      caller.
+    </read-token-cache-command>
+
+    <disconnection order="6">
+      The socket connection is closed by passing the file descriptor to the
+      disconnect operation. Calling disconnect with a negative file descriptor
+      is a no-op.
+    </disconnection>
+
+    <error-behavior order="7">
+      Connection failures, send failures, and receive failures all produce IO
+      errors. Partial writes are not detected; if the operating system sends
+      fewer bytes than requested, the protocol is silently violated and the
+      server will receive a malformed request. End-of-file on a receive loop
+      causes the loop to exit with whatever bytes were received, returning that
+      partial content as the response without error.
+
+      <notable reason="no partial-write detection">
+        Write system calls are not checked for partial completion. On a busy
+        or slow system, a write may deliver fewer bytes than the full request,
+        leaving the server to parse an incomplete JSON line.
+      </notable>
+    </error-behavior>
+
+  </behavior>
+
+</specification>

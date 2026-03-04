@@ -1,0 +1,129 @@
+<specification topic="Logger">
+
+  <topic-statement>
+    The logger writes structured JSON log records to a rotating file in a
+    well-known directory, with thread-safe serialization and automatic log
+    rotation on each initialization.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Log directory creation and path resolution, log file rotation on
+      initialization, per-record formatting (level, ISO 8601 timestamp with
+      milliseconds and timezone offset, payload), thread-safe file writes,
+      and the two logger modes (global singleton and dependency-injected
+      instance).
+    </in-scope>
+
+    <boundary name="Log Consumers">
+      How log records are read, searched, or visualized is outside this scope.
+      The logger only produces the log file.
+    </boundary>
+
+    <boundary name="Panic Handler">
+      The panic handler accesses the log file descriptor directly to write
+      a final record before terminating. That access path is outside this scope;
+      this topic covers only normal write operations.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Log Record">
+      <field name="level" type="string" note="severity label: debug, info, warn, or error" />
+      <field name="timestamp" type="string" note="ISO 8601 format with millisecond precision and UTC offset; e.g. 2026-01-15T14:23:05.123+00:00" />
+      <field name="logline" type="JSON value" note="the original structured payload passed by the caller" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <initialization order="1">
+      Initialization resolves the log file path and opens the file for
+      appending.
+
+      <path-resolution order="1">
+        If the environment variable IKIGAI_LOG_DIR is set, the log file is
+        placed at that path appended with "/current.log". Otherwise, the log
+        directory is ".ikigai/logs" relative to the supplied working directory,
+        and the log file is "current.log" within that directory. The directory
+        is created if it does not exist.
+
+        If the resolved path exceeds the internal path buffer capacity, the
+        process terminates via the panic handler.
+      </path-resolution>
+
+      <log-rotation order="2">
+        If a file named "current.log" already exists at the resolved location,
+        it is renamed to an archive file before the new log is opened. The
+        archive filename is derived from the current local time formatted as
+        an ISO 8601 datetime, with colon characters replaced by dashes to
+        produce a filesystem-safe name. This rotation occurs on every
+        initialization, so each process run begins with a fresh log file.
+      </log-rotation>
+
+      <file-open order="3">
+        The log file is opened for writing. Failure to open the file terminates
+        the process via the panic handler.
+      </file-open>
+    </initialization>
+
+    <write-operation order="2">
+      Each write composes a JSON object from the level string, a freshly
+      captured timestamp, and the caller-supplied payload, then appends it
+      to the log file as a single line followed by a newline character
+      (JSON Lines format).
+
+      <timestamp-capture order="1">
+        The timestamp is captured at write time using the current wall clock.
+        It includes both seconds and milliseconds. The UTC offset is formatted
+        as "+HH:MM" (or "-HH:MM" for negative offsets).
+      </timestamp-capture>
+
+      <serialization order="2">
+        The JSON object is serialized using a JSON library. The caller
+        transfers ownership of the payload document to the logger; the document
+        is freed after serialization whether or not the write succeeds.
+      </serialization>
+
+      <file-write order="3">
+        The serialized string is written to the file. A mutex serializes all
+        write operations so that concurrent callers from multiple threads do
+        not interleave their output.
+      </file-write>
+    </write-operation>
+
+    <logger-modes order="3">
+      Two logger modes exist and operate independently.
+
+      <global-singleton order="1">
+        A single global logger is initialized once at startup via a dedicated
+        initialization function and written to via a global write function. If
+        the global logger was not initialized, write calls are silent no-ops.
+        This mode is used by subsystems that predate the dependency-injected
+        instance logger.
+      </global-singleton>
+
+      <instance-logger order="2">
+        An instance logger is allocated as a talloc context and carries its
+        own file handle and mutex. It is initialized with the same path
+        resolution logic as the global logger. When the talloc context is
+        freed, the file handle is closed and the mutex is destroyed. This mode
+        is intended for components that receive their logger via dependency
+        injection.
+
+        If the instance logger's file handle is absent, write calls are silent
+        no-ops.
+      </instance-logger>
+    </logger-modes>
+
+    <error-behavior order="4">
+      Directory creation failure (other than the directory already existing),
+      path buffer overflow, and file open failure all terminate the process
+      via the panic handler. These conditions are treated as unrecoverable.
+
+      Write failures after initialization do not terminate the process.
+    </error-behavior>
+
+  </behavior>
+
+</specification>

@@ -1,0 +1,111 @@
+<specification topic="Clear Command">
+
+  <topic-statement>
+    The clear command resets the current agent's conversation state by wiping
+    all in-memory data, recording a clear boundary in the database, and
+    rendering the current system prompt as the first entry of the fresh session.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      In-memory state erasure (messages, scrollback, token cache, marks,
+      completion state), log rotation, database persistence of the clear event
+      and system prompt, fallback behavior on database failure, and scrollback
+      rendering of the new session start.
+    </in-scope>
+
+    <boundary name="System Prompt Resolution">
+      How the effective system prompt is assembled from pinned documents,
+      configuration files, and configuration defaults is handled by the agent
+      subsystem. This topic requests the resolved prompt and uses it but does
+      not assemble it.
+    </boundary>
+
+    <boundary name="Scrollback Rendering">
+      How the system prompt text is converted to scrollback display entries is
+      handled by the event rendering subsystem.
+    </boundary>
+
+    <boundary name="Token Cache">
+      How the token cache tracks and prunes token budgets is handled by the
+      token cache subsystem. This topic only resets it.
+    </boundary>
+  </scope>
+
+  <behavior>
+
+    <log-rotation order="1">
+      The current log file is closed and a new log file is opened, using the
+      current working directory as the log location. This rotation creates a
+      permanent record boundary at each conversation reset.
+    </log-rotation>
+
+    <in-memory-erasure order="2">
+      All conversation state for the current agent is erased from memory:
+
+      1. The scrollback display buffer is cleared of all entries.
+      2. The conversation message array is freed and reset to empty.
+      3. If a token cache is present, it is reset: cached turn counts are
+         cleared and the turn array is emptied.
+      4. If any conversation marks exist, each is freed individually and the
+         marks array is freed. The mark count is reset to zero.
+      5. If autocomplete state is present, it is freed and set to absent.
+
+      These operations happen before any database work. If a subsequent database
+      operation fails, the in-memory state remains cleared. Memory is authoritative.
+    </in-memory-erasure>
+
+    <database-persistence order="3">
+      If a database connection and a valid session identifier are available, two
+      database records are written.
+
+      <clear-event order="1">
+        A message of kind "clear" is inserted into the current agent's conversation
+        history with no content and no metadata. This event becomes the boundary
+        marker used during future session restoration to identify where the
+        previous context ends and the fresh session begins.
+
+        If the insert fails, a warning is logged and execution continues. The
+        clear command does not fail due to this error.
+      </clear-event>
+
+      <system-prompt-event order="2">
+        The current effective system prompt is resolved. If a non-null prompt is
+        obtained, a message of kind "system" is inserted into the conversation
+        history with the prompt text as content and an empty JSON object as
+        metadata.
+
+        If the insert fails, a warning is logged and execution continues. The
+        clear command does not fail due to this error.
+
+        <notable reason="system prompt is fetched twice">
+          The effective system prompt is resolved once for database insertion and
+          a second time immediately afterward for scrollback rendering. Both
+          resolutions use the same prompt assembly process.
+        </notable>
+      </system-prompt-event>
+    </database-persistence>
+
+    <scrollback-rendering order="4">
+      The effective system prompt is resolved again. If a non-null prompt is
+      obtained, it is rendered to the now-empty scrollback as a system event,
+      giving the user a visual indication of the current session context.
+
+      If the scrollback render fails, the clear command returns the error. This
+      is the only failure mode that terminates the clear command with an error.
+    </scrollback-rendering>
+
+    <no-database-path order="5">
+      If no database connection or session identifier is available, the database
+      persistence steps are skipped entirely. In-memory erasure and scrollback
+      rendering still occur.
+
+      <notable reason="clearing always succeeds even without a database">
+        The absence of database connectivity does not prevent the user from
+        clearing the conversation. The in-memory state is wiped regardless.
+      </notable>
+    </no-database-path>
+
+  </behavior>
+
+</specification>

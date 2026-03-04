@@ -1,0 +1,159 @@
+<specification topic="Agent History Replay">
+
+  <topic-statement>
+    The agent history replay system reconstructs a chronologically ordered
+    message sequence from the database by walking the ancestor chain backward
+    and applying conversation clear boundaries to determine the starting point
+    for each ancestor's contribution.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Ancestor chain traversal, clear event detection, replay range construction,
+      message range querying, message accumulation, and interrupted-turn marking.
+    </in-scope>
+
+    <boundary name="Database">
+      This topic executes parameterized SQL queries and receives message rows
+      and agent records. The schema layout, indexing, and transactional guarantees
+      are outside this scope.
+    </boundary>
+
+    <boundary name="Agent Restoration">
+      How the reconstructed message sequence is consumed — which messages are
+      rendered to the scrollback, which are loaded into the live conversation
+      array, and how marks are restored — is handled by the agent restoration
+      subsystem and is outside this scope.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Replay Range">
+      <field name="agent identifier" type="string" note="UUID of the ancestor agent whose messages this range queries" />
+      <field name="start id" type="integer" note="exclusive lower bound; messages with id strictly greater than this value are included; zero means from the beginning" />
+      <field name="end id" type="integer" note="inclusive upper bound; messages with id at most this value are included; zero means no upper limit" />
+    </contract>
+
+    <contract name="Message">
+      <field name="id" type="integer" note="database row identifier; used for range boundary arithmetic" />
+      <field name="kind" type="string" note="message type discriminator (e.g., user, assistant, clear, interrupted)" />
+      <field name="content" type="string" nullable="true" note="text payload; null for structural messages" />
+      <field name="data" type="string" nullable="true" note="JSON-encoded structured payload" />
+      <field name="interrupted" type="boolean" note="set to true after filtering if this message is part of a cancelled turn; always false before filtering" />
+    </contract>
+
+    <contract name="Replay Context">
+      <field name="messages" type="array of Message" note="accumulated messages in chronological order, covering all ancestors" />
+      <field name="message count" type="integer" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <building-replay-ranges order="1">
+      Before any messages are loaded, a plan (an ordered list of replay ranges)
+      is constructed by walking the ancestor chain from the target agent upward
+      toward the root.
+
+      <ancestry-walk order="1">
+        The walk starts at the target agent. At each step, the most recent clear
+        event in the current agent's history is located, subject to any upper
+        bound imposed by the caller. A clear event is the message with the highest
+        id among all messages of kind "clear" that fall within the applicable
+        range.
+
+        If a clear event is found:
+        - A replay range is recorded for this agent, starting after the clear
+          event (start id set to the clear event's id, meaning messages with ids
+          strictly greater than the clear id will be included) and ending at the
+          upper bound.
+        - The walk terminates. No further ancestors are consulted.
+
+        If no clear event is found:
+        - A replay range is recorded for this agent starting from the beginning
+          (start id set to zero) and ending at the upper bound.
+        - If this agent has a parent, the walk continues upward. The upper bound
+          for the parent is set to the fork message id recorded on the current
+          agent — the id of the message in the parent's history at which the
+          current agent was created.
+        - If this agent has no parent (it is the root), the walk terminates.
+      </ancestry-walk>
+
+      <range-ordering order="2">
+        The walk produces ranges in leaf-to-root order. Before queries are
+        executed, the range list is reversed so that ranges are in root-to-leaf
+        (chronological) order. Queries are then executed in that order.
+      </range-ordering>
+    </building-replay-ranges>
+
+    <querying-messages order="2">
+      For each replay range in chronological order, a single database query
+      retrieves all messages matching the range:
+
+        agent identifier = range.agent_identifier
+        AND message id > range.start_id
+        AND (range.end_id = 0 OR message id ≤ range.end_id)
+        ORDER BY creation timestamp
+
+      Messages are returned ordered by creation timestamp. If the range
+      contains no messages, an empty result is returned without error.
+
+      The fields retrieved for each message are: id, kind, content, and data.
+
+      <notable reason="zero end_id is dual-purpose">
+        An end id of zero signals "no upper bound" in the query. This means
+        it is impossible to express a range that ends specifically at message
+        id zero; zero is reserved as the sentinel value for unbounded ranges.
+      </notable>
+    </querying-messages>
+
+    <accumulating-messages order="3">
+      As each range's query results are returned, messages are copied into the
+      replay context's message array. The array grows dynamically: when capacity
+      is exhausted, it is doubled. Initial capacity is zero; the first message
+      triggers allocation to an initial capacity of sixteen.
+
+      Each copied message has its interrupted flag initialized to false.
+      The source messages from the query result are not modified.
+    </accumulating-messages>
+
+    <filtering-interrupted-turns order="4">
+      After all ranges have been accumulated, the complete message sequence is
+      scanned once to identify and mark interrupted turns.
+
+      The scan maintains a "last user message" cursor. When a message of kind
+      "user" is encountered, the cursor advances to that message's position.
+      When a message of kind "interrupted" is encountered, every message from
+      the last user message position through the interrupted message (inclusive)
+      has its interrupted flag set to true.
+
+      Messages are not removed from the sequence. Consumers are responsible for
+      deciding how to handle messages whose interrupted flag is true.
+
+      <notable reason="interrupted flag applies to the entire turn">
+        All messages between the user message that started a cancelled turn and
+        the interrupted marker that ended it are marked, including any tool calls,
+        tool results, and partial assistant messages in between.
+      </notable>
+
+      <notable reason="marks stack is allocated but never populated">
+        The replay context includes a mark stack structure that is initialized
+        with capacity zero and count zero. No messages are ever examined for
+        mark content during replay. The mark stack remains empty after replay
+        completes.
+      </notable>
+    </filtering-interrupted-turns>
+
+    <error-behavior order="5">
+      If a database query during range construction fails, the error is returned
+      to the caller immediately. If a query during message loading fails, the
+      error is returned. No partial results are returned on error.
+
+      If the initial clear-event lookup fails, the error is returned and range
+      construction is abandoned. If the agent record lookup (needed to find a
+      parent) fails, the error is returned and the walk terminates with that error.
+    </error-behavior>
+
+  </behavior>
+
+</specification>

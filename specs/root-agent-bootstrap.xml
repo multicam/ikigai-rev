@@ -1,0 +1,120 @@
+<specification topic="Root Agent Bootstrap">
+
+  <topic-statement>
+    The root agent bootstrap system ensures exactly one root agent exists in
+    the database, creating it on first launch and adopting any messages that
+    predate the agent tracking era.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Detection of whether a root agent exists, creation of the root agent
+      record, orphaned message adoption, and insertion of the initial fork event.
+    </in-scope>
+
+    <boundary name="Database">
+      SQL execution, row insertion, and transaction context are delegated to
+      the database layer. The caller is responsible for any surrounding
+      transaction.
+    </boundary>
+
+    <boundary name="Agent Session Restoration">
+      How the root agent's conversation history is replayed into memory at
+      startup is handled by the agent session restoration subsystem.
+    </boundary>
+
+    <boundary name="System Prompt Resolution">
+      How the effective system prompt is assembled from configuration and pinned
+      files is out of scope. The bootstrap records the path to the system prompt
+      file as part of the initial fork event but does not read or assemble
+      the prompt itself.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Root Agent Record">
+      <field name="identifier" type="UUID string" note="newly generated; unique per database" />
+      <field name="name" type="null" note="always null at creation; no display name assigned" />
+      <field name="parent identifier" type="null" note="always null; distinguishes the root from all other agents" />
+      <field name="status" type="string" note="always 'running' at creation" />
+      <field name="created at" type="integer" note="Unix timestamp as a decimal string" />
+      <field name="fork message id" type="integer" note="always zero at creation" />
+      <field name="session id" type="integer" note="the active session identifier" />
+    </contract>
+
+    <contract name="Initial Fork Event">
+      <field name="kind" type="string" note="always 'fork'" />
+      <field name="content" type="string" note="'Agent 0 created with system prompt'" />
+      <field name="data" type="JSON object" note="contains role='child' and pinned_paths array with the system prompt file path" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <checking-for-existing-root order="1">
+      The database is queried for an agent with no parent. The query selects
+      the identifier of the first such agent.
+
+      If a row is returned, that identifier is returned to the caller and
+      all subsequent steps are skipped. The operation is idempotent: calling
+      it when a root agent already exists has no side effects.
+    </checking-for-existing-root>
+
+    <creating-the-root-agent order="2">
+      If no root agent exists, a new unique identifier is generated. A new
+      agent record is inserted with that identifier, null name, null parent,
+      status "running", the current Unix timestamp, fork message id zero, and
+      the provided session identifier.
+    </creating-the-root-agent>
+
+    <orphaned-message-adoption order="3">
+      Databases created before agent tracking was introduced may contain
+      messages that have no associated agent identifier. The bootstrap
+      checks whether the agent identifier column exists on the messages table
+      before proceeding, as a guard against running on a schema version that
+      predates that column.
+
+      If the column exists, the database is checked for any messages whose
+      agent identifier is null. If any exist, they are all updated to assign
+      them to the newly created root agent.
+
+      <notable reason="migration safety guard">
+        The column-existence check is defensive: the bootstrap behaves correctly
+        both on a fresh schema and on a schema that has not yet been migrated
+        to include the agent identifier column.
+      </notable>
+
+      <notable reason="adoption is unconditional within an eligible schema">
+        All null-agent messages are adopted by the root agent in a single
+        bulk update. No filtering or selection is applied.
+      </notable>
+    </orphaned-message-adoption>
+
+    <inserting-initial-fork-event order="4">
+      An initial fork event is inserted into the root agent's conversation
+      history. The event's data payload records that the root agent was created
+      with a system prompt, and includes the file path of the system prompt
+      document as the sole entry in the pinned paths list.
+
+      This event serves as the starting point for agent restoration: the
+      session restoration subsystem uses fork events to reconstruct which
+      documents were pinned when an agent was created.
+    </inserting-initial-fork-event>
+
+    <returning-the-identifier order="5">
+      The root agent's identifier (whether retrieved from an existing record
+      or generated during creation) is returned to the caller.
+    </returning-the-identifier>
+
+    <error-behavior order="6">
+      If any database query or insertion fails, an error is returned and no
+      further steps are attempted. On error, any temporary allocations are
+      released. Partial state (for example, a successfully inserted agent row
+      followed by a failed message adoption) is left in place; no rollback is
+      performed by this function. The caller is responsible for transaction
+      management.
+    </error-behavior>
+
+  </behavior>
+
+</specification>
