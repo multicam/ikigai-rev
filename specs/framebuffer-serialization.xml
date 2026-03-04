@@ -1,0 +1,220 @@
+<specification topic="Framebuffer Serialization">
+
+  <topic-statement>
+    The framebuffer serialization system converts raw terminal framebuffer bytes
+    into a structured JSON representation that encodes text content and styling metadata.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Parsing ANSI escape sequences from framebuffer bytes, extracting text and style
+      information, and producing a JSON document describing rows, spans, colors, and
+      cursor state.
+    </in-scope>
+
+    <boundary name="Framebuffer Source">
+      This topic receives a byte buffer containing raw terminal output (text intermixed
+      with ANSI escape sequences), terminal dimensions, and cursor state. It does not
+      produce or maintain the framebuffer.
+    </boundary>
+
+    <boundary name="Consumers">
+      This topic produces a JSON string. What consumes that string is outside this
+      topic's scope.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Input">
+      <field name="framebuffer bytes" type="byte array" />
+      <field name="row count" type="integer" />
+      <field name="column count" type="integer" />
+      <field name="cursor row" type="integer" />
+      <field name="cursor column" type="integer" />
+      <field name="cursor visible" type="boolean" />
+    </contract>
+
+    <contract name="Style">
+      <field name="foreground color" type="integer" note="256-color palette index; 0 means unset" />
+      <field name="bold" type="boolean" />
+      <field name="dim" type="boolean" />
+      <field name="reverse" type="boolean" />
+    </contract>
+
+    <contract name="Span">
+      <field name="text" type="string" note="content segment sharing a single style" />
+      <field name="style" type="Style" />
+    </contract>
+
+    <contract name="Line">
+      <field name="row" type="integer" note="zero-based row index" />
+      <field name="spans" type="array of Span" note="always at least one span per line" />
+    </contract>
+
+    <contract name="JSON Output">
+      <field name="type" type="string" note="always the string 'framebuffer'" />
+      <field name="rows" type="integer" />
+      <field name="cols" type="integer" />
+      <field name="cursor_row" type="integer" />
+      <field name="cursor_col" type="integer" />
+      <field name="cursor_visible" type="boolean" />
+      <field name="lines" type="array of Line JSON objects" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <entry-validation order="1">
+      If the framebuffer byte pointer is null, the operation fails immediately and
+      returns an error. No output is produced.
+    </entry-validation>
+
+    <initialization order="2">
+      Before parsing begins, a line array is allocated with one slot per terminal row.
+      Each slot is initialized with its row index, an empty span array (initial capacity
+      four), and a fresh text buffer (initial capacity 256 bytes). A single empty initial
+      span is prepared in a transient working area for accumulating text during the parse.
+    </initialization>
+
+    <parsing-framebuffer-bytes order="3">
+      The parser iterates through every byte in the framebuffer, advancing one character
+      at a time unless an escape sequence or multi-byte UTF-8 character causes a larger
+      jump.
+
+      <cursor-hide-skip order="1">
+        When the cursor-hide escape sequence (ESC[?25l) is encountered, it is skipped
+        entirely and contributes no text or style change.
+      </cursor-hide-skip>
+
+      <cursor-home-skip order="2">
+        When the cursor-home escape sequence (ESC[H) is encountered, it is skipped
+        entirely and contributes no text or style change.
+      </cursor-home-skip>
+
+      <escape-sequence-dispatch order="3">
+        Any other byte pair matching ESC followed by '[' triggers escape sequence
+        handling. The parser inspects the bytes immediately following the '[' to
+        determine which sequence applies.
+
+        <foreground-color order="1">
+          A sequence of the form ESC[38;5;NNNm (where NNN is a decimal integer)
+          sets the foreground color to the parsed index value. Before the color
+          is applied, any accumulated text in the current span is flushed to the
+          current line. The new color takes effect for subsequent text. If the
+          byte sequence does not match the expected prefix "38;5;" exactly or
+          there are insufficient bytes remaining, the sequence is skipped.
+        </foreground-color>
+
+        <reset order="2">
+          A sequence ending in 'm' preceded by '0' resets all style flags. Any
+          accumulated text in the current span is flushed to the current line. The
+          foreground color, bold, dim, and reverse flags are all cleared to their
+          zero/false defaults.
+        </reset>
+
+        <bold order="3">
+          A sequence matching the bold attribute sets the bold flag. Any accumulated
+          text in the current span is flushed before the flag is updated.
+        </bold>
+
+        <dim order="4">
+          A sequence matching the dim attribute sets the dim flag. Any accumulated
+          text in the current span is flushed before the flag is updated.
+        </dim>
+
+        <reverse order="5">
+          A sequence matching the reverse attribute sets the reverse flag. Any
+          accumulated text in the current span is flushed before the flag is updated.
+        </reverse>
+
+        <unknown-sequence-skip order="6">
+          Any escape sequence that does not match the recognized patterns is skipped.
+          The parser advances past the ESC[ prefix and then continues advancing until
+          it reaches a byte value in the printable ASCII range (0x20 to 0x7E inclusive),
+          at which point it stops (without consuming that byte). This ensures unknown
+          sequences do not produce text output.
+        </unknown-sequence-skip>
+      </escape-sequence-dispatch>
+
+      <carriage-return-linefeed order="4">
+        When a CR+LF pair is encountered, the current line is finalized. If the
+        current span contains any accumulated text (or if the current line has no
+        spans yet), the span is flushed to the current line. The parser then advances
+        to the next line. The current row index increments by one.
+
+        <notable reason="empty-line handling">
+          The flush condition for CRLF checks either text_len > 0 OR span_count == 0.
+          This ensures that even a line with no text produces at least one flush,
+          which combined with the post-processing step guarantees every line has at
+          least one span in the output.
+        </notable>
+      </carriage-return-linefeed>
+
+      <regular-character order="5">
+        Any byte that is not part of an escape sequence or CRLF is appended to the
+        current span's text buffer. If the text buffer is full, it is doubled in
+        capacity before the character is added.
+      </regular-character>
+    </parsing-framebuffer-bytes>
+
+    <post-processing order="4">
+      After the parse loop completes, every line in the line array is checked. If a
+      line has zero spans, an empty span is allocated and added to it. This guarantees
+      that every line in the output has at least one span, even if the line received
+      no text during parsing.
+    </post-processing>
+
+    <span-flushing order="5">
+      Flushing moves the current working span into the line's span array. If the
+      accumulated text buffer is empty, the span is discarded without being added.
+      If adding the span would exceed the line's span array capacity, the capacity
+      is doubled. After flushing, a new 256-byte text buffer is allocated for the
+      next span, and the new span inherits the current style.
+
+      <notable reason="silent discard on empty span">
+        If the current span has no text, flush is a no-op. No empty span is added
+        to the line during normal text flushing (only the post-processing step adds
+        empty spans to lines with zero spans).
+      </notable>
+    </span-flushing>
+
+    <json-construction order="6">
+      After parsing and post-processing, the output JSON document is constructed
+      from the collected lines.
+
+      <top-level-envelope order="1">
+        The root JSON object contains the fields: type (the literal string
+        "framebuffer"), rows, cols, cursor_row, cursor_col, cursor_visible, and lines.
+        The lines value is a JSON array.
+      </top-level-envelope>
+
+      <line-json order="2">
+        Each line is serialized as a JSON object with fields row (integer) and spans
+        (JSON array). Lines are comma-separated within the array.
+      </line-json>
+
+      <span-json order="3">
+        Each span is serialized as a JSON object with fields text and style. Text
+        content is JSON-escaped (double quotes and backslashes are escaped with a
+        preceding backslash). Style is a JSON object.
+      </span-json>
+
+      <style-json order="4">
+        The style JSON object contains only non-default fields. A foreground color
+        is included only if it is non-zero. Bold, dim, and reverse are included only
+        if true. If all style attributes are at their defaults, the style object is
+        empty. Fields within the style object are comma-separated and appear in the
+        order: fg, bold, dim, reverse.
+      </style-json>
+    </json-construction>
+
+    <memory-management order="7">
+      All intermediate allocations (line arrays, span arrays, text buffers) are
+      made under a temporary context that is freed after the final JSON string is
+      produced. The JSON output string is allocated under the caller-provided context
+      and outlives the intermediate allocations.
+    </memory-management>
+
+  </behavior>
+
+</specification>

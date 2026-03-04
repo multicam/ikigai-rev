@@ -1,0 +1,109 @@
+<specification topic="Scrollback Byte Ranges">
+
+  <topic-statement>
+    The scrollback byte-range system calculates the byte offsets within a stored
+    text line that correspond to a requested span of terminal display rows.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Computing the start byte offset, end byte offset, and end-of-line flag for a
+      given contiguous range of terminal rows within a single scrollback line, taking
+      into account line wrapping and embedded newlines (segments).
+    </in-scope>
+
+    <boundary name="Scrollback Buffer">
+      This topic reads line text, byte length, and layout metadata (segment widths,
+      physical row count, terminal width) from the scrollback buffer. It does not
+      modify any stored data.
+
+      <shared topic="Scrollback Layout">
+        A line's physical row count is the sum of segment row counts. Each segment
+        row count is the ceiling division of that segment's display width by the
+        terminal width, with a minimum of one row. The display width is measured in
+        terminal columns accounting for ANSI sequences (skipped) and wide Unicode
+        characters (counted by their column width). A zero-width segment still occupies
+        one row.
+      </shared>
+    </boundary>
+
+    <boundary name="Byte-Offset Lookup">
+      This topic delegates conversion from a display-column offset to a byte offset
+      within the text to a shared byte-offset lookup operation. If that lookup fails,
+      this topic treats the failure as a zero-byte offset.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Range Request">
+      <field name="scrollback line" type="line reference" />
+      <field name="terminal width" type="integer" note="columns; used for wrap calculation" />
+      <field name="start row offset" type="integer" note="zero-based offset from the line's first display row" />
+      <field name="row count" type="integer" note="number of display rows to include" />
+    </contract>
+
+    <contract name="Range Result">
+      <field name="start byte" type="integer" note="byte index into the line's text where rendering begins" />
+      <field name="end byte" type="integer" note="byte index into the line's text where rendering ends (exclusive)" />
+      <field name="is line end" type="boolean" note="true if the range extends to the final row of the line" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <computing-the-start-byte order="1">
+      If the start row offset is zero, the start byte is zero — rendering begins at
+      the first byte of the line's text.
+
+      Otherwise, the calculation locates the byte within the text that corresponds
+      to the beginning of the requested row. The line's layout is consulted to
+      determine how many display rows each segment occupies (each segment is a
+      newline-delimited portion of the text). Each segment's row count is the ceiling
+      of its display width divided by the terminal width, with a minimum of one.
+
+      Segments are consumed in order until enough rows have been accounted for. If
+      the target row falls within a segment, the display columns advanced within that
+      segment are computed (how many full terminal-width rows of that segment are
+      skipped multiplied by the terminal width). A byte-offset lookup converts those
+      display columns to a byte position within the segment's text.
+
+      If the target row crosses multiple segment boundaries, the byte position of the
+      start is located by counting newline characters in the text starting from the
+      byte found by the lookup. The position immediately after the Nth newline (where
+      N is the number of additional segment boundaries crossed) is the start byte.
+
+      If the byte-offset lookup fails, the start byte is treated as zero.
+    </computing-the-start-byte>
+
+    <computing-the-end-byte order="2">
+      If the end row offset (start row offset plus row count minus one) is at or
+      beyond the last display row of the line, the end byte is the total byte length
+      of the line's text. The is-line-end flag is set to true.
+
+      Otherwise, the end byte is calculated using the same segment-walking logic as
+      the start byte, but accumulating rows inclusively through the end row. The
+      is-line-end flag is set to false.
+
+      If the byte-offset lookup fails during end-byte calculation, the end byte is
+      treated as zero.
+    </computing-the-end-byte>
+
+    <combined-range-calculation order="3">
+      When a range is requested, the start and end bytes are computed separately and
+      independently. The end row offset passed to the end-byte calculation is the sum
+      of the start row offset and row count minus one.
+
+      All three output values (start byte, end byte, is-line-end flag) are produced
+      by a single call that internally delegates to the start and end calculations.
+    </combined-range-calculation>
+
+    <notable reason="zero-on-lookup-failure">
+      If the underlying byte-offset lookup reports an error (e.g., the display column
+      is out of range), the affected start or end byte is silently set to zero rather
+      than propagating the error. This may produce incorrect render ranges without
+      any indication of failure.
+    </notable>
+
+  </behavior>
+
+</specification>

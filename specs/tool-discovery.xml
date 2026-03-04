@@ -1,0 +1,142 @@
+<specification topic="Tool Discovery">
+
+  <topic-statement>
+    The tool discovery system scans configurable directories for tool executables and
+    populates the tool registry with their definitions.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Directory scanning, executable detection, schema extraction via subprocess
+      invocation, tool name derivation, and registration with override precedence.
+    </in-scope>
+
+    <boundary name="Tool Registry">
+      This topic sends tool names, paths, and parsed schema documents to the registry.
+      How the registry stores or retrieves entries is outside this topic's scope.
+    </boundary>
+
+    <boundary name="Schema Content">
+      This topic parses the raw JSON schema output from tools but does not validate
+      its structure or interpret its contents. The schema is passed opaquely to the
+      registry.
+    </boundary>
+
+    <boundary name="File System">
+      This topic reads directory listings and file metadata from the file system.
+      Directory creation, modification, and any writes are outside scope.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Discovery Input">
+      <field name="system tools directory" type="path" note="lowest priority" />
+      <field name="user tools directory" type="path" note="middle priority" />
+      <field name="project tools directory" type="path" note="highest priority" />
+      <field name="tool registry" type="registry reference" />
+    </contract>
+
+    <contract name="Discovered Tool">
+      <field name="name" type="string" note="derived from filename by stripping -tool suffix and converting hyphens to underscores" />
+      <field name="path" type="string" note="full filesystem path to the executable" />
+      <field name="schema" type="parsed JSON document" note="output of running the executable with --schema" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <scan-order-and-override-precedence order="1">
+      Discovery scans three directories in a fixed order: system, then user, then
+      project. When a tool with the same name appears in more than one directory, the
+      later-scanned directory's version replaces the earlier one. Project tools override
+      user tools; user tools override system tools.
+
+      If any directory scan returns an error, discovery stops immediately and propagates
+      the error without scanning subsequent directories.
+
+      After all three directories have been scanned, the registry is sorted alphabetically
+      by tool name.
+    </scan-order-and-override-precedence>
+
+    <scanning-a-directory order="2">
+      Each directory is opened for reading. If the directory does not exist or cannot
+      be opened, it is silently skipped — no error is produced and discovery continues
+      with the next directory.
+
+      <notable reason="graceful-skip on missing directory">
+        A missing or inaccessible directory is not an error condition. Discovery simply
+        moves on. This allows a system with no user-level tools, or no project-level
+        tools, to operate normally.
+      </notable>
+
+      Every entry in the directory is examined in the order returned by the operating
+      system. The entries named "." and ".." are skipped. For each remaining entry, the
+      full file path is constructed by joining the directory path and the entry name.
+
+      An entry is eligible for registration only if both conditions are met:
+      1. The file has the user-execute permission bit set (determined by inspecting the
+         file's metadata; if metadata cannot be read, the file is skipped silently).
+      2. The filename ends with the suffix "-tool".
+
+      Files that fail either condition are silently skipped without error.
+    </scanning-a-directory>
+
+    <schema-extraction order="3">
+      For each eligible file, a child process is spawned to run the tool executable
+      with the single argument "--schema". The child process's standard output is
+      captured. Standard error is discarded silently.
+
+      The parent waits for the child's output with a one-second timeout enforced via
+      a system alarm signal. If the child does not produce output or does not exit
+      within one second, the alarm fires.
+
+      The child's output is read into a buffer with a maximum capacity of 8191 bytes
+      (plus a null terminator for 8192 bytes total). If the tool produces more output
+      than this, the excess is silently truncated.
+
+      After reading completes, the alarm is cancelled, the pipe is closed, and the
+      parent waits for the child process to exit.
+
+      A schema extraction is considered successful only if both of these are true:
+      - The child process exited normally with exit status zero.
+      - At least one byte was read from its output.
+
+      If either condition fails, the tool is silently skipped — no error is produced
+      and discovery continues with the next file.
+
+      <notable reason="silent-skip on schema failure">
+        A tool that crashes, produces no output, or exits with a non-zero status is
+        ignored without any warning or log message. The tool simply does not appear
+        in the registry.
+      </notable>
+
+      If the output is non-empty and the child exited successfully, the output is
+      parsed as JSON. If JSON parsing fails, the tool is silently skipped.
+    </schema-extraction>
+
+    <tool-name-derivation order="4">
+      A tool's registry name is derived from its filename by two transformations:
+      1. The trailing "-tool" suffix is removed.
+      2. Every hyphen in the remaining name is replaced with an underscore.
+
+      Examples:
+      - "bash-tool" becomes "bash"
+      - "file-read-tool" becomes "file_read"
+      - "git-commit-tool" becomes "git_commit"
+
+      If the file does not end with "-tool", the behavior is undefined — this case
+      is treated as a precondition violation.
+    </tool-name-derivation>
+
+    <registration order="5">
+      Each successfully extracted tool is added to the registry by name, path, and
+      schema. If a tool with the same name already exists in the registry (from an
+      earlier directory scan), the existing entry is replaced with the new one.
+
+      If registration fails (due to a registry-internal error), the error is propagated
+      immediately and discovery halts.
+    </registration>
+
+  </behavior>
+
+</specification>

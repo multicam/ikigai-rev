@@ -1,0 +1,156 @@
+<specification topic="Tool Call Formatting">
+
+  <topic-statement>
+    The tool call formatting system renders tool invocations and their results into
+    human-readable terminal text with structured argument display and content truncation.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Formatting tool call arguments from JSON into a key=value display, formatting
+      tool results with type-sensitive extraction, content truncation, and the buffer
+      management that supports incremental construction of formatted strings.
+    </in-scope>
+
+    <boundary name="Terminal Display">
+      This topic produces formatted strings. Rendering those strings to the terminal
+      is outside this topic's scope.
+    </boundary>
+
+    <boundary name="Tool Execution">
+      This topic receives tool names, argument JSON strings, and result JSON strings.
+      Executing tools or producing those values is outside this topic's scope.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Tool Call Input">
+      <field name="tool name" type="string" />
+      <field name="arguments JSON" type="string" nullable="true" note="JSON object string; may be null or empty" />
+    </contract>
+
+    <contract name="Tool Result Input">
+      <field name="tool name" type="string" />
+      <field name="result JSON" type="string" nullable="true" note="any JSON value; may be null" />
+    </contract>
+
+    <contract name="Formatted Output">
+      <field name="text" type="string" note="null-terminated string allocated under the caller-provided context" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <buffer-management order="1">
+      Formatted output is built incrementally using an internal byte-array buffer.
+      The buffer supports printf-style formatted appends, raw string appends, and
+      indentation appends (repeated space characters). The final string is extracted
+      from the buffer as a null-terminated string; if the last byte already is a null
+      terminator it is reused rather than appended again. The buffer length excludes
+      any trailing null terminator.
+    </buffer-management>
+
+    <formatting-a-tool-call order="2">
+      A tool call is formatted as a single line of the form:
+
+        → tool_name: arg1="value1", arg2=42, arg3=true
+
+      <prefix-and-name order="1">
+        The line begins with the arrow prefix "→ " followed by the tool name and a
+        colon and space.
+      </prefix-and-name>
+
+      <no-arguments order="2">
+        If the arguments string is null or empty, only the prefix and tool name are
+        produced. No colon, space, or argument list is appended.
+      </no-arguments>
+
+      <invalid-json-arguments order="3">
+        If the arguments string is non-empty but cannot be parsed as JSON, the raw
+        argument string is appended directly after a ": " separator, subject to the
+        standard content truncation rules (three lines or 400 characters). No
+        key=value formatting is applied.
+      </invalid-json-arguments>
+
+      <non-object-arguments order="4">
+        If the arguments parse successfully as JSON but the root value is not a JSON
+        object, the serialized JSON is appended after a ": " separator, subject to
+        truncation. No key=value formatting is applied.
+      </non-object-arguments>
+
+      <empty-object-arguments order="5">
+        If the arguments are a valid JSON object with no fields, only the prefix and
+        tool name are produced.
+      </empty-object-arguments>
+
+      <key-value-arguments order="6">
+        For a valid non-empty JSON object, each field is formatted as key=value and
+        the fields are separated by ", ". The formatting of each value depends on its
+        JSON type:
+        - String values are surrounded by double quotes.
+        - Number, boolean, and null values are rendered without quotes.
+        - Array and object values are serialized back to compact JSON without quotes.
+
+        The complete argument list is produced without truncation.
+      </key-value-arguments>
+    </formatting-a-tool-call>
+
+    <formatting-a-tool-result order="3">
+      A tool result is formatted as a single line of the form:
+
+        ← tool_name: content
+
+      <prefix-and-name order="1">
+        The line begins with the left-arrow prefix "← " followed by the tool name.
+      </prefix-and-name>
+
+      <null-result order="2">
+        If the result string is null, the prefix and tool name are produced with no
+        additional content.
+      </null-result>
+
+      <invalid-json-result order="3">
+        If the result string is non-null but cannot be parsed as JSON, the raw result
+        string is appended after a ": " separator, subject to truncation.
+      </invalid-json-result>
+
+      <string-result order="4">
+        If the result parses as a JSON string, the string value (without JSON quotes)
+        is extracted and appended after ": ", subject to truncation. If the extracted
+        string is empty, the text "(no output)" is appended instead.
+      </string-result>
+
+      <array-result order="5">
+        If the result parses as a JSON array, the array elements are joined with ", "
+        and appended after ": ", subject to truncation. String elements in the array
+        are appended directly (without JSON quotes); all other element types are
+        serialized to compact JSON.
+      </array-result>
+
+      <object-or-other-result order="6">
+        If the result parses as any other JSON type (object, number, boolean, null),
+        the entire value is serialized to compact JSON and appended after ": ", subject
+        to truncation.
+      </object-or-other-result>
+
+      <no-extractable-content order="7">
+        If, after type dispatch, no content string was produced, the text "(no output)"
+        is appended after ": ".
+      </no-extractable-content>
+    </formatting-a-tool-result>
+
+    <content-truncation order="4">
+      Content is truncated before being appended if it exceeds either of two limits:
+      more than three lines, or more than 400 characters (whichever limit is reached
+      first). Scanning stops at the first byte that would violate either limit.
+
+      If the content is empty, the text "(no output)" is appended.
+
+      If truncation occurs, "..." is appended after the truncated content.
+
+      If truncation does not occur, the full content is appended as-is.
+    </content-truncation>
+
+  </behavior>
+
+</specification>

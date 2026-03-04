@@ -1,0 +1,127 @@
+<specification topic="Tool Registry">
+
+  <topic-statement>
+    The tool registry maintains an ordered, overrideable in-memory set of tool
+    definitions available to agents.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Storing, looking up, adding, replacing, clearing, sorting, and enumerating
+      tool definitions (both external and internal). Growth strategy of the backing
+      store.
+    </in-scope>
+
+    <boundary name="Tool Discovery">
+      Tools are added to the registry by an external discovery process. How tools
+      are found or how their schemas are obtained is outside this topic's scope.
+    </boundary>
+
+    <boundary name="LLM Integration">
+      This topic produces a JSON array of tool schemas for LLM consumption but does
+      not interact with the LLM or serialize requests directly.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="External Tool Entry">
+      <field name="name" type="string" note="registry key; derived from executable filename" />
+      <field name="path" type="string" note="full filesystem path to the executable" />
+      <field name="schema" type="parsed JSON document" note="the tool's schema as returned by --schema" />
+      <field name="type" type="enum" note="always 'external' for externally discovered tools" />
+    </contract>
+
+    <contract name="Internal Tool Entry">
+      <field name="name" type="string" />
+      <field name="path" type="null" note="always absent for internal tools" />
+      <field name="schema" type="parsed JSON document" note="statically defined schema" />
+      <field name="type" type="enum" note="always 'internal'" />
+      <field name="handler" type="function reference" note="invoked directly when the tool is called" />
+      <field name="completion hook" type="function reference" required="false" note="invoked after tool result is processed; null if not needed" />
+    </contract>
+
+    <contract name="Registry">
+      <field name="entries" type="dynamic array of tool entries" />
+      <field name="count" type="integer" note="current number of entries" />
+      <field name="capacity" type="integer" note="current allocated slots; starts at 16" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <creation order="1">
+      A new registry is created with an initial capacity of 16 slots and zero entries.
+      Both the registry structure and its backing array are zero-initialized.
+    </creation>
+
+    <lookup order="2">
+      Looking up a tool by name performs a linear scan from the first entry to the
+      last. The first entry whose name matches exactly (case-sensitive) is returned.
+      If no entry matches, nothing is returned.
+
+      <notable reason="linear-scan performance">
+        Lookup is O(n) in the number of registered tools. There is no hash index or
+        binary search despite the registry being kept sorted.
+      </notable>
+    </lookup>
+
+    <adding-an-external-tool order="3">
+      When an external tool is added, the registry first looks up whether a tool with
+      the same name already exists.
+
+      <replacement order="1">
+        If an entry with the same name already exists, it is replaced in-place. The
+        old name string, path string, and schema document are freed. New copies of the
+        name and path strings are allocated under the registry. The new schema document's
+        ownership is transferred to the registry. The entry's type is set to external,
+        and its handler and completion-hook fields are cleared.
+      </replacement>
+
+      <growth order="2">
+        If no existing entry matches and the registry is at capacity (count equals
+        capacity), the capacity is doubled and the backing array is reallocated to
+        accommodate the new size. The count then increments by one, and the new entry
+        is written at the newly claimed slot.
+      </growth>
+
+      In both the replacement and growth cases, new copies of the name and path strings
+      are allocated under the registry. Ownership of the schema document is transferred
+      to the registry (not copied).
+    </adding-an-external-tool>
+
+    <adding-an-internal-tool order="4">
+      Adding an internal tool follows the same replacement and growth logic as adding
+      an external tool, with two differences:
+      - The path field is not set (internal tools have no executable path).
+      - The handler and completion-hook function references are stored in the entry.
+      - The entry type is set to internal.
+
+      <notable reason="path-is-null">
+        Internal tool entries have a null path. Code that operates on tool entries
+        must handle a null path field without crashing.
+      </notable>
+    </adding-an-internal-tool>
+
+    <clearing order="5">
+      Clearing the registry frees the name string, path string (if non-null), and
+      schema document of every entry. The entry count is reset to zero. The backing
+      array capacity is preserved — subsequent additions reuse the existing allocation.
+    </clearing>
+
+    <sorting order="6">
+      If the registry has one or fewer entries, sorting is a no-op. Otherwise, all
+      entries are sorted in-place in ascending alphabetical order by name
+      (lexicographic, byte-value comparison). This is the order in which entries are
+      enumerated and in which they appear in the JSON tools array.
+    </sorting>
+
+    <building-the-llm-tools-array order="7">
+      A JSON array is produced containing a deep copy of every tool's schema root
+      object, in the order the entries appear in the registry (typically alphabetical
+      after sorting). The resulting array is a mutable JSON structure suitable for
+      inclusion in an LLM request.
+    </building-the-llm-tools-array>
+
+  </behavior>
+
+</specification>
