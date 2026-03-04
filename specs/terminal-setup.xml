@@ -1,0 +1,168 @@
+<specification topic="Terminal Setup">
+
+  <topic-statement>
+    The terminal setup component initializes a TTY file descriptor into raw mode with
+    an alternate screen buffer, probes for enhanced keyboard protocol support, and
+    restores the terminal to its original state on cleanup.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Headless terminal creation, terminal initialization from a TTY file descriptor,
+      CSI u protocol probing and activation, terminal size querying, and terminal
+      cleanup and state restoration.
+    </in-scope>
+
+    <boundary name="TTY Device">
+      Normal (non-headless) initialization opens /dev/tty directly. The test-facing
+      variant accepts a pre-opened file descriptor. All terminal I/O — escape
+      sequences, attribute changes, size queries — goes through this descriptor.
+    </boundary>
+
+    <boundary name="Logger">
+      CSI u enable and unexpected-response events are written to the logger when one
+      is provided. Logging is optional; no logger produces no log output.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Terminal Context">
+      <field name="tty_fd" type="integer" note="file descriptor; -1 in headless mode" />
+      <field name="screen_rows" type="integer" note="terminal height in rows; 50 in headless mode" />
+      <field name="screen_cols" type="integer" note="terminal width in columns; 100 in headless mode" />
+      <field name="csi_u_supported" type="boolean" note="whether enhanced keyboard protocol was activated; false in headless mode" />
+      <field name="orig_termios" type="terminal attributes" note="saved original terminal settings for restoration on cleanup" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <headless-initialization order="1">
+      When headless initialization is requested, a terminal context is returned with
+      a file descriptor of -1, 50 rows, 100 columns, and CSI u marked as not
+      supported. No TTY is opened and no I/O is performed.
+    </headless-initialization>
+
+    <normal-initialization order="2">
+      Terminal initialization takes a TTY file descriptor and proceeds through the
+      following steps in order. If any step fails, preceding state changes are rolled
+      back before the error is returned.
+
+      <save-original-attributes order="1">
+        The current terminal attributes are saved. Failure to retrieve them closes
+        the file descriptor and returns an I/O error.
+      </save-original-attributes>
+
+      <raw-mode-activation order="2">
+        Terminal attributes are modified from the saved copy:
+        - Input flags cleared: BRKINT, ICRNL, INPCK, ISTRIP, IXON
+        - Output flags cleared: OPOST
+        - Control flags set: CS8
+        - Local flags cleared: ECHO, ICANON, IEXTEN, ISIG
+        - Minimum read size set to 1; read timeout set to 0
+
+        The modified attributes are applied immediately (no drain). Failure
+        closes the file descriptor and returns an I/O error.
+      </raw-mode-activation>
+
+      <input-flush order="3">
+        Any bytes already queued in the input buffer from before raw mode was active
+        are discarded. Failure restores the original terminal attributes, closes the
+        file descriptor, and returns an I/O error.
+      </input-flush>
+
+      <alternate-screen-entry order="4">
+        The escape sequence to enter the alternate screen buffer (ESC[?1049h, 8 bytes)
+        is written to the TTY. Failure restores original attributes, closes the file
+        descriptor, and returns an I/O error.
+      </alternate-screen-entry>
+
+      <screen-clear order="5">
+        The escape sequence to clear the entire screen and move the cursor to the
+        home position (ESC[2J ESC[H, 6 bytes) is written to the TTY. Failure restores
+        original attributes, closes the file descriptor, and returns an I/O error.
+
+        <notable reason="no alternate-screen exit on clear failure">
+          On screen-clear failure, the code restores terminal attributes and closes
+          the file descriptor but does not send the alternate-screen exit sequence.
+          The terminal is left in the alternate screen buffer.
+        </notable>
+      </screen-clear>
+
+      <csi-u-probe order="6">
+        The enhanced keyboard protocol (CSI u) is probed by sending the query sequence
+        (ESC[?u, 4 bytes) and waiting up to 100 milliseconds for a response. If a
+        response of at least 4 bytes arrives and begins with ESC [ ?, and a 'u'
+        character appears anywhere after the third byte, the protocol is considered
+        supported. Any other outcome — timeout, read error, response shorter than 4
+        bytes, missing ESC[? prefix, or no 'u' terminator — means the protocol is
+        not supported.
+
+        <notable reason="no rollback if CSI u fails">
+          CSI u support failure is non-fatal. Initialization continues regardless
+          of probe outcome.
+        </notable>
+      </csi-u-probe>
+
+      <csi-u-enable order="7">
+        If CSI u support was detected, the enable sequence (ESC[>9u, 5 bytes, flag
+        value 9 which requests key disambiguation and all-key reporting) is sent.
+        The system waits up to 100 milliseconds for a response.
+
+        If no response arrives within the timeout, the protocol is assumed to have
+        been successfully enabled and the terminal context records it as active.
+
+        If a response arrives and begins with ESC [ ?, and a 'u' character appears
+        after the third byte, the decimal digits preceding 'u' are parsed as the
+        enabled flags value. A log event named "csi_u_enabled" carrying the flags
+        value is written to the logger. The protocol is recorded as active.
+
+        If a response arrives but does not match the expected ESC[?…u format, a log
+        event named "csi_u_unexpected_response" is written, carrying the response
+        length in bytes and a space-separated lowercase hexadecimal dump of up to
+        the first 32 bytes of the response. Despite the unexpected format, the
+        protocol is still recorded as active.
+
+        If the read call returns zero or a negative value, the enable attempt fails
+        and CSI u is recorded as inactive.
+
+        <notable reason="unexpected response still treated as success">
+          Any response that does not match the expected format still causes CSI u
+          to be recorded as active. Only a zero or error return from the read
+          actually disables it.
+        </notable>
+      </csi-u-enable>
+
+      <terminal-size-query order="8">
+        The terminal size is queried from the system. Failure exits the alternate
+        screen buffer (ESC[?1049l), restores original attributes, closes the file
+        descriptor, and returns an I/O error. On success, the row and column counts
+        are stored in the terminal context.
+      </terminal-size-query>
+
+    </normal-initialization>
+
+    <size-query order="3">
+      When the terminal size is queried after initialization, if the file descriptor
+      is valid, the size is re-read from the system and the stored values are updated.
+      If the file descriptor is -1 (headless), the stored values are returned without
+      any system call. Failure to query a live terminal size returns an I/O error.
+    </size-query>
+
+    <cleanup order="4">
+      Terminal cleanup is a no-op if the context is absent or the file descriptor is
+      -1. Otherwise, the following steps are performed in order:
+
+      1. If CSI u was active, the disable sequence (ESC[&lt;u, 4 bytes) is written.
+      2. The alternate screen exit sequence (ESC[?1049l, 8 bytes) is written.
+      3. The original terminal attributes are restored immediately (no drain).
+      4. Any remaining queued input is discarded.
+      5. The file descriptor is closed.
+
+      All write and flush failures are silently ignored during cleanup. Freeing the
+      terminal context is the caller's responsibility.
+    </cleanup>
+
+  </behavior>
+
+</specification>

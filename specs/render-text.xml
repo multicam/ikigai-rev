@@ -1,0 +1,40 @@
+<specification topic="Render Text Utilities">
+
+  <topic-statement>
+    The render text utilities provide two byte-level text transformations used during
+    terminal rendering: newline counting and newline-to-CRLF conversion.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Counting newline characters in a byte sequence, and copying a byte sequence
+      while replacing each newline with a carriage-return–newline pair.
+    </in-scope>
+  </scope>
+
+  <behavior>
+
+    <counting-newlines order="1">
+      A byte sequence and its length are provided. Each byte equal to 0x0A (newline)
+      is counted. The total count is returned. Bytes of any other value are ignored.
+      No allocation occurs.
+    </counting-newlines>
+
+    <crlf-conversion order="2">
+      A source byte sequence, its length, and a destination buffer are provided.
+      Each byte is copied from source to destination. When a byte equal to 0x0A
+      (newline) is encountered, it is replaced with two bytes: 0x0D (carriage return)
+      followed by 0x0A (newline). All other bytes are copied unchanged. The total
+      number of bytes written to the destination is returned.
+
+      <notable reason="caller must pre-size destination">
+        No length is accepted for the destination buffer, and no bounds checking is
+        performed. For a source sequence containing N newlines, the destination
+        requires up to (source_length + N) bytes. If the destination buffer is
+        undersized, the write overruns.
+      </notable>
+    </crlf-conversion>
+
+  </behavior>
+
+</specification>

@@ -1,0 +1,122 @@
+<specification topic="Panic Handler">
+
+  <topic-statement>
+    The panic handler performs emergency process termination by restoring terminal
+    state, emitting a fatal log entry, writing a diagnostic message to stderr, and
+    aborting the process to generate a core dump.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Terminal restoration on panic, logger write on panic, stderr diagnostic output
+      on panic, process termination via abort, and the talloc error handler that
+      delegates to the panic path.
+    </in-scope>
+
+    <boundary name="Terminal">
+      The panic handler accesses a global terminal context set during startup. If
+      the context is present and has a valid file descriptor, terminal escape
+      sequences are written to that descriptor and terminal attributes are restored.
+    </boundary>
+
+    <boundary name="Logger">
+      The panic handler accesses a global logger set during startup. If the logger
+      is present and has a valid file descriptor, a JSON log entry is written to
+      that descriptor.
+    </boundary>
+  </scope>
+
+  <behavior>
+
+    <panic order="1">
+      A panic is triggered by providing an error message string, a source file name
+      string, and a line number. Either string may be absent. The following steps
+      execute in order:
+
+      <terminal-restoration order="1">
+        If the global terminal context is present and its file descriptor is valid,
+        a reset sequence is written directly to the file descriptor. The sequence
+        shows the cursor (ESC[?25h), resets text attributes (ESC[0m), and exits the
+        alternate screen buffer (ESC[?1049l), as a single 18-byte write. The original
+        terminal attributes are then restored immediately using a direct system call.
+
+        <notable reason="not fully async-signal-safe">
+          The terminal attribute restore call is not async-signal-safe per POSIX.
+          It is used here anyway because it is necessary for the terminal to be
+          usable after the process terminates. The escape sequence write is
+          async-signal-safe.
+        </notable>
+      </terminal-restoration>
+
+      <logger-write order="2">
+        If the global logger is present and its file descriptor is valid, a JSON
+        object is formatted and written to that descriptor. The object contains:
+        - "level": "fatal"
+        - "event": "panic"
+        - "message": the message string (empty string if absent)
+        - "file": the file string (empty string if absent)
+        - "line": the line number as a decimal integer
+
+        The formatted string is followed by a newline. If the formatted length
+        would exceed 511 bytes, nothing is written.
+
+        <notable reason="not async-signal-safe">
+          The string formatting function used here is not async-signal-safe.
+          The log write uses a direct write call, which is async-signal-safe,
+          but the formatting is not.
+        </notable>
+      </logger-write>
+
+      <stderr-output order="3">
+        A diagnostic message is written to standard error using only the direct
+        write system call. The format is:
+
+          FATAL: &lt;message&gt;\n  at &lt;file&gt;:&lt;line&gt;\n
+
+        If the message string is absent, that portion is empty. If the file string
+        is absent, that portion is empty. The line number is converted to a decimal
+        string using a custom integer-to-string routine that avoids all non-signal-safe
+        functions.
+
+        <notable reason="INT32_MIN overflow">
+          The integer-to-string conversion negates negative input values to obtain
+          absolute digits. If the line number is exactly the minimum signed 32-bit
+          integer value (-2147483648), negating it produces signed integer overflow,
+          which is undefined behavior. Line numbers in practice are always positive,
+          making this unreachable.
+        </notable>
+
+        <notable reason="truncation on long numbers">
+          The integer-to-string buffer is 15 characters. Numbers requiring more
+          than 15 digits are silently truncated. This is unreachable for line
+          numbers within any realistic source file.
+        </notable>
+      </stderr-output>
+
+      <process-termination order="4">
+        The process is terminated by calling abort, which raises SIGABRT and
+        generates a core dump if the system is configured to do so.
+      </process-termination>
+
+    </panic>
+
+    <talloc-abort-handler order="2">
+      When the memory management library detects an internal error (such as a double
+      free or heap corruption), it calls this handler with a reason string. If the
+      reason string is present, it is passed as the panic message. If the reason
+      string is absent, the message "talloc abort" is used. The file is recorded as
+      "&lt;talloc&gt;" and the line number as zero. The panic sequence then executes as
+      described above.
+    </talloc-abort-handler>
+
+    <coverage-exclusion order="3">
+      <notable reason="excluded from coverage">
+        The entire panic handler is excluded from code coverage measurement. Because
+        every execution path through the handler ends with process termination via
+        abort, no test can observe a return and coverage cannot be collected.
+      </notable>
+    </coverage-exclusion>
+
+  </behavior>
+
+</specification>

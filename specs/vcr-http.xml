@@ -1,0 +1,136 @@
+<specification topic="VCR HTTP">
+
+  <topic-statement>
+    The VCR HTTP layer intercepts HTTP client operations during test runs to deliver
+    pre-recorded response fixtures instead of making live network requests.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      VCR state tracking per HTTP handle, write-callback interception for record and
+      playback modes, chunk delivery during playback, synthetic completion signaling,
+      HTTP status code injection, and passthrough behavior when VCR is inactive.
+    </in-scope>
+
+    <boundary name="HTTP Client Library">
+      This layer wraps each HTTP client operation. When VCR is inactive, every
+      operation is forwarded unchanged to the underlying library. When VCR is active,
+      operations are intercepted as described.
+    </boundary>
+
+    <boundary name="VCR Fixture System">
+      This layer queries the fixture system for the active VCR mode, retrieves
+      response status codes and chunks during playback, records captured chunks
+      during recording, and checks whether more data remains. The fixture system
+      itself is outside scope.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="VCR Handle State">
+      <field name="handle" type="pointer" note="the HTTP easy handle this state belongs to" />
+      <field name="write callback" type="function pointer" nullable="true" note="the caller's original write callback" />
+      <field name="write context" type="pointer" nullable="true" note="the caller's original write context" />
+      <field name="http status" type="integer" note="HTTP response status code from the fixture" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <inactive-mode order="1">
+      When VCR is not active, all HTTP client calls are forwarded directly to the
+      underlying library with their arguments unchanged. No state tracking occurs.
+    </inactive-mode>
+
+    <write-callback-interception order="2">
+      When the caller registers a write callback on an HTTP handle, the VCR layer
+      intercepts this registration.
+
+      <record-mode order="1">
+        In record mode, the caller's callback and context are saved in per-handle
+        state. A wrapper callback is registered with the library in place of the
+        caller's callback, and the per-handle state is registered as the context.
+        When data arrives, the wrapper first forwards the chunk to the fixture system
+        for recording, then calls the original callback with the original context.
+        If the original callback is absent, the wrapper consumes the data silently
+        and reports success.
+      </record-mode>
+
+      <playback-mode order="2">
+        In playback mode, the caller's callback and context are saved in per-handle
+        state. The registration call returns success without forwarding anything to
+        the underlying library — no callback is registered with it.
+      </playback-mode>
+    </write-callback-interception>
+
+    <handle-lifecycle order="3">
+      When an HTTP handle is added to a multi-handle in playback mode, the HTTP
+      response status code is retrieved from the fixture system and stored in the
+      per-handle state. The message-delivered flag is reset to false for the new
+      request. The underlying library call is still made.
+
+      When an HTTP handle is cleaned up, any per-handle VCR state for that handle
+      is removed before the underlying cleanup call is made.
+    </handle-lifecycle>
+
+    <playback-data-delivery order="4">
+      When the HTTP multi-handle is polled for progress in playback mode, the next
+      chunk is retrieved from the fixture system. If a chunk is available, it is
+      delivered to the write callback of the first handle in the state list that
+      has a registered callback. The running-handles count is set to 1 if more
+      chunks remain, or 0 if the fixture is exhausted. If no chunk is available,
+      running-handles is set to 0. Success is always returned.
+
+      <notable reason="first-handle assumption">
+        Chunk delivery targets only the first handle in the state list that has
+        a registered callback. When multiple HTTP handles are active within one
+        multi-handle, chunks for subsequent handles are not delivered. The
+        implementation assumes at most one active handle per multi-handle.
+      </notable>
+    </playback-data-delivery>
+
+    <playback-wait order="5">
+      When the HTTP multi-handle wait operation is called in playback mode, it
+      returns immediately with success. The number-of-file-descriptors-ready output
+      is set to 1 to simulate activity. No actual waiting occurs.
+    </playback-wait>
+
+    <playback-completion-signaling order="6">
+      When the message-read operation is called in playback mode:
+
+      If the message has already been delivered for this request, zero messages
+      are reported and nothing is returned.
+
+      If the fixture has no more chunks and at least one handle exists in the state
+      list, a completion message is synthesized. The message carries the type
+      "done", the handle from the first entry in the state list, and a success
+      result code. The delivered flag is set to true. Zero further messages are
+      reported. The synthesized message is returned.
+
+      If the fixture still has chunks remaining, zero messages are reported and
+      nothing is returned.
+
+      <notable reason="single synthesized message object">
+        The synthesized completion message is written into a single static object.
+        Concurrent or overlapping requests would overwrite this object.
+      </notable>
+    </playback-completion-signaling>
+
+    <playback-status-retrieval order="7">
+      When the caller queries the HTTP response code for a handle in playback mode,
+      the status code stored in the per-handle state (populated when the handle was
+      added to the multi-handle) is written to the output parameter and success is
+      returned. All other info queries are forwarded to the underlying library.
+    </playback-status-retrieval>
+
+    <compile-time-scope order="8">
+      <notable reason="debug-only compilation">
+        This entire interception layer is only compiled in debug and test builds.
+        In release builds, the HTTP wrappers are defined as direct passthrough
+        functions inlined at the call site and the VCR layer does not exist.
+      </notable>
+    </compile-time-scope>
+
+  </behavior>
+
+</specification>

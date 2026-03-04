@@ -1,0 +1,54 @@
+<specification topic="JSON Allocator">
+
+  <topic-statement>
+    The JSON allocator bridges the JSON parsing library's pluggable allocation interface
+    to the talloc hierarchical memory manager so that all JSON-allocated memory is
+    tracked under a talloc context.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Construction of an allocator object that routes JSON library allocation calls
+      through talloc.
+    </in-scope>
+
+    <boundary name="JSON Library">
+      The allocator object produced by this component is passed directly to the JSON
+      library. The library uses it whenever it needs to allocate, reallocate, or free
+      memory during document parsing and construction.
+    </boundary>
+
+    <boundary name="Memory Management">
+      Allocations are made as talloc children of the context provided at allocator
+      creation. Frees are performed directly on the pointer without needing the parent
+      context, which is the expected behavior of talloc.
+    </boundary>
+  </scope>
+
+  <behavior>
+
+    <allocator-creation order="1">
+      An allocator object is created by providing a talloc context. The result is
+      returned by value (not heap-allocated). The allocator carries three operations:
+
+      <allocation order="1">
+        When the JSON library requests memory of a given size, it is allocated as a
+        talloc child of the context provided at allocator creation.
+      </allocation>
+
+      <reallocation order="2">
+        When the JSON library requests a resize, the pointer is reallocated to the
+        new size. The old size argument provided by the JSON library is ignored —
+        talloc tracks allocation sizes internally.
+      </reallocation>
+
+      <deallocation order="3">
+        When the JSON library releases memory, the pointer is freed via talloc. The
+        context argument provided by the JSON library is ignored — talloc does not
+        require the parent context to free a child.
+      </deallocation>
+    </allocator-creation>
+
+  </behavior>
+
+</specification>

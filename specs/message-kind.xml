@@ -1,0 +1,41 @@
+<specification topic="Message Kind Classification">
+
+  <topic-statement>
+    The message kind classifier determines whether a message kind string represents
+    a conversation turn that should be included in requests to a language model.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Classification of a kind string as a conversation kind or a non-conversation kind.
+    </in-scope>
+  </scope>
+
+  <behavior>
+
+    <classifying-a-kind order="1">
+      A kind string is provided. If the string is absent, the result is false. If the
+      string exactly matches one of the six recognized conversation kinds, the result
+      is true. Any other string produces false.
+
+      The six recognized conversation kinds are:
+      - "system"
+      - "user"
+      - "assistant"
+      - "tool_call"
+      - "tool_result"
+      - "tool"
+
+      <notable reason="legacy kind">
+        The kind "tool" is treated as a conversation kind. It is annotated in the
+        implementation as a legacy or wire-format message type, distinct from the
+        current "tool_call" and "tool_result" kinds.
+      </notable>
+
+      All other kind strings — representing metadata events, agent lifecycle events,
+      UI events, and any unrecognized values — produce false.
+    </classifying-a-kind>
+
+  </behavior>
+
+</specification>

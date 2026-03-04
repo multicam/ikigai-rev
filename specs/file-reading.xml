@@ -1,0 +1,92 @@
+<specification topic="File Reading">
+
+  <topic-statement>
+    The file reading utility reads the complete contents of a file from the filesystem
+    into a null-terminated in-memory buffer.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Opening a file, determining its size, reading all bytes into a heap-allocated
+      buffer, and null-terminating the result.
+    </in-scope>
+
+    <boundary name="Filesystem">
+      This topic opens, seeks, reads, and closes a file by path. Any operation that
+      fails produces an I/O error returned to the caller.
+    </boundary>
+
+    <boundary name="Memory Management">
+      The output buffer is allocated as a child of the provided context. The caller
+      is responsible for managing its lifetime through talloc.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Input">
+      <field name="path" type="text" note="filesystem path to read" />
+      <field name="out_size" type="pointer to unsigned integer" required="false" note="receives byte count if provided" />
+    </contract>
+    <contract name="Output">
+      <field name="content" type="text buffer" note="heap-allocated, null-terminated, contains all file bytes followed by a null byte" />
+      <field name="size" type="unsigned integer" note="number of bytes in the file, not counting the null terminator; only written if out_size was provided" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <reading-a-file order="1">
+
+      <open order="1">
+        The file is opened in binary read mode. If the open fails, an I/O error is
+        returned and no further operations are attempted.
+      </open>
+
+      <size-determination order="2">
+        The file position is seeked to the end to determine file size. If the seek
+        fails, the file is closed and an I/O error is returned. The byte offset at
+        the end is retrieved. If that operation fails, the file is closed and an I/O
+        error is returned. The position is then seeked back to the beginning. If that
+        seek fails, the file is closed and an I/O error is returned.
+      </size-determination>
+
+      <overflow-check order="3">
+        If the file size exceeds the maximum unsigned 32-bit value minus one, the
+        file is closed and an I/O error is returned indicating the file is too large.
+
+        <notable reason="boundary uses UINT_MAX not SIZE_MAX">
+          The overflow boundary is UINT_MAX (4,294,967,295) rather than SIZE_MAX.
+          On 64-bit systems where SIZE_MAX is much larger, this artificially limits
+          the maximum readable file size to approximately 4 GB.
+        </notable>
+      </overflow-check>
+
+      <buffer-allocation order="4">
+        A buffer of size plus one bytes is allocated. Allocation failure terminates
+        the process immediately.
+      </buffer-allocation>
+
+      <read order="5">
+        All bytes are read into the buffer. The file is closed immediately after the
+        read regardless of success. If the number of bytes read does not equal the
+        expected file size, an I/O error is returned.
+
+        <notable reason="buffer leaks on read failure">
+          When a short read is detected, an I/O error is returned but the allocated
+          buffer is not freed. The allocated memory remains attached to the provided
+          context until that context is freed.
+        </notable>
+      </read>
+
+      <null-termination order="6">
+        A null byte is written immediately after the last byte of file content. The
+        content pointer and file size are written to the caller's output parameters.
+        The size output parameter is only written if it was provided by the caller.
+        The result carries the content pointer.
+      </null-termination>
+
+    </reading-a-file>
+
+  </behavior>
+
+</specification>

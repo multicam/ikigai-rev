@@ -1,0 +1,115 @@
+<specification topic="Generic Array">
+
+  <topic-statement>
+    The generic array is a type-agnostic resizable collection that stores fixed-size
+    elements contiguously and grows its capacity on demand.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Array creation, element appending, element insertion, element deletion, element
+      replacement, element access, size and capacity queries, and the byte-typed
+      specialization of the generic array.
+    </in-scope>
+
+    <boundary name="Memory Management">
+      This topic allocates memory and panics on allocation failure. Memory ownership
+      follows the talloc hierarchy — the array and its buffer are children of the
+      context provided at creation. Freeing the context frees the array and buffer.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Array">
+      <field name="element size" type="unsigned integer" note="bytes per element; must be greater than zero" />
+      <field name="increment" type="unsigned integer" note="capacity for first allocation; must be greater than zero" />
+      <field name="size" type="unsigned integer" note="current number of elements; starts at zero" />
+      <field name="capacity" type="unsigned integer" note="allocated capacity in elements; starts at zero" />
+      <field name="buffer" type="pointer" nullable="true" note="null until first insertion or append" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <creation order="1">
+      A new array is created by supplying an element size and an increment value. If
+      either value is zero, creation fails with an invalid-argument error and no array
+      is returned. On success, the array starts with zero elements, zero capacity, and
+      no allocated buffer. No buffer is allocated at creation time.
+    </creation>
+
+    <appending order="2">
+      An element is appended to the end of the array. If the current number of elements
+      equals the current capacity, the array grows before the element is copied. The
+      element is copied by value using the element size specified at creation. The
+      element count increases by one. The operation always succeeds — any allocation
+      failure terminates the process.
+
+      <shared topic="Capacity Growth">
+        When the array is full, capacity is expanded. If the current capacity is zero,
+        the new capacity equals the increment. Otherwise the new capacity doubles. The
+        buffer is reallocated to hold the new capacity. Allocation failure terminates
+        the process immediately.
+      </shared>
+    </appending>
+
+    <insertion order="3">
+      An element is inserted at a specified index. The index must be between zero and
+      the current element count inclusive — inserting at the end is valid. If the array
+      is full, it grows first. All elements from the insertion index to the end are
+      shifted one position toward the end to make room. The new element is then copied
+      into the vacated slot. The element count increases by one. Allocation failure
+      terminates the process.
+    </insertion>
+
+    <deletion order="4">
+      An element at a specified index is removed. All elements after the deleted index
+      are shifted one position toward the beginning. The element count decreases by one.
+      The allocated buffer capacity is never reduced. No validation is performed — the
+      index must be within bounds.
+    </deletion>
+
+    <replacement order="5">
+      An element at a specified index is overwritten by copying the new element value
+      into the slot. The element count does not change. The index must be within bounds
+      — no validation is performed.
+    </replacement>
+
+    <clearing order="6">
+      All elements are removed by setting the element count to zero. The allocated
+      buffer is not freed and the capacity is unchanged. After clearing, the array
+      reports zero elements but its capacity remains at whatever it was before.
+    </clearing>
+
+    <element-access order="7">
+      A direct pointer into the buffer at the requested index is returned. The pointer
+      is valid until the next mutation that may reallocate the buffer. The index must
+      be within bounds — no validation is performed.
+    </element-access>
+
+    <size-and-capacity-queries order="8">
+      The current element count and current allocated capacity can each be queried
+      independently. Both return unsigned integer values.
+    </size-and-capacity-queries>
+
+    <byte-typed-specialization order="9">
+      A byte-typed specialization of the generic array stores unsigned 8-bit values.
+      It has the same creation, append, insert, delete, clear, and size operations as
+      the generic array, using an element size of one byte. The get operation differs:
+      it returns the byte value directly rather than a pointer into the buffer.
+      There is no capacity query exposed by the byte-typed specialization.
+    </byte-typed-specialization>
+
+    <overflow-protection order="10">
+      <notable reason="theoretical only">
+        Integer overflow protection is present for capacity doubling and buffer
+        allocation size, but these limits require storing more elements than any
+        64-bit system can physically hold (on the order of exabytes). In practice,
+        the process runs out of memory and aborts long before the overflow condition
+        could be reached.
+      </notable>
+    </overflow-protection>
+
+  </behavior>
+
+</specification>
