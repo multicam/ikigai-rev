@@ -1,0 +1,162 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    container:
+      image: debian:13.2@sha256:c71b05eac0b20adb4cdcc9f7b052227efd7da381ad10bb92f972e8eae7c6cdc9
+      env:
+        PGHOST: postgres
+        IKIGAI_DEV: 1
+        IKIGAI_BIN_DIR: ${{ github.workspace }}/bin
+        IKIGAI_CONFIG_DIR: ${{ github.workspace }}/etc
+        IKIGAI_DATA_DIR: ${{ github.workspace }}/share
+        IKIGAI_LIBEXEC_DIR: ${{ github.workspace }}/libexec
+        IKIGAI_CACHE_DIR: ${{ github.workspace }}/cache
+        IKIGAI_STATE_DIR: ${{ github.workspace }}/state
+        OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+        BRAVE_API_KEY: ${{ secrets.BRAVE_API_KEY }}
+        GOOGLE_SEARCH_API_KEY: ${{ secrets.GOOGLE_SEARCH_API_KEY }}
+        GOOGLE_SEARCH_ENGINE_ID: ${{ secrets.GOOGLE_SEARCH_ENGINE_ID }}
+        NTFY_API_KEY: ${{ secrets.NTFY_API_KEY }}
+        NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: ikigai
+          POSTGRES_PASSWORD: ikigai
+          POSTGRES_DB: ikigai
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+    - name: Install git for paths-filter
+      run: |
+        apt-get update && apt-get install -y git
+        git config --global --add safe.directory /__w/ikigai/ikigai
+
+    - uses: actions/checkout@v4
+
+    - name: Check if code changed
+      id: filter
+      uses: dorny/paths-filter@v3
+      with:
+        filters: |
+          code:
+            - 'apps/**'
+            - 'shared/**'
+            - 'tests/**'
+            - 'Makefile'
+
+    - name: Install build dependencies
+      if: steps.filter.outputs.code == 'true'
+      run: |
+        apt-get update
+        apt-get upgrade -y
+        apt-get install -y \
+          build-essential \
+          uncrustify \
+          complexity \
+          check \
+          libtalloc-dev \
+          libulfius-dev \
+          libcurl4-gnutls-dev \
+          uuid-dev \
+          libb64-dev \
+          libutf8proc-dev \
+          libpq-dev \
+          libxkbcommon-dev \
+          postgresql-client \
+          lcov \
+          valgrind \
+          git \
+          sudo \
+          libxml2-dev \
+          bc \
+          debhelper \
+          dpkg-dev \
+          fakeroot
+
+    - name: Debug info - Environment
+      if: steps.filter.outputs.code == 'true'
+      run: |
+        echo "=== OS Information ==="
+        cat /etc/os-release
+        echo ""
+        echo "=== Kernel ==="
+        uname -a
+        echo ""
+        echo "=== Toolchain ==="
+        echo "gcc:" && gcc --version
+        echo ""
+        echo "ld:" && ld --version
+        echo ""
+        echo "binutils:" && dpkg -l binutils | grep binutils || true
+        echo ""
+        echo "=== Build Tools ==="
+        echo "make:" && make --version | head -1
+        echo "lcov:" && lcov --version
+        echo ""
+        echo "=== Environment Variables ==="
+        env | grep -E "^(PATH|CC|CFLAGS|LDFLAGS|BUILD|IKIGAI_|PG)" | sort
+        echo ""
+        echo "=== Working Directory ==="
+        pwd
+        ls -la
+        echo ""
+        echo "=== Disk Space ==="
+        df -h .
+
+    - name: Verify PostgreSQL connectivity
+      if: steps.filter.outputs.code == 'true'
+      run: |
+        psql "postgresql://ikigai:ikigai@postgres/ikigai" -c "SELECT 1"
+
+    - name: check-compile
+      if: steps.filter.outputs.code == 'true'
+      run: make RAW=1 check-compile
+
+    - name: check-link
+      if: steps.filter.outputs.code == 'true'
+      run: make RAW=1 check-link
+
+    - name: check-filesize
+      if: steps.filter.outputs.code == 'true'
+      run: make RAW=1 check-filesize
+
+    - name: Create non-root user for tests
+      if: steps.filter.outputs.code == 'true'
+      run: |
+        useradd -m -s /bin/bash testuser
+        chown -R testuser:testuser .
+
+    - name: check-unit
+      if: steps.filter.outputs.code == 'true'
+      run: |
+        rm -rf /tmp/.ikigai
+        sudo -E -u testuser make RAW=1 check-unit MAKE_JOBS=1
+
+    - name: check-integration
+      if: steps.filter.outputs.code == 'true'
+      run: |
+        rm -rf /tmp/.ikigai
+        sudo -E -u testuser make RAW=1 check-integration
+
+    - name: check-complexity
+      if: steps.filter.outputs.code == 'true'
+      run: make RAW=1 check-complexity

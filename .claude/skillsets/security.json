@@ -1,0 +1,10 @@
+{
+  "preload": [
+    "errors",
+    "naming",
+    "style",
+    "align",
+    "principles"
+  ],
+  "advertise": []
+}

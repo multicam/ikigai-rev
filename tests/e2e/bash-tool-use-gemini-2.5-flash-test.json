@@ -1,0 +1,20 @@
+{
+  "name": "tool use with gemini-2.5-flash returns current working directory",
+  "steps": [
+    {"send_keys": "/clear\\r"},
+    {"wait": 0.5},
+    {"send_keys": "/model gemini-2.5-flash/low\\r"},
+    {"wait": 0.5},
+    {"mock_expect": {"responses": [{"tool_calls": [{"name": "bash", "arguments": {"command": "pwd"}}]}, {"content": "The current working directory is /home/user/projects/ikigai."}]}},
+    {"send_keys": "use your bash tool to return the current working directory\\r"},
+    {"wait_idle": 15000},
+    {"read_framebuffer": true}
+  ],
+  "assert": [
+    {"contains": "gemini-2.5-flash/low"},
+    {"line_prefix": "→ bash:"},
+    {"line_prefix": "← bash:"},
+    {"line_prefix": "●"}
+  ],
+  "assert_mock": []
+}

@@ -1,0 +1,22 @@
+# Helgrind suppression file for ikigai
+
+# libp11-kit false positives - mutex_destroy in library cleanup
+{
+   libp11kit_mutex_destroy
+   Helgrind:Misc
+   fun:mutex_destroy_WRK
+   obj:*/libp11-kit.so.*
+   ...
+}
+
+# glibc timezone data races - known false positives in localtime_r
+# The timezone functions access shared timezone data structures
+# but are safe for read-only access which is our use case
+{
+   glibc_timezone_data_race
+   Helgrind:Race
+   ...
+   fun:__tz_convert
+   fun:ik_log_format_timestamp_impl
+   ...
+}

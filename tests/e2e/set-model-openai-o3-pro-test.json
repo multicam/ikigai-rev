@@ -1,0 +1,21 @@
+{
+  "name": "set model to openai o3-pro with low reasoning",
+  "steps": [
+    {"send_keys": "/clear\\r"},
+    {"wait": 0.5},
+    {"send_keys": "/model o3-pro/low\\r"},
+    {"wait": 0.5},
+    {"mock_expect": {"responses": [{"content": "Mock response from o3-pro."}]}},
+    {"send_keys": "Hello\\r"},
+    {"wait_idle": 30000},
+    {"read_framebuffer": true}
+  ],
+  "assert": [
+    {"contains": "o3-pro/low"},
+    {"contains": "effort: low"},
+    {"line_prefix": "●"}
+  ],
+  "assert_mock": [
+    {"contains": "Mock response from o3-pro."}
+  ]
+}

@@ -1,0 +1,193 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+#
+# harness/prune/run - Create and queue a dead code removal goal
+#
+# 1. Runs check-prune to get candidates
+# 2. Picks a random candidate
+# 3. Creates a Ralph goal
+# 4. Queues the goal for orchestrator pickup
+#
+
+require 'json'
+require 'optparse'
+require 'open3'
+
+SCRIPT_DIR = File.dirname(File.realpath(__FILE__))
+PROJECT_ROOT = File.expand_path('../../..', SCRIPT_DIR)
+CHECK_SCRIPT = File.join(PROJECT_ROOT, '.claude/scripts/check-prune')
+RALPH_PIPELINE = File.expand_path('~/projects/ralph-pipeline/scripts')
+GOAL_CREATE_SCRIPT = File.join(RALPH_PIPELINE, 'goal-create')
+GOAL_QUEUE_SCRIPT = File.join(RALPH_PIPELINE, 'goal-queue')
+GOAL_TEMPLATE = File.join(SCRIPT_DIR, 'goal-template.md')
+
+def log(msg)
+  timestamp = Time.now.strftime('%Y-%m-%d %H:%M:%S')
+  puts "#{timestamp} | prune      | #{msg}"
+end
+
+def run_check_prune
+  log 'Running check-prune...'
+  output = `#{CHECK_SCRIPT} 2>&1`
+  exit_code = $?.exitstatus
+
+  begin
+    result = JSON.parse(output)
+  rescue JSON::ParserError => e
+    log "ERROR: Failed to parse check-prune output: #{e.message}"
+    log "Output: #{output[0..500]}"
+    return nil
+  end
+
+  if result['ok']
+    log 'No dead code candidates found'
+    return []
+  end
+
+  # Parse items: "function:file:line"
+  candidates = result['items'].map do |item|
+    parts = item.split(':')
+    next nil if parts.length < 3
+
+    {
+      function: parts[0],
+      file: parts[1],
+      line: parts[2]
+    }
+  end.compact
+
+  log "Found #{candidates.length} candidates"
+  candidates
+end
+
+def render_goal_body(candidate)
+  function = candidate[:function]
+  file = candidate[:file]
+  line = candidate[:line]
+
+  template = File.read(GOAL_TEMPLATE)
+  template
+    .gsub('{{function}}', function)
+    .gsub('{{file}}', file)
+    .gsub('{{line}}', line)
+end
+
+def create_goal(candidate)
+  function = candidate[:function]
+  title = "Prune dead code: #{function}"
+  body = render_goal_body(candidate)
+
+  log "Creating goal: #{title}"
+
+  # Pipe body to goal-create (org/repo auto-derived from git remote origin)
+  cmd = [GOAL_CREATE_SCRIPT, '--title', title]
+  stdout, status = Open3.capture2(*cmd, stdin_data: body, err: '/dev/null')
+
+  unless status.success?
+    log "ERROR: goal-create failed"
+    log "Output: #{stdout[0..500]}"
+    return nil
+  end
+
+  begin
+    result = JSON.parse(stdout)
+  rescue JSON::ParserError => e
+    log "ERROR: Failed to parse goal-create output: #{e.message}"
+    log "Output: #{stdout[0..500]}"
+    return nil
+  end
+
+  unless result['ok']
+    log "ERROR: goal-create returned error: #{result['items']}"
+    return nil
+  end
+
+  result['id']
+end
+
+def queue_goal(goal_number)
+  log "Queuing goal ##{goal_number}"
+
+  output = `#{GOAL_QUEUE_SCRIPT} #{goal_number} 2>&1`
+  exit_code = $?.exitstatus
+
+  unless exit_code == 0
+    log "ERROR: goal-queue failed"
+    log "Output: #{output[0..500]}"
+    return false
+  end
+
+  begin
+    result = JSON.parse(output)
+  rescue JSON::ParserError => e
+    log "ERROR: Failed to parse goal-queue output: #{e.message}"
+    log "Output: #{output[0..500]}"
+    return false
+  end
+
+  unless result['ok']
+    log "ERROR: goal-queue returned error: #{result['items']}"
+    return false
+  end
+
+  true
+end
+
+def main
+  options = {}
+
+  OptionParser.new do |opts|
+    opts.banner = 'Usage: fix-prune [options]'
+
+    opts.on('--function NAME', 'Target specific function instead of random') do |f|
+      options[:function] = f
+    end
+  end.parse!
+
+  Dir.chdir(PROJECT_ROOT)
+
+  # Get candidates
+  candidates = run_check_prune
+  exit 0 if candidates.nil? || candidates.empty?
+
+  # Filter to specific function if requested
+  if options[:function]
+    candidates = candidates.select { |c| c[:function] == options[:function] }
+    if candidates.empty?
+      log "ERROR: Function '#{options[:function]}' not found in candidates"
+      exit 1
+    end
+  end
+
+  # Pick random candidate
+  candidate = candidates.sample
+  log "Selected: #{candidate[:function]} at #{candidate[:file]}:#{candidate[:line]}"
+
+  # Create goal
+  goal_number = create_goal(candidate)
+  unless goal_number
+    log 'ERROR: Failed to create goal'
+    exit 1
+  end
+
+  log "Created goal ##{goal_number}"
+
+  # Queue goal
+  unless queue_goal(goal_number)
+    log 'ERROR: Failed to queue goal'
+    exit 1
+  end
+
+  log "Goal ##{goal_number} queued successfully"
+  puts JSON.generate(ok: true, number: goal_number)
+  exit 0
+end
+
+if __FILE__ == $PROGRAM_NAME
+  begin
+    main
+  rescue Interrupt
+    exit 130
+  end
+end

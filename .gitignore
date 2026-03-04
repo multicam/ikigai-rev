@@ -1,0 +1,73 @@
+build/
+build-*/
+/bin/
+/reports/
+dist/
+/demo.md
+/banner.md
+/coverage/
+tags
+/cache/
+/state/
+
+**/*.py
+__pycache__/
+
+**/core.*
+!**/core.c
+!**/core.h
+**/vgcore.*
+**/*.o
+**/*.gcov
+**/*.gcda
+**/*.gcno
+**/*.d
+**/*.info
+coverage_html/
+
+# Agent runtime data
+.claude/data/scratch.md
+.agents/logs/
+.ikigai/logs/
+.ikigai/history
+.ikigai/debug/
+.agents/db/
+.agents/deno/
+.ikigai/deno/
+.claude/logs/
+.claude/harness/*/history.md
+.claude/harness/*/history.jsonl
+.claude/harness/ralph/process.log
+.claude/harness/*/*-progress.jsonl
+.claude/harness/*/*-summary.md
+.claude/harness/*/*-summary-meta.json
+
+# Ralph loop state files (any directory)
+**/*-ralph-goal.md
+!.claude/harness/*/*-ralph-goal.md
+**/*-ralph-progress.jsonl
+**/*-ralph-summary.md
+**/*-ralph-summary-meta.json
+**/harness-ruby-progress.jsonl
+**/harness-ruby-summary.md
+**/harness-ruby-summary-meta.json
+
+# Pipeline orchestrator clones
+.ralphs/
+
+# Pipeline runtime cache (goal files, logs, ralph runtime files)
+.pipeline/cache/
+
+# Debug log (DEBUG builds only)
+IKIGAI_DEBUG.LOG
+
+# Credentials
+etc/ikigai/credentials.json
+
+# Nginx runtime
+.agents/httpd/pid/
+
+# Runit runtime (supervise dirs are created by runsv)
+.agents/sv/*/supervise/
+.agents/sv/*/log/supervise/
+libexec/

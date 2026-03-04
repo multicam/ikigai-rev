@@ -1,0 +1,24 @@
+{
+  "preload": [
+    "align",
+    "coverage",
+    "ctags",
+    "errors",
+    "jj",
+    "lcov",
+    "debugger",
+    "makefile",
+    "memory",
+    "mocking",
+    "naming",
+    "principles",
+    "quality",
+    "scm",
+    "style",
+    "tdd",
+    "testability"
+  ],
+  "advertise": [
+    {"skill": "database", "description": "PostgreSQL schema and query patterns"}
+  ]
+}

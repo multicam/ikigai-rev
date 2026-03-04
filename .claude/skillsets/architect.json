@@ -1,0 +1,15 @@
+{
+  "preload": [
+    "ddd",
+    "di",
+    "errors",
+    "meta",
+    "naming",
+    "source-code",
+    "style",
+    "tdd",
+    "align",
+    "principles"
+  ],
+  "advertise": []
+}

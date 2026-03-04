@@ -1,0 +1,131 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+#
+# ikigai-ctl - Send requests to the ikigai control socket
+#
+# Usage: ikigai-ctl <message-type> [args...] [--socket PATH]
+#
+# Examples:
+#   ikigai-ctl read_framebuffer
+#   ikigai-ctl send_keys "hello world\r"
+#   ikigai-ctl wait_idle 10000
+#   ikigai-ctl read_framebuffer --socket /tmp/ikigai-1234.sock
+#
+
+require "socket"
+require "json"
+
+def die(msg)
+  $stderr.puts "error: #{msg}"
+  exit 1
+end
+
+def usage
+  $stderr.puts <<~TEXT
+    Usage: ikigai-ctl <message-type> [args...] [--socket PATH]
+
+    Examples:
+      ikigai-ctl read_framebuffer
+      ikigai-ctl send_keys "hello world\\r"
+      ikigai-ctl wait_idle 10000
+      ikigai-ctl read_framebuffer --socket /path/to/ikigai-1234.sock
+  TEXT
+  exit 1
+end
+
+# Parse arguments
+message_type = nil
+message_arg = nil
+socket_path = nil
+
+args = ARGV.dup
+while (arg = args.shift)
+  case arg
+  when "--socket"
+    die "--socket requires a path argument" if args.empty?
+    socket_path = args.shift
+  when "--help", "-h"
+    usage
+  when /\A-/
+    die "unknown option: #{arg}"
+  else
+    if message_type.nil?
+      message_type = arg
+    elsif message_arg.nil?
+      message_arg = arg
+    else
+      die "unexpected argument: #{arg}"
+    end
+  end
+end
+
+usage if message_type.nil?
+
+die "send_keys requires a keys argument" if message_type == "send_keys" && message_arg.nil?
+
+# Auto-discover socket if not specified
+if socket_path.nil?
+  runtime_dir = ENV["IKIGAI_RUNTIME_DIR"]
+  die "IKIGAI_RUNTIME_DIR is not set and --socket not specified" if runtime_dir.nil? || runtime_dir.empty?
+
+  sockets = Dir.glob("#{runtime_dir}/ikigai-*.sock").select { |f| File.socket?(f) }
+
+  case sockets.size
+  when 0
+    die "ikigai is not running (no sockets found in #{runtime_dir})"
+  when 1
+    socket_path = sockets[0]
+  else
+    $stderr.puts "error: multiple ikigai instances found:"
+    sockets.each { |s| $stderr.puts "  #{s}" }
+    $stderr.puts ""
+    $stderr.puts "Specify one with: ikigai-ctl #{message_type} --socket PATH"
+    exit 1
+  end
+end
+
+die "socket not found: #{socket_path}" unless File.socket?(socket_path)
+
+def send_request(socket_path, request_json)
+  sock = UNIXSocket.new(socket_path)
+  sock.write(request_json)
+  sock.write("\n")
+
+  sock.read
+rescue Errno::ECONNREFUSED
+  die "failed to connect to #{socket_path}"
+ensure
+  sock&.close
+end
+
+case message_type
+when "send_keys"
+  interpreted = message_arg
+    .gsub("\\r", "\r")
+    .gsub("\\n", "\n")
+    .gsub("\\t", "\t")
+    .gsub("\\e", "\e")
+    .gsub("\\\\", "\\")
+
+  response = nil
+  interpreted.each_char.with_index do |char, i|
+    request = JSON.generate({ type: "send_keys", keys: char })
+    response = send_request(socket_path, request)
+    sleep 0.05 if i < interpreted.size - 1
+  end
+  puts response
+
+when "wait_idle"
+  timeout_ms = (message_arg || "10000").to_i
+  request = JSON.generate({ type: "wait_idle", timeout_ms: timeout_ms })
+  response = send_request(socket_path, request)
+  puts response
+  parsed = JSON.parse(response)
+  exit(parsed["type"] == "idle" ? 0 : 1)
+
+else
+  request = JSON.generate({ type: message_type })
+  response = send_request(socket_path, request)
+  puts response
+end

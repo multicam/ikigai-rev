@@ -1,0 +1,21 @@
+{
+  "name": "set model to openai o4-mini with low reasoning",
+  "steps": [
+    {"send_keys": "/clear\\r"},
+    {"wait": 0.5},
+    {"send_keys": "/model o4-mini/low\\r"},
+    {"wait": 0.5},
+    {"mock_expect": {"responses": [{"content": "Mock response from o4-mini."}]}},
+    {"send_keys": "Hello\\r"},
+    {"wait_idle": 15000},
+    {"read_framebuffer": true}
+  ],
+  "assert": [
+    {"contains": "o4-mini/low"},
+    {"contains": "effort: low"},
+    {"line_prefix": "●"}
+  ],
+  "assert_mock": [
+    {"contains": "Mock response from o4-mini."}
+  ]
+}
