@@ -1,0 +1,212 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<specification topic="Scrollback Layout">
+
+  <topic-statement>
+    The scrollback layout system computes and maintains the terminal row count
+    for each stored text line, recalculating that count arithmetically — without
+    rescanning text — when the terminal width changes.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Buffer initialization, line appending with layout computation, terminal
+      resize reflow, logical-line-to-physical-row lookup, and line text retrieval.
+    </in-scope>
+
+    <boundary name="Text rendering">
+      This specification covers which physical rows a line occupies. The
+      computation of which bytes of a line correspond to a specific physical
+      row — used when rendering a partial line during scrolling — is a
+      separate concern.
+    </boundary>
+
+    <boundary name="Memory management">
+      Allocation failure causes the process to abort immediately. No error is
+      returned to the caller.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Scrollback buffer">
+      <field name="lines" type="ordered list of logical lines" />
+      <field name="terminal width" type="positive integer" note="cached value of the last width used for layout computation; used to detect when reflow is needed" />
+      <field name="total physical rows" type="non-negative integer" note="cached sum of all stored lines' physical row counts" />
+    </contract>
+
+    <contract name="Line layout">
+      <field name="segment widths" type="array of non-negative integers" note="one entry per newline-delimited segment; entry count equals newline count plus one; immutable after initial computation" />
+      <field name="display width" type="non-negative integer" note="sum of all segment widths; immutable after initial computation" />
+      <field name="physical row count" type="positive integer" note="recalculated when terminal width changes; always at least one" />
+      <field name="newline count" type="non-negative integer" note="count of embedded newline characters; immutable after initial computation" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <buffer-initialization order="1">
+      A new scrollback buffer is created with an initial capacity for 16 lines
+      and 1024 bytes of text storage. No lines are stored. The supplied terminal
+      width is recorded as the current width. The cached total physical row count
+      is zero.
+    </buffer-initialization>
+
+    <line-appending order="2">
+      A logical line is added by supplying its text as a byte sequence. The
+      text is stored verbatim, then a layout is computed for the line.
+
+      <text-storage order="1">
+        The text bytes are appended to a contiguous text store. If the store
+        cannot hold the incoming bytes plus a null terminator, its capacity is
+        doubled repeatedly until it can. An offset into the text store and a
+        byte length are recorded for the new line.
+
+        <notable reason="capacity never shrinks">
+          Once grown, the text store never releases that capacity, even after
+          lines are removed.
+        </notable>
+      </text-storage>
+
+      <layout-computation order="2">
+        A single pass over the text is performed to compute the line's layout.
+        The text is divided into segments at each embedded newline character.
+        For each segment, the display width is computed as the sum of the
+        display widths of its characters.
+
+        <display-width-rules order="1">
+          ANSI CSI escape sequences are detected and consumed entirely without
+          contributing any display width. Newline characters serve as segment
+          boundaries and contribute no display width to any segment. Each
+          valid Unicode codepoint contributes the number of display columns
+          defined by the Unicode character width tables for that codepoint.
+          Each invalid UTF-8 byte contributes exactly one display column.
+        </display-width-rules>
+
+        <segment-width-storage order="2">
+          The display width of each segment is stored in an array. The array
+          has exactly one more entry than the line's newline count. The stored
+          segment widths are immutable and never modified after this initial
+          computation. The sum of all segment widths is also stored as the
+          line's total display width.
+        </segment-width-storage>
+
+        <physical-row-calculation order="3">
+          The number of physical terminal rows the line occupies is derived
+          from the segment widths and the current terminal width.
+
+          For each segment whose display width is greater than zero, the row
+          count for that segment is the smallest integer greater than or equal
+          to the segment's display width divided by the terminal width (ceiling
+          division).
+
+          For each segment whose display width is zero, the row count for that
+          segment is exactly one.
+
+          The line's total physical row count is the sum of the row counts for
+          all segments.
+
+          <notable reason="empty line occupies one row">
+            A line with no text has one segment with zero display width. That
+            segment contributes one row, so an empty line always occupies
+            exactly one physical row.
+          </notable>
+
+          <notable reason="trailing newline produces an extra row">
+            A line ending with a newline character has an empty trailing
+            segment with zero display width. That segment contributes one row.
+            The text "hello\n" therefore occupies two physical rows at any
+            terminal width wide enough to hold "hello" on a single row.
+          </notable>
+
+          <notable reason="each embedded newline adds at least one row">
+            Every empty segment between consecutive newlines contributes one
+            row. The text "A\n\nB" produces three segments — "A", "", and "B"
+            — and occupies three physical rows at any terminal width of at
+            least one column.
+          </notable>
+        </physical-row-calculation>
+
+        <total-update order="4">
+          The new line's physical row count is added to the buffer's cached
+          total physical row count.
+        </total-update>
+      </layout-computation>
+
+      <line-array-growth order="3">
+        If the line array is at capacity, it is doubled before storing the
+        new entry. The text offset and length arrays are grown in parallel
+        to maintain the same capacity.
+      </line-array-growth>
+    </line-appending>
+
+    <terminal-resize order="3">
+      When a terminal width is supplied to ensure the layout is current, the
+      supplied width is compared to the cached terminal width.
+
+      <no-change-early-exit order="1">
+        If the supplied width equals the cached width, the operation returns
+        immediately. No computation is performed.
+      </no-change-early-exit>
+
+      <reflow order="2">
+        When the supplied width differs from the cached width, the physical row
+        count of every stored line is recalculated using its stored segment
+        widths and the new terminal width. The same rules apply: zero-width
+        segments contribute one row; positive-width segments contribute the
+        ceiling of their display width divided by the new terminal width.
+
+        The text bytes are not read during reflow. Only the stored, immutable
+        segment widths are used.
+
+        The cached total physical row count and the cached terminal width are
+        updated to reflect the new values.
+
+        <notable reason="reflow requires no text parsing">
+          No Unicode decoding or ANSI sequence detection occurs during
+          terminal resize. All per-segment display widths were captured at
+          append time. Reflow performs only integer arithmetic on those
+          stored values.
+        </notable>
+      </reflow>
+    </terminal-resize>
+
+    <physical-row-lookup order="4">
+      A physical row number (zero-based from the top of the buffer) is mapped
+      to a logical line index and a row offset within that line.
+
+      The buffer is scanned from the first line. For each line, its physical
+      row count is accumulated into a running total. When the running total
+      first exceeds the requested physical row number, that line is the result.
+      The row offset within the line is the requested row number minus the
+      accumulated total of all preceding lines.
+
+      If the requested physical row number is greater than or equal to the
+      buffer's total physical row count, the lookup fails.
+    </physical-row-lookup>
+
+    <line-text-retrieval order="5">
+      A logical line's stored text is retrieved by its zero-based line index.
+      The operation returns a pointer into the text store at the line's recorded
+      offset, along with the line's recorded byte length. The returned pointer
+      remains valid until the buffer is next modified.
+
+      If the supplied index equals or exceeds the number of stored lines, the
+      retrieval fails.
+    </line-text-retrieval>
+
+    <buffer-clear order="6">
+      All stored lines and their layout data are discarded. The line count,
+      text byte usage, and total physical row count are reset to zero. The
+      allocated capacity of the line arrays and the text store is preserved
+      and not released.
+    </buffer-clear>
+
+    <buffer-copy order="7">
+      All lines from a source buffer are appended to a destination buffer one
+      by one in order. Each line undergoes a full layout computation against
+      the destination buffer's current terminal width. The source buffer is
+      not modified.
+    </buffer-copy>
+
+  </behavior>
+
+</specification>

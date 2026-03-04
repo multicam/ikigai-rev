@@ -1,0 +1,149 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<specification topic="Terminal Layers">
+
+  <topic-statement>
+    The terminal UI is composed of seven named layers that render specific
+    content to distinct regions of the terminal screen, stacking from top to
+    bottom to form the complete interactive display.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      The identity, content, visibility rules, and height of each of the seven
+      layers, and their spatial relationship to each other.
+    </in-scope>
+
+    <boundary name="Layer rendering">
+      How layers are composited, clipped to the viewport, and written to the
+      terminal in a single atomic pass is covered by the layer rendering
+      specification.
+    </boundary>
+
+    <boundary name="Scrollback buffer">
+      How the text lines stored in the scrollback buffer are structured and
+      how physical row counts are computed is covered by the scrollback buffer
+      specification.
+    </boundary>
+  </scope>
+
+  <behavior>
+
+    <stack-order order="1">
+      The seven layers occupy the terminal from top to bottom in the following
+      fixed order:
+
+      1. Banner
+      2. Scrollback
+      3. Separator
+      4. Input
+      5. Spinner
+      6. Status
+      7. Completion
+
+      The scrollback region dominates the middle of the terminal and expands
+      or contracts to fill whatever vertical space is not consumed by the other
+      layers.
+    </stack-order>
+
+    <banner-layer order="2">
+      The banner is an optional decorative header occupying exactly 6 rows. It
+      displays a stylized ASCII art face with the application name and version.
+      The visual elements use 256-color styling: cyan eyes with gold pupils,
+      a coral smile, dim gray border lines, soft blue version text, and a
+      light-gray tagline. The top and bottom of the banner are framed by
+      double horizontal lines.
+
+      The banner contains no dynamic content — it does not reflect agent state
+      or user input. It is purely decorative.
+
+      When hidden, the 6 rows it would occupy become available to the scrollback
+      layer.
+    </banner-layer>
+
+    <scrollback-layer order="3">
+      The scrollback layer is always visible and occupies all vertical space
+      not claimed by other layers. It renders the agent's conversation history:
+      user messages, LLM responses, tool calls and results, command output, and
+      system events, in chronological order.
+
+      The layer maintains a layout cache mapping logical scrollback lines to
+      physical screen rows, accounting for text wrapping at the terminal width.
+      It renders only the subset of rows that fall within the viewport (as
+      determined by the current scroll offset). Newlines embedded within a
+      scrollback line are rendered with ANSI clear-to-end-of-line sequences to
+      ensure correct display across wrapped lines.
+
+      When the terminal is resized, the layout cache is recomputed using the
+      pre-calculated per-segment widths stored with each line, without rescanning
+      the text.
+    </scrollback-layer>
+
+    <separator-layer order="4">
+      The separator is an optional 1-row horizontal divider composed of light
+      box-drawing characters that marks the boundary between the scrollback and
+      the input area.
+
+      The separator can optionally embed two kinds of overlay information:
+
+      1. **Navigation context**: abbreviated UUIDs of the current agent's
+         parent, previous sibling, next sibling, and most recent child, shown
+         with directional arrow characters. If a direction has no agent (for
+         example, the root agent has no parent), a dim dash is shown instead.
+      2. **Debug statistics**: scroll offset, viewport position, viewport
+         height, document height, computed scrollback row count, and last render
+         time in milliseconds or microseconds.
+
+      Both overlays are conditional on external configuration; neither appears
+      in normal production use.
+    </separator-layer>
+
+    <input-layer order="5">
+      The input layer displays the text currently being typed or edited by the
+      user. Its height is dynamic: it occupies the minimum number of rows
+      required to display the full input text at the current terminal width,
+      with a minimum of 1 row (to provide a cursor position even when the
+      buffer is empty).
+
+      Newlines in the input text are converted to ANSI clear-to-end-of-line
+      sequences before rendering, matching the behavior used in the scrollback
+      layer.
+
+      The cursor position within the input layer is the cursor byte offset
+      translated to a terminal row and column using the rendering context's
+      cursor position calculation.
+    </input-layer>
+
+    <spinner-layer order="6">
+      The spinner is a 1-row indicator that appears while the agent is waiting
+      for an LLM response. It cycles through ten Braille dot-pattern frames
+      to produce a subtle animation indicating ongoing activity. The animation
+      advances every 120 milliseconds. A fixed label follows the animation
+      frame.
+
+      The spinner is hidden when the agent is idle (not awaiting a response).
+    </spinner-layer>
+
+    <status-layer order="7">
+      The status layer is a fixed 2-row footer. The first row is a light
+      horizontal line separator. The second row displays the current agent's
+      configured model name and thinking level, separated by a forward slash.
+      If no model is configured, a placeholder is shown in soft blue.
+
+      The status layer always occupies its 2 rows; it is never hidden.
+    </status-layer>
+
+    <completion-layer order="8">
+      The completion layer is an optional dropdown that appears at the bottom
+      of the screen when a tab-completion session is active. It renders one
+      row per candidate. Each row shows the command name followed by its
+      description. The currently highlighted candidate is rendered with reverse
+      video and bold styling to distinguish it from the others. Each row is
+      padded to the terminal width to clear any previously rendered content.
+
+      The layer is hidden when no completion session is active. When visible,
+      its height equals the number of available candidates.
+    </completion-layer>
+
+  </behavior>
+
+</specification>

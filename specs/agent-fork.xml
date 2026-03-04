@@ -1,0 +1,202 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<specification topic="Agent Fork">
+
+  <topic-statement>
+    The agent fork operation creates a child agent that inherits the parent's
+    conversation history, configuration, and display output, then switches the user's
+    focus to the child.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      The two fork entry points (slash command and internal tool), their argument
+      formats, the sequence of state initialization and inheritance, the transaction
+      scope, concurrency control, and the differences between the two entry points.
+    </in-scope>
+
+    <boundary name="Agent navigation">
+      How the user navigates between agents after forking (by sibling, parent, or
+      child) is covered by the agent process tree and is out of scope here.
+    </boundary>
+
+    <boundary name="LLM request dispatch">
+      What happens after a prompt is submitted to the LLM — the HTTP request,
+      response streaming, and state transitions — is out of scope.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Slash command arguments">
+      <field name="model override" type="text or absent" note="optional; format MODEL or MODEL/THINKING_LEVEL; if absent, provider, model, and thinking level are inherited from the parent" />
+      <field name="prompt" type="text or absent" note="optional; must be double-quoted if present; submitted to the LLM on the child immediately after forking" />
+    </contract>
+
+    <contract name="Internal tool arguments">
+      <field name="name" type="text" note="required; a human-readable label for the child agent" />
+      <field name="prompt" type="text" note="required; submitted to the LLM on the child immediately after the fork completes" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <slash-command-fork order="1">
+      The slash command fork is user-initiated. The sequence of operations is:
+
+      <preconditions order="1">
+        Before any allocation, the current agent is checked for running tool
+        execution threads. If any are running, the command polls with a 10 ms sleep
+        until all threads complete.
+
+        A process-wide atomic flag prevents concurrent fork operations. If the flag
+        is already set, the command displays an error and returns without taking
+        any action. Otherwise the flag is set.
+      </preconditions>
+
+      <argument-parsing order="2">
+        Arguments are parsed to extract an optional `--model` flag and an optional
+        double-quoted prompt string. Either may appear before or after the other.
+        Unquoted text that is not a flag is an error. An unclosed quote is an error.
+        The `--model` flag requires a value; omitting the value is an error.
+
+        The model value has the form `MODEL` or `MODEL/THINKING_LEVEL`. Valid
+        thinking levels are `min`, `low`, `med`, and `high`. An unrecognized model
+        name or thinking level is an error.
+      </argument-parsing>
+
+      <transaction order="3">
+        A database transaction is opened. All subsequent database operations
+        (message ID query, agent insert, fork event insert) execute within this
+        transaction. If any database operation fails, the transaction is rolled back
+        and an error is returned.
+      </transaction>
+
+      <child-initialization order="4">
+        A new agent is created with a freshly generated UUID, the current time as
+        its creation timestamp, and the parent's UUID as its parent reference. The
+        fork message ID is set to the parent's last persisted message ID, which marks
+        the point of divergence.
+
+        All display layers (banner, scrollback, spinner, separator, input buffer,
+        completion, status) are initialized fresh. A new database connection is
+        opened for the child's worker thread. A new token cache is initialized with
+        the configured token budget.
+      </child-initialization>
+
+      <configuration-inheritance order="5">
+        If a model override was supplied, the child's provider is inferred from the
+        model name, and the model and thinking level are set from the override. If
+        the thinking level portion was omitted from the override, the parent's
+        thinking level is used.
+
+        If no override was supplied, the child inherits the parent's provider, model,
+        and thinking level verbatim.
+
+        If the child's thinking level is non-minimum and the model is known not to
+        support thinking, a warning is appended to the child's display output.
+        The fork proceeds regardless.
+      </configuration-inheritance>
+
+      <state-inheritance order="6">
+        The following state is copied from the parent to the child:
+
+        - **Conversation messages**: all messages with all content blocks are deep-copied.
+          The child's copy is fully independent; subsequent changes to either agent's
+          messages do not affect the other.
+        - **Scrollback display output**: the visual rendering history (all lines and
+          their layout data) is copied.
+        - **Pinned document paths**: the array of pinned document paths is copied.
+        - **Toolset filter**: the array of tool name restrictions is copied.
+
+        The following state is not inherited and starts fresh: input buffer, spinner
+        state, completion state, cursor position, history navigation state, marks.
+      </state-inheritance>
+
+      <database-persistence order="7">
+        The child agent record is inserted into the database. Two fork event messages
+        are inserted: one on the parent (kind `fork`, role `parent`, referencing the
+        child UUID) and one on the child (kind `fork`, role `child`, referencing the
+        parent UUID, the fork message ID, the pinned paths, and the toolset filter).
+        The transaction is committed.
+      </database-persistence>
+
+      <post-fork order="8">
+        The process-wide fork flag is cleared. The REPL focus switches to the child.
+        A confirmation message is appended to the child's display output.
+
+        If a prompt was supplied, it is submitted as a user message on the child and
+        an LLM request is initiated.
+      </post-fork>
+
+      <notable reason="fork is committed before prompt execution">
+        The database transaction commits before any LLM request is started. If the
+        LLM request fails after the fork, the fork itself remains in the database
+        and the child agent exists. The two operations are not atomic with respect
+        to each other.
+      </notable>
+    </slash-command-fork>
+
+    <internal-tool-fork order="2">
+      The internal tool fork is initiated by the LLM. It runs on a tool execution
+      thread, not on the main event loop thread.
+
+      <child-initialization order="1">
+        A new agent is created with a freshly generated UUID. The name and prompt
+        are taken from the JSON arguments. A `clear` event is inserted into the
+        child's message history to signal that the child starts from a blank
+        context (no inherited conversation).
+      </child-initialization>
+
+      <no-state-inheritance order="2">
+        Unlike the slash command fork, the internal tool fork does not copy
+        conversation messages, scrollback output, pinned paths, or toolset filter.
+        The child starts as an empty agent with only the supplied prompt.
+
+        The model, provider, and thinking level are inherited from the parent.
+      </no-state-inheritance>
+
+      <completion-hook order="3">
+        When the tool execution thread finishes, the REPL event loop polls the
+        result. The child agent is transferred to the REPL's agent array. The REPL
+        focus does not switch automatically; the user must navigate to the child
+        manually.
+
+        The tool result returned to the LLM contains the child's UUID and name.
+      </completion-hook>
+
+      <notable reason="agent array failure leaves child in database only">
+        If adding the child to the in-memory agent array fails, the child exists in
+        the database but is not accessible in the current session. No error is
+        propagated to the caller.
+      </notable>
+    </internal-tool-fork>
+
+    <differences-between-entry-points order="3">
+      The two fork entry points differ in the following ways:
+
+      | Aspect | Slash command | Internal tool |
+      |--------|--------------|---------------|
+      | Initiator | User | LLM |
+      | Thread | Event loop (main) | Tool execution thread |
+      | Concurrency control | Process-wide atomic flag | None |
+      | Conversation inheritance | Full deep copy | None (blank slate) |
+      | Scrollback inheritance | Yes | No |
+      | Pinned paths inheritance | Yes | No |
+      | Toolset filter inheritance | Yes | No |
+      | Model override | Supported via `--model` | Not supported; always inherits |
+      | Child name | Not set | Required field |
+      | Focus switch | Automatic | Manual |
+      | Database transaction | Yes | No |
+      | Fork event messages | Parent and child events | None |
+      | Prompt execution | Optional | Mandatory |
+    </differences-between-entry-points>
+
+    <concurrency-control order="4">
+      The process-wide fork-pending flag applies only to the slash command entry
+      point. It prevents two concurrent slash command forks but does not prevent
+      an internal tool fork from running concurrently. The flag is an atomic boolean
+      stored on the shared context and is thus visible across all agents.
+    </concurrency-control>
+
+  </behavior>
+
+</specification>

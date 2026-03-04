@@ -1,0 +1,133 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<specification topic="Configuration Loading">
+
+  <topic-statement>
+    The configuration loader assembles application settings from compiled-in
+    defaults, an optional system prompt file, and environment variable overrides,
+    producing a single configuration record used at startup.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      The configuration data contract, the three-tier source priority order,
+      default values for all fields, the system prompt file loading and
+      validation rules, environment variable override rules with field-specific
+      validation, and silent-rejection behavior for invalid overrides.
+    </in-scope>
+
+    <boundary name="Configuration consumption">
+      How configuration values are used by agents, providers, and the database
+      connection is handled by those subsystems and is out of scope here.
+    </boundary>
+
+    <boundary name="Credential loading">
+      API key retrieval from the keychain or environment is handled by the
+      credential loading subsystem and is out of scope here.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Configuration">
+      <field name="AI model" type="text" default="gpt-5-mini" note="identifier for the default language model" />
+      <field name="AI temperature" type="floating-point" default="1.0" note="sampling temperature for LLM responses" />
+      <field name="AI max completion tokens" type="integer" default="4096" note="maximum tokens in an LLM response" />
+      <field name="AI system message" type="text" default="You are a personal agent and are operating inside the Ikigai orchestration platform." note="default system prompt when no file or pinned documents are set" />
+      <field name="network address" type="text" default="127.0.0.1" note="address on which the control socket server listens" />
+      <field name="network port" type="16-bit unsigned integer" default="1984" note="port on which the control socket server listens" />
+      <field name="database host" type="text" default="localhost" note="PostgreSQL server hostname" />
+      <field name="database port" type="32-bit signed integer" default="5432" note="PostgreSQL server port" />
+      <field name="database name" type="text" default="ikigai" note="PostgreSQL database name" />
+      <field name="database user" type="text" default="ikigai" note="PostgreSQL role name" />
+      <field name="max tool turns" type="32-bit signed integer" default="50" note="maximum tool call iterations in a single agent conversation" />
+      <field name="max output size" type="64-bit signed integer" default="1048576" note="maximum byte length of tool output captured from a child process" />
+      <field name="history size" type="32-bit signed integer" default="10000" note="number of command history entries retained" />
+      <field name="default provider" type="text" default="openai" note="identifier for the default LLM provider" />
+      <field name="sliding context tokens" type="32-bit signed integer" default="100000" note="token budget for the sliding context window" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <loading-sequence order="1">
+      Configuration loading proceeds in four steps executed once at startup:
+
+      1. A zeroed configuration record is allocated.
+      2. All fields are set to their compiled-in default values.
+      3. A system prompt file is checked and, if valid, its content replaces
+         the default system message.
+      4. Environment variables are checked and, if valid, their values replace
+         the corresponding fields.
+
+      The result is a fully populated configuration record where every field
+      is set.
+    </loading-sequence>
+
+    <system-prompt-file order="2">
+      Before defaults are applied, the loader checks for a system prompt file
+      at a fixed path within the application data directory. If the file exists
+      and passes validation, its content is used as the system message, taking
+      priority over the compiled-in default.
+
+      Validation rules for the system prompt file:
+
+      - The file must exist and be readable.
+      - The file must not be empty (zero bytes).
+      - The file must not exceed 1,024 bytes.
+      - The read must complete successfully (no partial reads).
+
+      If any validation step fails, the file is silently ignored and the
+      compiled-in default system message is used.
+
+      <notable reason="file is checked before defaults but replaces after">
+        The file content is read before defaults are applied, but the
+        replacement takes place as part of the defaults step, making file
+        content the effective default for the system message field.
+      </notable>
+    </system-prompt-file>
+
+    <environment-variable-overrides order="3">
+      After defaults are applied, environment variables may override six fields.
+      Each variable is checked independently; failure of one does not affect
+      the others.
+
+      **String fields** (database host, database name, database user, default
+      provider): the environment variable value must be a non-empty string.
+      Empty strings are treated as absent and the default is retained.
+      Valid values replace the current field value.
+
+      **Integer fields** (database port, sliding context token budget): the
+      environment variable value is parsed as a decimal integer. Two additional
+      constraints apply:
+      - The database port must be in the range 1–65535.
+      - The token budget must be a positive (non-zero) integer.
+
+      If parsing fails or the constraint is not met, the override is silently
+      ignored and the default is retained.
+
+      **Default provider**: checked via a dedicated lookup that queries the
+      environment variable and falls back to the configured value if absent.
+    </environment-variable-overrides>
+
+    <silent-rejection order="4">
+      Overrides that fail validation are never reported to the user. The
+      application continues with the default or previously set value. This
+      applies to:
+      - Empty string environment variables
+      - Unparseable numeric environment variables
+      - Numeric values outside the valid range
+
+      <notable reason="no warnings are emitted for invalid overrides">
+        A misconfigured environment variable (for example, a non-numeric value
+        for database port) is silently ignored. Users who expect an override
+        to take effect will see the default behavior with no indication of why.
+      </notable>
+    </silent-rejection>
+
+    <allocation-failure order="5">
+      Memory allocation failures during configuration loading cause an immediate
+      process abort. There is no partial-configuration recovery path.
+    </allocation-failure>
+
+  </behavior>
+
+</specification>

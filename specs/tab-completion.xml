@@ -1,0 +1,201 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<specification topic="Tab Completion">
+
+  <topic-statement>
+    The tab completion system maintains a filtered list of command and argument
+    candidates, updating the input buffer with the selected candidate when the
+    user presses Tab and dismissing when they accept, revert, or navigate away.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Candidate generation for commands and arguments, fuzzy filtering, cycling
+      and navigation, input buffer replacement, revert-on-escape behavior, and
+      completion panel visibility.
+    </in-scope>
+
+    <boundary name="Command registry">
+      Completion requests the full list of registered commands to build
+      command candidates. The command names and descriptions are consumed
+      as-is; the registry internals are out of scope.
+    </boundary>
+
+    <boundary name="Input buffer">
+      Completion reads the current buffer text and replaces it wholesale when
+      a candidate is selected. The buffer's cursor management and layout
+      internals are out of scope.
+    </boundary>
+
+    <boundary name="Fuzzy matching">
+      Candidate filtering uses a fuzzy scoring algorithm. This specification
+      documents the observable filtering behavior — the scoring algorithm
+      internals are out of scope.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Completion context">
+      <field name="candidates" type="ordered list of text" note="filtered and scored; at most 15 entries" />
+      <field name="current index" type="non-negative integer" note="zero-based index into candidates; wraps on navigation" />
+      <field name="prefix" type="text" note="the input text that triggered this completion" />
+      <field name="original input" type="text" note="the full input buffer text at the moment Tab was first pressed; used to revert on Escape" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <activation order="1">
+      The completion context is created and kept active when the user types
+      characters into an input buffer that begins with `/`. After each
+      character insertion or deletion, the current buffer text is used as the
+      new prefix to rebuild the candidate list. If the buffer no longer starts
+      with `/`, the completion context is dismissed without reverting the input.
+
+      If no candidates match the current prefix, the completion context is not
+      created or is dismissed if previously active.
+
+      <notable reason="Tab is not the activation trigger">
+        The completion context is created and maintained by character input,
+        not by the Tab key. When Tab is pressed, it operates on the already-active
+        context. The Tab key creates a context on its own only when one is not
+        already active at the moment of the keypress.
+      </notable>
+    </activation>
+
+    <candidate-generation order="2">
+      Two categories of completion are produced depending on whether the input
+      contains a space after the command name.
+
+      <command-completion order="1">
+        When the input contains only a command prefix (no space), candidates
+        are drawn from the full list of registered commands. The text after the
+        leading `/` is used as the search term against command names.
+
+        Candidates are filtered to those where all characters of the search
+        term appear in order within the command name (case-insensitively).
+        Among those, only candidates where the search term forms a
+        case-insensitive prefix are retained. The retained candidates are
+        scored and returned in descending score order, with at most 15
+        candidates.
+      </command-completion>
+
+      <argument-completion order="2">
+        When the input contains a space after the command name, argument
+        completion applies. The text after the space is used as the search term.
+        The available candidates depend on the command:
+
+        For the `/model` command: if the search term contains a `/`, candidates
+        are the four thinking levels: `min`, `low`, `med`, and `high`. Otherwise,
+        candidates are drawn from a fixed list of known model names.
+
+        For the `/debug` command: candidates are `off` and `on`.
+
+        For the `/rewind` command: candidates are the labels of all marks
+        currently set on the active agent, in the order they appear.
+
+        For all other commands: no argument completion is provided and no
+        completion context is created.
+
+        The same fuzzy prefix filter and 15-candidate limit apply to argument
+        candidates as to command candidates.
+      </argument-completion>
+    </candidate-generation>
+
+    <tab-key-behavior order="3">
+      Pressing Tab advances the selected candidate and replaces the input
+      buffer content with the new selection. The completion context is
+      dismissed after the input is updated.
+
+      <tab-with-active-context order="1">
+        When a completion context is active at the time of the Tab keypress,
+        the current index is incremented by one, wrapping back to zero when
+        it would exceed the last candidate. The input buffer is replaced with
+        the text corresponding to the new selection (see input replacement
+        below). The completion context is then dismissed.
+      </tab-with-active-context>
+
+      <tab-without-active-context order="2">
+        When no completion context is active at the time of the Tab keypress,
+        one is created for the current buffer text using the same candidate
+        generation rules. The current index is set to zero. The input buffer
+        is replaced with the text corresponding to the first candidate. The
+        completion context is then dismissed.
+
+        If the buffer is empty or does not begin with `/`, the Tab keypress
+        has no effect.
+
+        If no candidates match the current buffer text, the Tab keypress has
+        no effect.
+      </tab-without-active-context>
+
+      <notable reason="context is dismissed after each Tab press">
+        Each Tab press completes one selection and dismisses the context. If
+        Tab is pressed again, a new context is created from the now-updated
+        buffer text. Because the buffer was just updated to contain a full
+        command or argument name, the next context's candidates will be
+        filtered against that complete name.
+      </notable>
+    </tab-key-behavior>
+
+    <input-replacement order="4">
+      When a candidate is selected, the input buffer is replaced wholesale with
+      the constructed completion text. The original prefix is preserved up to
+      the point where the candidate replaces it.
+
+      For command completion, the replacement is the `/` character followed by
+      the selected candidate name.
+
+      For argument completion, the replacement is everything from the beginning
+      of the input up to and including the first space, followed by the selected
+      candidate. The command portion of the input is preserved unchanged.
+
+      When a Space key is pressed while a context is active, the selected
+      candidate is committed with a trailing space appended to the replacement
+      text. The context is dismissed.
+    </input-replacement>
+
+    <escape-behavior order="5">
+      When Escape is pressed while a completion context is active and the
+      original input was recorded at activation time, the input buffer is
+      replaced with the original input text, reverting any candidate selections.
+      The completion context is then dismissed.
+
+      If no original input was recorded when Escape is pressed, the completion
+      context is dismissed without reverting the input buffer.
+    </escape-behavior>
+
+    <navigation-dismissal order="6">
+      Arrow key presses (left or right) dismiss the active completion context
+      without reverting the input buffer. The buffer retains whatever text was
+      most recently inserted by a candidate selection.
+    </navigation-dismissal>
+
+    <panel-visibility order="7">
+      A completion panel is rendered while a completion context is active. The
+      panel occupies one row per candidate. Each row displays the candidate
+      name alongside its command description (for command completion). The row
+      corresponding to the current index is rendered with reverse video and
+      bold formatting. All other rows are rendered without additional formatting.
+      Each row is padded to the full terminal width.
+
+      The panel is hidden when the completion context is inactive (dismissed).
+    </panel-visibility>
+
+    <index-navigation order="8">
+      The current index advances by one on each Tab press, wrapping from the
+      last candidate (index `count − 1`) back to the first (index 0).
+
+      A backward navigation operation (returning to the previous candidate) is
+      defined in the implementation but is not connected to any key press.
+
+      <notable reason="backward cycling is not accessible">
+        The implementation includes logic to move the current index to the
+        previous candidate with wrap-around, but no keyboard shortcut or other
+        input event triggers this operation. It is unreachable during normal
+        use.
+      </notable>
+    </index-navigation>
+
+  </behavior>
+
+</specification>

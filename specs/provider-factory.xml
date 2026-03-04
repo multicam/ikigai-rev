@@ -1,0 +1,143 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<specification topic="Provider Factory">
+
+  <topic-statement>
+    The provider factory validates a provider name, resolves its API credential,
+    and returns an initialized LLM provider instance ready for use.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Provider name validation, credential resolution, dispatch to
+      provider-specific constructors, per-agent instance caching, and cache
+      invalidation.
+    </in-scope>
+
+    <boundary name="Credential loading">
+      Credential resolution delegates to the credential loading subsystem with
+      a null path (triggering default path discovery). This specification
+      records what credential name is requested and what value is received —
+      the credential loading internals are out of scope.
+
+      <shared topic="Credential Loading">
+        Credentials are loaded from `~/.config/ikigai/credentials.json` (or
+        `$IKIGAI_CONFIG_DIR/credentials.json` if that variable is set),
+        with environment variables applied as overrides. Only non-empty string
+        values are accepted from either source. A missing file is not an error.
+        JSON parse failures are silently ignored; in that case only environment
+        variables contribute.
+      </shared>
+    </boundary>
+
+    <boundary name="Provider-specific construction">
+      After credential validation, an OpenAI-, Anthropic-, or Google-specific
+      constructor is called with the resolved API key. Whether that constructor
+      succeeds, and what it allocates internally, is out of scope.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Supported providers">
+      <field name="name" type="text" note="one of exactly three values: 'openai', 'anthropic', 'google'; comparison is case-sensitive" />
+      <field name="credential environment variable name" type="text" note="'OPENAI_API_KEY', 'ANTHROPIC_API_KEY', or 'GOOGLE_API_KEY' respectively" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <provider-creation order="1">
+      A provider instance is created by supplying a provider name string. The
+      following steps execute in strict order; the first failure stops processing
+      and returns an error.
+
+      <name-validation order="1">
+        The name is checked against the list of three supported provider names:
+        `openai`, `anthropic`, and `google`. Comparison is case-sensitive.
+        If the name does not match any of the three, an invalid-argument error
+        is returned immediately. No allocations have been made at this point,
+        so no cleanup is required.
+
+        <notable reason="case sensitivity">
+          `OpenAI`, `ANTHROPIC`, and `Google` are not valid provider names.
+          Only lowercase forms are accepted.
+        </notable>
+      </name-validation>
+
+      <credential-resolution order="2">
+        The credential loading subsystem is invoked to load all credentials.
+        If loading fails (for example, because `HOME` is not set and the
+        default path requires tilde expansion), that error is returned
+        immediately.
+
+        The provider name is mapped to its corresponding environment variable
+        name, and the credential value for that name is retrieved from the
+        loaded credentials. If the value is absent (neither the file nor the
+        environment variable provided a non-empty value for this provider),
+        an error is returned with a message naming the environment variable
+        and the credentials file that should be used to supply the key.
+
+        <shared topic="Credential Loading">
+          Credential values are sourced first from the JSON configuration file
+          and then overridden by environment variables. Empty environment
+          variable values are treated as absent and do not override file values.
+          Only non-empty string values from either source are accepted.
+        </shared>
+      </credential-resolution>
+
+      <provider-dispatch order="3">
+        The resolved API key is passed to the provider-specific constructor
+        for the validated provider name. If that constructor fails, its error
+        is returned to the caller. If it succeeds, the resulting provider
+        instance is returned.
+      </provider-dispatch>
+    </provider-creation>
+
+    <per-agent-caching order="2">
+      Each agent holds at most one provider instance. The instance is
+      created on the first request and cached for all subsequent requests
+      within that agent's lifetime.
+
+      <first-request order="1">
+        When a provider instance is first requested for an agent, the agent's
+        configured provider name is passed to the provider creation procedure
+        above. If the agent has no provider configured, an error is returned.
+        On success, the resulting instance is stored in the agent and returned.
+      </first-request>
+
+      <subsequent-requests order="2">
+        When a provider instance is requested and one is already cached, the
+        cached instance is returned immediately. No credential loading, no
+        name validation, and no provider construction occurs.
+      </subsequent-requests>
+
+      <notable reason="provider instances are not shared between agents">
+        Each agent creates its own independent provider instance. Two agents
+        configured with the same provider name each hold separate instances
+        with separate internal state and separate HTTP sessions.
+      </notable>
+    </per-agent-caching>
+
+    <cache-invalidation order="3">
+      The cached provider instance can be explicitly released. When released,
+      the instance is freed and the cache slot is cleared. The next request
+      for a provider instance triggers the full creation procedure again,
+      including credential loading.
+
+      Releasing the cache when no instance is cached is a no-op.
+
+      <notable reason="invalidation is used when the provider changes">
+        Invalidation is triggered when the agent's provider or model
+        configuration changes at runtime, ensuring the next request creates
+        a fresh instance with the new configuration.
+      </notable>
+    </cache-invalidation>
+
+    <provider-enumeration order="4">
+      The list of supported provider names can be retrieved as a null-terminated
+      array of strings. The array is static and its contents never change at
+      runtime.
+    </provider-enumeration>
+
+  </behavior>
+
+</specification>

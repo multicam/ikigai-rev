@@ -1,0 +1,127 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<specification topic="REPL Initialization">
+
+  <topic-statement>
+    The REPL initialization subsystem sets up all resources required for the
+    interactive session — signal handlers, agent array, input infrastructure,
+    and database session — in a fixed order, and tears them down on exit.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      The ordered initialization sequence, per-step error handling, the
+      headless-mode difference, and the shutdown sequence including tool-thread
+      join.
+    </in-scope>
+
+    <boundary name="Agent session restoration">
+      How previously running agents are reconstructed from the database is
+      covered by the agent session restoration specification.
+    </boundary>
+
+    <boundary name="Configuration loading">
+      How the application configuration record is assembled is covered by the
+      configuration loading specification.
+    </boundary>
+
+    <boundary name="Terminal setup">
+      How the terminal is switched to raw mode and the alternate screen is
+      managed is handled by the shared context and terminal subsystems.
+    </boundary>
+  </scope>
+
+  <behavior>
+
+    <initialization-sequence order="1">
+      Initialization proceeds in the following fixed order:
+
+      <signal-handlers order="1">
+        Signal handlers for terminal resize, user interrupt, and termination are
+        installed before any other resource is allocated. This ensures that
+        signals delivered during initialization are handled correctly.
+      </signal-handlers>
+
+      <repl-context order="2">
+        The REPL context is allocated. A destructor is registered on the context
+        to run the shutdown sequence when the context is freed.
+      </repl-context>
+
+      <agent-array order="3">
+        The agent array is initialized as empty. The root agent context is
+        created and added to the array as the first and current agent.
+      </agent-array>
+
+      <input-infrastructure order="4">
+        Three independent resources are created:
+
+        1. The input parser (decodes raw bytes into semantic input actions).
+        2. The scroll detector (identifies mouse scroll events).
+        3. The key injection buffer (holds programmatically injected keystrokes).
+      </input-infrastructure>
+
+      <database-session order="5">
+        If a database connection is configured:
+
+        1. An active session is retrieved or created. The session ID is stored
+           in the shared context for use by all subsequent database writes.
+        2. Dead agents from previous sessions are reaped from the database.
+        3. The root agent's database record is verified or created.
+        4. All agents previously marked as running are restored from the
+           database into the agent array.
+
+        If any database step fails, initialization aborts and returns an error.
+      </database-session>
+    </initialization-sequence>
+
+    <headless-mode order="2">
+      In headless mode, a headless terminal context is created before the shared
+      context is initialized and passed into it. The headless terminal context
+      accepts terminal writes without a real TTY, enabling the application to
+      run without an attached terminal and be driven programmatically via the
+      control socket.
+
+      All other initialization steps are identical to normal mode.
+    </headless-mode>
+
+    <error-handling order="3">
+      Different failure modes are handled differently:
+
+      - **Memory allocation failures**: cause an immediate process abort (panic).
+        There is no recovery path.
+      - **Missing environment variables** (required path configuration): an
+        error message is written to standard error and initialization returns
+        a failure result.
+      - **Configuration or credential load failures**: logged and returned as
+        failure results.
+      - **Database failures**: logged and returned as failure results; the
+        terminal is explicitly cleaned up before the error propagates.
+
+      On any failure result, the caller (the application entry point) exits
+      with a non-zero status.
+    </error-handling>
+
+    <shutdown-sequence order="4">
+      Shutdown is triggered when the REPL context is freed (either by normal
+      loop exit or by an error path). The registered destructor:
+
+      1. Checks whether a tool execution thread is currently running on the
+         current agent.
+      2. If a thread is running, waits for it to complete before proceeding.
+         This prevents the tool thread from accessing freed memory.
+      3. All other resources (agent array, input parser, scroll detector, key
+         injection buffer) are freed implicitly by the talloc hierarchy when
+         the REPL context is released.
+
+      Terminal cleanup is handled separately by the shared context destructor,
+      not by the REPL destructor, to avoid double-cleanup.
+
+      <notable reason="tool thread is joined synchronously on exit">
+        If a tool is executing when the user exits, shutdown blocks until the
+        tool finishes. There is no timeout on this join; a tool that does not
+        terminate will prevent clean shutdown indefinitely.
+      </notable>
+    </shutdown-sequence>
+
+  </behavior>
+
+</specification>

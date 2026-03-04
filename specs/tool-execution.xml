@@ -1,0 +1,196 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<specification topic="Tool Execution">
+
+  <topic-statement>
+    The tool execution pipeline dispatches an LLM-requested tool call to either an
+    in-process handler or an external executable, wraps the result, and appends
+    both the call and the result to the conversation before continuing the LLM
+    request loop.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Trigger conditions, the two execution paths (internal and external), the worker
+      thread lifecycle, completion polling, result wrapping, URI translation,
+      database persistence, the tool registry and discovery, and the tool loop
+      continuation mechanism.
+    </in-scope>
+
+    <boundary name="LLM request dispatch">
+      How the LLM API request is formed and sent, and how the streaming response is
+      parsed to detect tool calls, is covered by the provider and SSE parser
+      specifications.
+    </boundary>
+
+    <boundary name="Agent state machine">
+      The state transitions between idle, waiting-for-LLM, and executing-tool are
+      covered by the agent state machine specification.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Tool registry entry">
+      <field name="name" type="text" note="the tool's callable name (e.g., 'bash', 'file_read'); derived from the executable filename by stripping the '-tool' suffix and converting hyphens to underscores" />
+      <field name="path" type="text or null" note="absolute filesystem path to the executable; null for internal tools" />
+      <field name="schema" type="parsed JSON" note="the tool's JSON schema, obtained by invoking the tool with the '--schema' flag during discovery" />
+      <field name="type" type="enumeration" note="one of: external (fork/exec), internal (in-process function)" />
+      <field name="handler" type="function reference or null" note="the C function for internal tools; null for external tools" />
+      <field name="on-complete hook" type="function reference or null" note="called on the main thread after the tool's worker thread finishes; null if no post-completion work is needed" />
+    </contract>
+
+    <contract name="Tool result envelope">
+      <field name="tool_success" type="boolean" note="true if the tool executed without error" />
+      <field name="result" type="JSON value" note="present when tool_success is true; the tool's output" />
+      <field name="error" type="text" note="present when tool_success is false; a human-readable error message" />
+      <field name="error_code" type="text" note="present when tool_success is false; a short machine-readable error identifier" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <trigger order="1">
+      Tool execution begins when an LLM response is received with a tool call
+      content block and a finish reason indicating tool use. The tool call's name,
+      identifier, and JSON arguments are extracted from the response and stored as
+      the agent's pending tool call.
+
+      Only the first tool call block in a response is executed. Any additional tool
+      call blocks in the same response are discarded.
+    </trigger>
+
+    <worker-thread order="2">
+      Tool execution runs on a dedicated worker thread, not on the main event loop
+      thread. The thread is created when execution begins and joined when the main
+      loop detects completion.
+
+      While the thread is running, the agent is in the executing-tool state. The
+      main loop polls for completion every 50 milliseconds by checking an atomic
+      completion flag.
+
+      When the flag is set, the main loop joins the thread, harvests the result
+      from a shared field, and proceeds with result processing.
+
+      <notable reason="thread is joined from the main loop, not from a callback">
+        There is no asynchronous notification. The main loop polls the completion
+        flag on every iteration when any agent is in the executing-tool state and
+        joins the thread synchronously when the flag is observed as set.
+      </notable>
+    </worker-thread>
+
+    <internal-tool-path order="3">
+      If the tool name matches a registered internal tool, its handler function is
+      called directly on the worker thread. The handler receives a talloc allocator
+      context, the agent context, and the JSON arguments string. It returns a JSON
+      string result.
+
+      Internal tools currently registered are:
+      - **fork**: creates a child agent with a given name and prompt.
+      - **kill**: terminates a named agent and all of its descendants.
+      - **send**: delivers a message to another agent.
+      - **wait**: blocks until a message is received from one or more other agents.
+    </internal-tool-path>
+
+    <external-tool-path order="4">
+      If the tool name matches a registered external tool, the tool executable is
+      invoked as a child process.
+
+      <uri-translation order="1">
+        Before invocation, `ik://` URIs in the JSON arguments are translated to
+        absolute filesystem paths. After the tool returns, any absolute filesystem
+        paths in the result that fall under the state or data directories are
+        translated back to `ik://` URIs. This translation is transparent to the
+        tool process.
+      </uri-translation>
+
+      <process-creation order="2">
+        The executable is launched as a child process with:
+        - The JSON arguments supplied on standard input.
+        - The calling agent's UUID set in the `IKIGAI_AGENT_ID` environment variable.
+        - A new process group (the child becomes its own process group leader),
+          enabling group-based interruption of any subprocesses it spawns.
+        - Standard output and standard error captured via pipes.
+      </process-creation>
+
+      <timeout order="3">
+        A 30-second alarm is set before reading from the pipes. If the tool has
+        not produced all output within 30 seconds, the alarm fires.
+      </timeout>
+
+      <result-collection order="4">
+        The parent reads all of the child's standard output and standard error via
+        the pipes, then waits for the child to exit. If the child exits with a
+        non-zero status, the standard error output (if any) is returned as an error.
+        If the child produces no standard output, an error is returned. If the child
+        produces standard output and exits cleanly, the output is the tool result.
+      </result-collection>
+    </external-tool-path>
+
+    <result-wrapping order="5">
+      All tool results — from both internal and external paths — are wrapped in a
+      standard envelope before being added to the conversation. A successful result
+      becomes `{"tool_success": true, "result": <output>}`. A failure becomes
+      `{"tool_success": false, "error": "<message>", "error_code": "<code>"}`.
+
+      Invalid JSON returned by an external tool is treated as a failure with the
+      error code `INVALID_OUTPUT`.
+
+      A lookup failure (the tool name is not in the registry) is treated as a
+      failure with the error code `tool_not_found`.
+    </result-wrapping>
+
+    <conversation-update order="6">
+      After the result is collected and wrapped, two messages are added to the
+      conversation:
+
+      1. A tool call message (assistant role) containing the original tool call
+         block and any thinking blocks from the LLM response.
+      2. A tool result message (tool role) containing the tool call identifier and
+         the wrapped result.
+
+      Both messages are persisted to the database and rendered to the scrollback.
+    </conversation-update>
+
+    <on-complete-hook order="7">
+      If the tool registry entry has an on-complete hook, it is called on the main
+      thread after the result has been harvested from the worker thread. The hook
+      may modify REPL state (for example, the fork tool's hook transfers the newly
+      created child agent into the REPL's agent array). The hook runs before the
+      tool loop continuation.
+    </on-complete-hook>
+
+    <tool-loop-continuation order="8">
+      After result processing, the agent automatically resubmits the conversation
+      to the LLM. The LLM may respond with another tool call, continuing the loop,
+      or with a text response that ends the loop. Each tool call iteration
+      increments an iteration counter on the agent.
+
+      <notable reason="no configured iteration limit">
+        There is no hardcoded or configured maximum number of tool loop iterations.
+        The loop continues as long as the LLM requests tool calls. The iteration
+        counter is tracked but not checked against a limit.
+      </notable>
+    </tool-loop-continuation>
+
+    <tool-discovery order="9">
+      The tool registry is populated at startup and on `/refresh` by scanning three
+      directories in order: the system libexec directory, the user tools directory
+      (`~/.ikigai/tools/`), and the project tools directory (`.ikigai/tools/`
+      relative to the current working directory). Tools found in later directories
+      override tools with the same name found in earlier directories.
+
+      An executable file qualifies as a tool if its name ends with `-tool`. The
+      tool name is derived by stripping the `-tool` suffix and replacing hyphens
+      with underscores in the remainder.
+
+      Each candidate tool is invoked with the `--schema` flag and given 1 second to
+      output its JSON schema on standard output. If the invocation times out,
+      produces no output, or produces invalid JSON, the tool is skipped and not
+      added to the registry.
+
+      Internal tools are registered unconditionally after external tools are
+      discovered.
+    </tool-discovery>
+
+  </behavior>
+
+</specification>

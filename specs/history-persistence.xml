@@ -1,0 +1,164 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<specification topic="History Persistence">
+
+  <topic-statement>
+    The history persistence system loads command history from a JSONL file at
+    startup and appends new entries to that file when commands are submitted.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      File path resolution, directory creation, JSONL parsing and validation
+      during load, capacity enforcement during load, entry formatting and
+      writing during append, and graceful degradation on I/O errors.
+    </in-scope>
+
+    <boundary name="In-memory history">
+      This specification covers the file I/O layer only. The in-memory history
+      structure that receives loaded entries and supplies entries to be appended
+      is covered in the Command History specification.
+
+      <shared topic="Command History">
+        The in-memory history structure maintains an ordered list up to a
+        configured capacity. Loaded entries are submitted to it one by one in
+        chronological order. If the number of valid entries in the file exceeds
+        the capacity, only the most recent entries are submitted (oldest are
+        discarded at load time before submission).
+      </shared>
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="History file entry">
+      <field name="cmd" type="text" note="the full command string exactly as submitted" />
+      <field name="ts" type="text" note="UTC timestamp in ISO-8601 format: YYYY-MM-DDTHH:MM:SSZ" />
+    </contract>
+
+    <contract name="File format">
+      <field name="encoding" type="text" note="JSONL (JSON Lines): one JSON object per line, terminated by a newline character" />
+      <field name="path" type="text" note=".ikigai/history relative to the current working directory; not configurable" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <directory-management order="1">
+      Before any file operation, the `.ikigai` directory is ensured to exist.
+
+      If the directory already exists, no action is taken. If the path exists
+      but is not a directory (e.g., it is a plain file), an error is returned.
+
+      If the directory does not exist, it is created with permissions allowing
+      owner read, write, and execute, and group and other read and execute
+      (`0755`). If creation fails for any reason other than the directory having
+      been created by another process between the existence check and the
+      creation attempt, an error is returned. The race condition case — where
+      the directory appears between the check and the creation — is treated as
+      success.
+    </directory-management>
+
+    <loading order="2">
+      History is loaded at startup by reading and parsing the history file.
+
+      <file-not-found order="1">
+        If the history file does not exist, an empty file is created at the
+        history file path and loading completes with no entries. The empty file
+        creation ensures that subsequent existence checks succeed.
+      </file-not-found>
+
+      <empty-file order="2">
+        If the file exists but contains no bytes, loading completes with no
+        entries. No entries are submitted to the in-memory structure.
+      </empty-file>
+
+      <line-by-line-parsing order="3">
+        If the file contains data, it is read in full and split into lines at
+        newline characters. Empty lines are silently skipped.
+
+        Each non-empty line is parsed as JSON. If any of the following
+        conditions applies, the line is skipped and a warning is recorded; no
+        error is returned and parsing continues with the next line:
+
+        The line is not valid JSON.
+
+        The JSON root value is not an object.
+
+        The JSON object does not contain a `cmd` field, or the `cmd` field's
+        value is not a string.
+
+        If the line is valid and the `cmd` field is a non-empty string, the
+        command value is extracted. The `ts` field and any other fields are not
+        examined and do not affect whether the line is accepted.
+
+        <notable reason="ts field is never read">
+          The timestamp field written during append is never read during load.
+          It is present in the format but is entirely ignored by the parser.
+        </notable>
+      </line-by-line-parsing>
+
+      <capacity-enforcement order="4">
+        After all lines have been parsed, the collection of successfully
+        extracted command strings is compared against the history capacity. If
+        the number of valid entries exceeds the capacity, the oldest entries
+        (those appearing earliest in the file) are discarded until the count
+        equals the capacity. Only the most recent entries are submitted to the
+        in-memory structure.
+
+        Entries are submitted to the in-memory history in chronological order,
+        oldest first, so that the most recently submitted command ends up as
+        the most recent entry.
+      </capacity-enforcement>
+
+      <load-error-handling order="5">
+        A failure to create the history directory, or a failure to read the
+        file after it is known to exist, produces an error. In both cases, the
+        calling system logs the error but continues operating without history
+        from the file. The application does not abort.
+
+        Individual malformed lines do not produce errors; they produce warnings.
+        Loading always succeeds unless the file cannot be read at all.
+      </load-error-handling>
+    </loading>
+
+    <appending order="3">
+      A command string is appended to the history file each time a command is
+      submitted.
+
+      <entry-format order="1">
+        The entry is formatted as a JSON object containing two fields: `cmd`
+        holds the command string, and `ts` holds the current UTC time formatted
+        as an ISO-8601 timestamp (`YYYY-MM-DDTHH:MM:SSZ`). The formatted object
+        is written to the file followed by a newline character.
+      </entry-format>
+
+      <append-mode order="2">
+        The file is opened in append mode. The formatted JSON line is written
+        and the file is closed. No explicit flush or synchronization to disk is
+        performed beyond what the operating system provides on close.
+
+        <notable reason="not atomic">
+          A process crash after the file is opened but before the write
+          completes can produce a partial line at the end of the file. The
+          partial line will be rejected as malformed JSON on the next load and
+          will be silently skipped.
+        </notable>
+
+        <notable reason="no locking">
+          No file locking is performed. If multiple processes append to the
+          same history file simultaneously, the resulting file may contain
+          entries in a non-chronological order relative to when they were
+          submitted, but both entries will be present and parseable.
+        </notable>
+      </append-mode>
+
+      <append-error-handling order="3">
+        A failure to create the directory, open the file, format the entry, or
+        write to the file produces an error. The calling system logs the error
+        but continues operating. The in-memory history is not affected; only
+        the file write is skipped.
+      </append-error-handling>
+    </appending>
+
+  </behavior>
+
+</specification>

@@ -1,0 +1,160 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<specification topic="Inter-Agent Messaging">
+
+  <topic-statement>
+    The inter-agent messaging subsystem enables agents to send messages to one
+    another, wait for incoming messages from specific senders, and terminate
+    named agents, using the database as the shared communication medium.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      The send operation (message delivery and database notification), the wait
+      operation in both next-message and fan-in modes, the mailbox data model,
+      database notification wakeup mechanism, message deletion after receipt,
+      and the kill operation (agent termination).
+    </in-scope>
+
+    <boundary name="Tool execution">
+      How send, wait, and kill are invoked as LLM tool calls is covered by the
+      tool execution specification.
+    </boundary>
+
+    <boundary name="Agent state machine">
+      The state transitions that occur when an agent is killed or completes a
+      wait are covered by the agent state machine specification.
+    </boundary>
+
+    <boundary name="Database persistence">
+      How mailbox records are stored and queried in PostgreSQL is managed by
+      the database layer and is out of scope here.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Mail message">
+      <field name="recipient agent UUID" type="UUID" note="the agent to whom the message is addressed" />
+      <field name="sender agent UUID" type="UUID" note="the agent who sent the message" />
+      <field name="session ID" type="identifier" note="the database session in which the message was written" />
+      <field name="body" type="text" note="the message content" />
+    </contract>
+
+    <contract name="Fan-in result entry">
+      <field name="target agent UUID" type="UUID" note="one of the agents being waited on" />
+      <field name="target agent name" type="text" note="human-readable name of the target agent" />
+      <field name="status" type="enumeration" note="one of: running (still waiting), received (message arrived), idle (agent finished without sending), dead (agent was killed)" />
+      <field name="message body" type="text or null" note="the received message body; present only when status is received" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <send-operation order="1">
+      The send operation delivers a message from the calling agent to a named
+      recipient:
+
+      1. The recipient is validated: it must exist in the database and be
+         currently marked as running.
+      2. The message is inserted into the database mailbox table with the
+         sender's UUID, the recipient's UUID, and the body text.
+      3. If the database is not currently inside a transaction, a PostgreSQL
+         NOTIFY event is fired on a channel named after the recipient's UUID.
+         This wakes any agent currently blocking in a wait operation.
+
+      The operation returns immediately without waiting for the recipient to
+      read the message. Messages accumulate in the mailbox until the recipient
+      retrieves them.
+
+      <notable reason="NOTIFY is skipped inside a transaction">
+        PostgreSQL NOTIFY cannot be sent within a transaction (it would be
+        rolled back if the transaction aborts). When a send occurs during a
+        transaction, the notification is silently omitted. The recipient will
+        discover the message on its next polling interval rather than being
+        woken immediately.
+      </notable>
+    </send-operation>
+
+    <wait-operation order="2">
+      The wait operation suspends the calling agent until a message arrives or
+      a timeout expires. Two modes are supported:
+
+      <next-message-mode order="1">
+        In next-message mode, the agent waits for any incoming message:
+
+        1. A LISTEN is registered on the database notification channel for this
+           agent's UUID.
+        2. The mailbox is checked immediately; if a message is already present,
+           it is returned without entering the polling loop.
+        3. A polling loop runs with 50-millisecond intervals. On each iteration:
+           - Any pending database notifications are consumed.
+           - The mailbox is queried for new messages.
+           - If a message is found, it is returned (and deleted from the mailbox).
+           - If an interrupt is detected, the wait exits with an interrupted status.
+           - If the timeout has elapsed, the wait exits with a timeout status.
+        4. The LISTEN registration is removed before returning.
+      </next-message-mode>
+
+      <fan-in-mode order="2">
+        In fan-in mode, the agent waits for responses from a set of named target
+        agents:
+
+        1. A LISTEN is registered on this agent's UUID channel and on each
+           target's UUID channel.
+        2. A result table is initialized with one entry per target, all in
+           running state.
+        3. Agent names are fetched from the database for all targets.
+        4. A polling loop runs with 50-millisecond intervals. On each iteration,
+           for each target still in running state:
+           - The mailbox is checked for a message from that target.
+           - The target's database record is checked to determine if it has
+             become idle or dead since the last check.
+           - The result entry is updated accordingly.
+        5. The loop exits when all targets are resolved or the timeout expires.
+        6. All LISTEN registrations are removed before returning.
+
+        Each target's final state is one of: received (a message arrived),
+        idle (the agent finished naturally without sending), or dead (the agent
+        was killed).
+
+        <notable reason="fan-in detects agent lifecycle changes">
+          Fan-in does not only detect message arrival — it also detects when
+          a target agent transitions to idle or dead, allowing the waiting
+          agent to learn that a worker has finished even if it sent no message.
+        </notable>
+      </fan-in-mode>
+
+      <polling-interval notable="true" reason="50ms polling introduces delivery latency">
+        Messages are discovered on the next polling check after the notification
+        or state change occurs. Maximum additional latency before discovery is
+        50 milliseconds.
+      </polling-interval>
+    </wait-operation>
+
+    <message-deletion order="3">
+      Messages are deleted from the mailbox immediately after being read by
+      their recipient. Each retrieved message is not re-delivered on subsequent
+      wait calls.
+    </message-deletion>
+
+    <kill-operation order="4">
+      The kill operation marks a target agent as dead in the database:
+
+      1. The target is validated: it must exist and be running.
+      2. Two structural constraints are enforced:
+         - The root agent (the agent with no parent) cannot be killed.
+         - An agent cannot kill its own parent.
+      3. The target is marked as dead in the database.
+      4. The agent's UUID is stored for post-completion processing.
+      5. After the tool call completes, the in-memory agent array is updated:
+         any agent matching the killed UUID has its dead flag set.
+
+      <notable reason="kill does not cascade to descendants">
+        Only the directly named target is marked dead. Child agents of the
+        killed agent are not automatically killed. They continue to run until
+        explicitly killed or until they exit naturally.
+      </notable>
+    </kill-operation>
+
+  </behavior>
+
+</specification>

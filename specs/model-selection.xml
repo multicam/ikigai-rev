@@ -1,0 +1,93 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<specification topic="Model Selection">
+
+  <topic-statement>
+    The model selection subsystem configures which LLM model, provider, and
+    thinking level an agent uses, with changes taking effect on the next request.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      The /model command (model name, thinking level parsing, provider
+      inference), the /system command (system prompt override), state changes
+      on model switch (provider invalidation, token cache reprune), and
+      persistence of model configuration.
+    </in-scope>
+
+    <boundary name="Provider serialization">
+      How the selected model and thinking level are encoded into provider-specific
+      API request bodies is covered by the provider serialization specification.
+    </boundary>
+
+    <boundary name="Credential loading">
+      How API keys are resolved for the inferred provider is covered by the
+      credential loading specification.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Model configuration">
+      <field name="model name" type="text" note="provider-specific model identifier (e.g., claude-opus-4-6)" />
+      <field name="provider" type="text" note="inferred from the model name; one of: anthropic, openai, google" />
+      <field name="thinking level" type="enumeration" note="one of: min (disabled), low, med, high; defaults to min" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <model-command order="1">
+      The `/model` command accepts an argument of the form `<model_name>` or
+      `<model_name>/<thinking_level>`. The forward slash separates the model
+      name from the optional thinking level.
+
+      1. **Argument parsing**: the argument is split at the first `/`. If no
+         `/` is present, the thinking level defaults to minimum (disabled).
+      2. **Provider inference**: the provider is determined from the model name
+         by recognizing provider-specific name patterns. The three recognized
+         providers are Anthropic (Claude models), Google (Gemini models), and
+         OpenAI (all other models).
+      3. **Thinking level validation**: the level string must be one of `min`,
+         `low`, `med`, or `high`. An unrecognized string is an error.
+      4. **Guard**: the command cannot execute while an LLM request is in
+         progress. If the agent is not idle, an error is returned.
+      5. **State update**: the agent's provider name, model name, and thinking
+         level are updated in memory. The cached provider instance is
+         invalidated so a fresh one is created on the next request. The token
+         cache is reprune to account for the new model's token counting behavior.
+      6. **Persistence**: the new configuration is written to the agent's
+         database record. Persistence failures are logged as warnings; memory
+         is authoritative.
+
+      Calling `/model` without an argument is an error.
+    </model-command>
+
+    <system-command order="2">
+      The `/system` command sets a session-level system prompt override that
+      supplements or replaces the system prompt sources used during LLM request
+      assembly:
+
+      - With a text argument: the argument string is stored as the override
+        system message. No length or content validation is applied.
+      - Without an argument: any existing override is cleared.
+
+      The system message override is stored in the shared configuration context,
+      not on the individual agent. It applies globally to all agents in the
+      session.
+
+      <notable reason="system override is not persisted to the database">
+        Unlike model changes, the system message override set via `/system` is
+        not persisted to the database. It is lost when the session ends.
+      </notable>
+    </system-command>
+
+    <provider-invalidation order="3">
+      When the model or provider changes, the cached provider instance (which
+      holds the configured API endpoint, authentication, and model parameters)
+      is destroyed. The next LLM request will instantiate a new provider
+      instance with the updated configuration. This ensures that no stale
+      provider configuration is used after a model switch.
+    </provider-invalidation>
+
+  </behavior>
+
+</specification>

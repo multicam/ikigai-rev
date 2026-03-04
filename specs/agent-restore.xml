@@ -1,0 +1,153 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<specification topic="Agent Session Restoration">
+
+  <topic-statement>
+    The agent session restoration subsystem reconstructs all active agents from
+    the database at startup, replaying conversation history, pinned documents,
+    toolset configuration, and marks to restore each agent to its last known
+    state.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      The ordering of agent restoration, per-agent restoration steps (message
+      reconstruction, scrollback rebuilding, mark restoration, pin replay,
+      toolset reconstruction), command event side-effects during replay,
+      fresh-install path for agents with no history, and failure handling.
+    </in-scope>
+
+    <boundary name="Database queries">
+      How agent records and events are stored and retrieved from PostgreSQL is
+      handled by the database layer and is out of scope here.
+    </boundary>
+
+    <boundary name="Event rendering">
+      How historical events are converted to scrollback display lines is handled
+      by the event rendering subsystem and is out of scope here.
+    </boundary>
+
+    <boundary name="Token cache">
+      How the token cache is pruned after messages are loaded is handled by
+      the token cache subsystem and is out of scope here.
+    </boundary>
+  </scope>
+
+  <behavior>
+
+    <restoration-ordering order="1">
+      At startup, all agents still marked as running in the database are loaded
+      and sorted by creation timestamp, oldest first. This ordering ensures that
+      a parent agent is always restored before its children, preserving the
+      correct parent-child relationships when child agents are added to the
+      REPL's agent array.
+    </restoration-ordering>
+
+    <per-agent-steps order="2">
+      Each agent is restored in the following order:
+
+      <configuration-loading order="1">
+        Static configuration is loaded from the agent's database row: provider
+        name, model name, and any agent-specific settings. Provider and model
+        are set on the agent context; the provider instance itself is not
+        instantiated until the first request.
+      </configuration-loading>
+
+      <message-reconstruction order="2">
+        The conversation history is loaded from the database. Each event that
+        represents a conversation message and was not interrupted is converted
+        from database representation to an in-memory message object and added
+        to the agent's live message array. User messages cause a new token cache
+        turn to be recorded. Events that fail conversion are logged and skipped;
+        they do not halt restoration.
+      </message-reconstruction>
+
+      <scrollback-rebuilding order="3">
+        The scrollback display is reconstructed by replaying all historical
+        events through the event renderer in chronological order. Before each
+        event is rendered, any command side-effects associated with that event
+        are applied (see command-replay below). Render failures are logged and
+        skipped.
+      </scrollback-rebuilding>
+
+      <mark-restoration order="4">
+        Conversation marks (bookmarks) are restored from the replay context
+        that was built during message reconstruction and scrollback rebuilding.
+        The mark array is populated from the events identified as mark records.
+      </mark-restoration>
+
+      <token-cache-pruning order="5">
+        After messages are loaded and marks restored, the token cache is pruned
+        to trim any messages that exceed the configured token budget.
+      </token-cache-pruning>
+
+      <pin-replay order="6">
+        Pinned documents are restored through two queries. For child agents, the
+        fork event is loaded first to extract any documents that were pinned at
+        the time the agent was created. Then all subsequent pin and unpin
+        commands are applied in chronological order, building up the final set
+        of pinned document paths. This replay is independent of the clear-point
+        logic that constrains conversation message loading.
+      </pin-replay>
+
+      <toolset-reconstruction order="7">
+        The toolset filter is reconstructed through a priority cascade:
+
+        1. If an explicit toolset command exists in the agent's history, the
+           most recent one is used.
+        2. If no explicit command but the agent is a child, the toolset filter
+           is inherited from the fork event that created the agent.
+        3. If neither applies, no toolset filter is set (all tools allowed).
+
+        The toolset filter is stored as a delimited string and parsed into an
+        array of allowed tool names.
+      </toolset-reconstruction>
+
+      <repl-registration order="8">
+        After all state is restored, the agent is added to the REPL's active
+        agent array and is ready for use.
+      </repl-registration>
+    </per-agent-steps>
+
+    <command-replay order="3">
+      Certain slash commands have state side-effects that must be replayed
+      during scrollback reconstruction to ensure the displayed history is
+      consistent with actual agent state:
+
+      - **Model change commands**: the provider and model fields on the agent
+        are updated to reflect the selected values at each point in history.
+        The final values after all replays give the agent its current provider
+        and model.
+      - **Fork events**: the child agent's initial pinned documents and toolset
+        are extracted from the fork event's data payload and applied.
+
+      <notable reason="model is set repeatedly during replay">
+        If the user has changed models multiple times, the model field is
+        updated on each replay of a model command. After full replay, the agent
+        holds the model that was most recently set before the end of history.
+      </notable>
+    </command-replay>
+
+    <fresh-install-path order="4">
+      If the root agent (the first agent, with no parent) has no conversation
+      history in the database, it is treated as a fresh install. An initial
+      event is written to establish a starting point, and the default system
+      prompt is pinned. The agent is then ready for the first user message.
+    </fresh-install-path>
+
+    <failure-handling order="5">
+      If restoration of any individual agent fails (database query error, memory
+      exhaustion, or any other unrecoverable error), the agent is marked as dead
+      in the database and its restoration is abandoned. Remaining agents in the
+      sorted list continue to be restored. The REPL starts with whatever agents
+      were successfully restored.
+
+      <notable reason="partial restore is accepted">
+        A failed child agent does not prevent the parent or sibling agents from
+        being restored. The application starts in a degraded state rather than
+        refusing to launch.
+      </notable>
+    </failure-handling>
+
+  </behavior>
+
+</specification>

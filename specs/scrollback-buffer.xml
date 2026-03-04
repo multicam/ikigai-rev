@@ -1,0 +1,185 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<specification topic="Scrollback Buffer">
+
+  <topic-statement>
+    The scrollback buffer stores an unbounded sequence of logical text lines in a
+    single contiguous byte array and maintains pre-computed display layout data for
+    each line to support efficient rendering and terminal-width reflow.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Text storage layout, line indexing, dynamic growth strategy, append operation,
+      layout computation on append, O(n)-arithmetic reflow on terminal-width change,
+      physical-row lookup by row number, and all utility operations on stored lines.
+    </in-scope>
+
+    <boundary name="Scrollback layout computation">
+      The per-line layout calculation — segment widths, physical row counts, display
+      widths — is performed by the scrollback layout subsystem. This specification
+      covers when layout is triggered and what the result is stored as, not the
+      internal calculation.
+
+      <shared topic="Scrollback Layout">
+        The layout subsystem computes a segment-width array for a line by splitting
+        the text at newline characters and measuring the display width of each
+        segment in terminal columns. It uses this to compute the number of physical
+        rows the line occupies at a given terminal width.
+      </shared>
+    </boundary>
+
+    <boundary name="Rendering">
+      How stored lines are rendered to the terminal output buffer is handled by the
+      layer rendering pipeline and is out of scope here.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Scrollback buffer">
+      <field name="text buffer" type="contiguous byte array" note="all lines stored end-to-end; each line's bytes followed by a null terminator; never shrinks" />
+      <field name="text offsets" type="array of non-negative integers" note="byte offset in text buffer where each line's text begins; one entry per logical line" />
+      <field name="text lengths" type="array of non-negative integers" note="byte length of each line's text, not including the null terminator; one entry per logical line" />
+      <field name="layouts" type="array of layout records" note="pre-computed layout for each line; one entry per logical line" />
+      <field name="line count" type="non-negative integer" note="number of logical lines currently stored" />
+      <field name="line capacity" type="positive integer" note="allocated slots in the offset, length, and layout arrays; doubles when count would exceed it" />
+      <field name="buffer used" type="non-negative integer" note="bytes currently occupied in the text buffer, including null terminators" />
+      <field name="buffer capacity" type="positive integer" note="total allocated bytes in the text buffer; doubles when an append would exceed it" />
+      <field name="cached width" type="integer" note="terminal width in columns used for the most recent layout calculation; -1 or 0 before first calculation" />
+      <field name="total physical lines" type="non-negative integer" note="sum of physical_lines across all stored logical lines; updated on append and reflow" />
+    </contract>
+
+    <contract name="Line layout record">
+      <field name="display width" type="non-negative integer" note="total display width of the line in terminal columns, excluding ANSI escape sequences and newline characters" />
+      <field name="physical lines" type="positive integer" note="number of terminal rows the line occupies at the cached terminal width" />
+      <field name="newline count" type="non-negative integer" note="number of newline characters embedded in the line text" />
+      <field name="segment widths" type="array of non-negative integers" note="display width of each segment between (or after) newlines; length is newline_count + 1" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <initialization order="1">
+      A new scrollback buffer is created with an initial line capacity of 16 and an
+      initial text buffer capacity of 1024 bytes. All counts start at zero. The
+      cached width is set to indicate that no layout has been calculated.
+    </initialization>
+
+    <append order="2">
+      A logical line is appended by supplying its text bytes and length. The
+      following steps execute in order:
+
+      <line-array-growth order="1">
+        If the current line count equals the line capacity, the capacity is doubled
+        and the three parallel arrays (text offsets, text lengths, layouts) are each
+        reallocated to the new capacity. If any reallocation fails, an out-of-memory
+        error is returned and no state is modified.
+      </line-array-growth>
+
+      <text-buffer-growth order="2">
+        If the current buffer usage plus the incoming length plus one (for the null
+        terminator) would exceed the buffer capacity, the capacity is doubled
+        repeatedly until it is sufficient. If the reallocation fails, an
+        out-of-memory error is returned.
+      </text-buffer-growth>
+
+      <text-copy order="3">
+        The text bytes are copied into the text buffer at the current write position
+        (buffer used). A null terminator byte is written immediately after. The text
+        offset for the new line is set to the write position before the copy. The
+        text length for the new line is set to the supplied length. Buffer used is
+        advanced by length plus one (for the null terminator).
+      </text-copy>
+
+      <layout-on-append order="4">
+        The layout subsystem is invoked to compute the layout record for the new
+        line at the current cached terminal width. The computed layout is stored in
+        the layouts array at the new line's index. The total physical lines counter
+        is increased by the new line's physical lines count.
+      </layout-on-append>
+
+      <line-count-advance order="5">
+        The line count is incremented. The operation returns success.
+      </line-count-advance>
+
+      <notable reason="null-terminated but length does not include terminator">
+        Each line's text in the buffer is null-terminated for safe use as a C string,
+        but the stored text length excludes the terminator. The pointer returned by
+        the line-text accessor points directly into the buffer and is valid until the
+        next modification.
+      </notable>
+    </append>
+
+    <layout-reflow order="3">
+      When the terminal width changes, physical row counts must be recalculated.
+      The reflow operation iterates over all stored lines and, for each line,
+      recomputes its physical row count using only the existing segment-width array
+      and the new terminal width: each segment's physical rows is the ceiling of its
+      display width divided by the terminal width, with a minimum of one row per
+      segment. No UTF-8 scanning or newline counting is performed. The total
+      physical lines counter is recomputed from the new per-line counts. The cached
+      width is updated.
+
+      If the cached width already equals the requested width, the operation is a
+      no-op.
+
+      <notable reason="reflow is O(n) in line count, not in text size">
+        Because segment widths are pre-computed at append time, a resize requires
+        only arithmetic over the stored integers. The text buffer is not scanned
+        during reflow.
+      </notable>
+    </layout-reflow>
+
+    <physical-row-lookup order="4">
+      Given a physical row number (zero-indexed across the entire scrollback), the
+      corresponding logical line index and the row offset within that line are found
+      by scanning the layout array from the first line, accumulating physical row
+      counts, until the target row falls within a line's range. The output is the
+      logical line index and the row offset (how many rows into that line the target
+      row falls).
+
+      <notable reason="linear scan">
+        Lookup is O(n) in the number of logical lines. There is no index structure
+        for random access by physical row.
+      </notable>
+    </physical-row-lookup>
+
+    <clear order="5">
+      Clearing the buffer resets the line count, buffer-used, and total physical
+      lines counter to zero. The segment-width arrays owned by each layout record
+      are freed. The text buffer capacity and line array capacity are preserved; no
+      memory is released. The buffer is ready to accept new lines immediately.
+    </clear>
+
+    <copy order="6">
+      Copying from a source scrollback to a destination scrollback appends each
+      source line to the destination in order by calling the append operation. The
+      destination's cached width determines the layout of the copied lines, which
+      may differ from the source's layout if the two have different cached widths.
+    </copy>
+
+    <line-text-retrieval order="7">
+      A line's text is retrieved by supplying its zero-indexed line number. The
+      operation returns a pointer directly into the text buffer and the line's
+      byte length. The pointer is valid until the next append, clear, or copy
+      operation on the same buffer. The caller must not free the pointer.
+    </line-text-retrieval>
+
+    <display-column-to-byte-offset order="8">
+      Given a logical line index and a target display column, the byte offset within
+      that line's text at which the target column begins is computed by walking the
+      UTF-8 text, tracking the display column while skipping ANSI escape sequences.
+      The walk stops when the column count reaches the target. If the target column
+      exceeds the line's total display width, the byte offset of the end of the text
+      is returned.
+    </display-column-to-byte-offset>
+
+    <no-capacity-limit order="9">
+      There is no configured maximum for the number of lines or total bytes. The
+      buffer grows without bound as lines are appended, limited only by available
+      memory. An allocation failure during growth returns an error to the caller; the
+      buffer remains in its pre-growth state.
+    </no-capacity-limit>
+
+  </behavior>
+
+</specification>

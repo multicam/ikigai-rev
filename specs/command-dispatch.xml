@@ -1,0 +1,131 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<specification topic="Command Dispatch">
+
+  <topic-statement>
+    The command dispatcher routes slash-prefixed input lines to registered command
+    handlers by exact name match and persists successful command output to the
+    database.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Command recognition, routing, argument extraction, the complete command
+      registry, echo and output formatting, database persistence of command output,
+      and error handling for unknown commands.
+    </in-scope>
+
+    <boundary name="Tab completion">
+      Partial command name completion is performed by the tab completion subsystem
+      before the user submits the input. The dispatcher only sees complete, submitted
+      input and performs no prefix matching.
+    </boundary>
+
+    <boundary name="Individual command behavior">
+      What each command does — how it modifies agent state, what it outputs — is
+      outside the scope of this specification.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Command handler">
+      <field name="name" type="text" note="exact command name without the leading slash" />
+      <field name="handler" type="function reference" note="signature: (allocator context, REPL context, args string or null) → result" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <command-registry order="1">
+      The registry contains exactly 18 commands in a fixed ordered list:
+
+      | Name | Purpose |
+      |------|---------|
+      | `clear` | Clear scrollback, session messages, and marks |
+      | `mark` | Create a rollback checkpoint, optionally named |
+      | `rewind` | Roll back to a checkpoint, optionally by name |
+      | `fork` | Create a child agent |
+      | `kill` | Terminate an agent |
+      | `send` | Send a message to another agent |
+      | `wait` | Block until messages arrive from other agents |
+      | `reap` | Remove dead agents |
+      | `agents` | Display the agent process tree |
+      | `help` | List available commands |
+      | `model` | Change the active LLM model and thinking level |
+      | `system` | Set or display the system prompt |
+      | `tool` | List tools or show a tool's schema |
+      | `refresh` | Reload the tool registry from disk |
+      | `pin` | Manage pinned document paths |
+      | `unpin` | Remove a pinned document path |
+      | `toolset` | Restrict which tools are visible to the LLM |
+      | `exit` | Quit the application |
+
+      The list is static and never modified at runtime.
+    </command-registry>
+
+    <input-parsing order="2">
+      Input is recognized as a command when it begins with a forward slash (`/`).
+      The dispatcher:
+
+      1. Strips the leading `/`.
+      2. Skips any leading whitespace.
+      3. Extracts the command name: all characters up to the first whitespace or
+         end of string.
+      4. Skips whitespace between the command name and the arguments.
+      5. Treats the remainder as the arguments string. If no text remains, the
+         arguments are absent (null, not an empty string).
+
+      An input of `/` alone (no command name) is rejected with an error.
+    </input-parsing>
+
+    <routing order="3">
+      The command name is compared against each registry entry using a case-sensitive
+      exact string match. The list is scanned from the first entry to the last.
+      The first match is used.
+
+      If no entry matches, a warning is appended to the scrollback: `Unknown command
+      'name'`, and an invalid-argument error is returned. The input is not persisted
+      to the database on an unknown command.
+    </routing>
+
+    <echo-and-output order="4">
+      Before invoking the handler, the original input line (including the leading
+      `/`) is echoed to the scrollback in a dark-gray color, followed by a blank
+      line.
+
+      After the handler returns successfully, if the handler appended at least one
+      line to the scrollback, an additional blank line is appended. Handlers that
+      produce no output do not receive a trailing blank line.
+
+      The echo always appears; it is not conditional on handler success or output.
+    </echo-and-output>
+
+    <database-persistence order="5">
+      After a handler returns successfully, the command is persisted to the database
+      as a `command` event. The persisted record contains:
+
+      - The full original input line as the echo field.
+      - Any lines the handler appended to the scrollback during execution as the
+        output content.
+      - The command name and arguments in a structured data field.
+
+      Failed commands (handlers that return an error) are not persisted.
+
+      If the database write itself fails, the error is logged but the failure is
+      not returned to the caller; the command is considered to have completed
+      successfully from the user's perspective.
+    </database-persistence>
+
+    <handler-contract order="6">
+      Each handler receives:
+      - A talloc allocator context for temporary allocations.
+      - The REPL context for accessing agent state, scrollback, and the database.
+      - The arguments string (null if no arguments were supplied).
+
+      Handlers return a result indicating success or failure. Failures are displayed
+      to the user by appending a warning to the scrollback before the handler returns,
+      not by the dispatcher after the fact.
+    </handler-contract>
+
+  </behavior>
+
+</specification>

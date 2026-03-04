@@ -1,0 +1,285 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<specification topic="Input Parser">
+
+  <topic-statement>
+    The keyboard input parser translates a stream of raw TTY bytes into semantic
+    input actions one byte at a time, handling UTF-8 multibyte characters and ANSI
+    escape sequences through two independent stateful sub-parsers.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      All 28 semantic action types, the byte routing decision tree, UTF-8 decoding
+      with overlong and surrogate rejection, legacy control character mapping,
+      printable ASCII fast path, escape sequence buffering and dispatch, legacy CSI
+      arrow and tilde sequences, SGR mouse scroll sequences, CSI u protocol, shifted
+      character translation via keyboard layout, and error recovery.
+    </in-scope>
+
+    <boundary name="Action handling">
+      What happens after an action is produced — cursor movement, history navigation,
+      text insertion, etc. — is handled by the REPL action dispatcher and is out of scope.
+    </boundary>
+
+    <boundary name="Key injection">
+      Bytes injected programmatically by the key injection subsystem are fed to this
+      same parser. Whether a byte originates from the TTY or from injection is
+      indistinguishable at the parser level and is out of scope here.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Input action">
+      <field name="type" type="enumeration" note="one of 28 semantic action types; see behavior section for the complete list" />
+      <field name="codepoint" type="32-bit unsigned integer" note="the Unicode codepoint for the character action type only; zero for all other action types" />
+    </contract>
+
+    <contract name="Parser state">
+      <field name="escape buffer" type="byte array of 16 bytes" note="accumulates bytes of an in-progress escape sequence; indexed by escape length" />
+      <field name="escape length" type="non-negative integer" note="number of bytes currently in the escape buffer" />
+      <field name="in escape" type="boolean" note="true while collecting an escape sequence" />
+      <field name="UTF-8 buffer" type="byte array of 4 bytes" note="accumulates bytes of an in-progress multibyte UTF-8 sequence" />
+      <field name="UTF-8 length" type="non-negative integer" note="bytes accumulated so far for the current UTF-8 sequence" />
+      <field name="UTF-8 expected" type="non-negative integer" note="total bytes required to complete the current UTF-8 sequence (2, 3, or 4)" />
+      <field name="in UTF-8" type="boolean" note="true while collecting a multibyte UTF-8 sequence" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <semantic-actions order="1">
+      The parser produces exactly one of 28 action types per byte. Most actions
+      carry no payload. The character action carries a Unicode codepoint.
+
+      Actions with no payload:
+      - Newline (Enter key — submit the current line)
+      - Insert newline (Shift/Ctrl/Alt+Enter — insert a newline without submitting)
+      - Backspace
+      - Delete (forward delete)
+      - Arrow left, arrow right, arrow up, arrow down
+      - Page up, page down
+      - Scroll up, scroll down (mouse wheel)
+      - Ctrl+A (move to line start)
+      - Ctrl+C (interrupt)
+      - Ctrl+E (move to line end)
+      - Ctrl+K (kill to end of line)
+      - Ctrl+N (next history entry)
+      - Ctrl+P (previous history entry)
+      - Ctrl+U (kill entire line)
+      - Ctrl+W (delete word backward)
+      - Tab (completion trigger)
+      - Escape
+      - Navigate to previous sibling agent (Ctrl+Left)
+      - Navigate to next sibling agent (Ctrl+Right)
+      - Navigate to parent agent (Ctrl+Up)
+      - Navigate to child agent (Ctrl+Down)
+      - Unknown (byte was valid but produced no semantic result, or sequence is incomplete)
+
+      The character action carries a codepoint and represents a typeable Unicode
+      character — printable ASCII or any valid non-control Unicode codepoint.
+    </semantic-actions>
+
+    <byte-routing order="2">
+      Each byte received is routed through the following decision tree in strict order.
+      Only one path executes per byte.
+
+      1. If currently collecting a UTF-8 continuation sequence, attempt to append the
+         byte as a continuation byte. See UTF-8 decoding.
+
+      2. If currently collecting an escape sequence, dispatch the byte to the escape
+         sequence parser. See escape sequence parsing.
+
+      3. If the byte is `0x1B` (ESC), enter escape collection mode (escape length reset
+         to zero, in-escape set to true) and return Unknown.
+
+      4. If the byte matches a control character listed in the legacy control character
+         table below, return the corresponding action immediately.
+
+      5. If the byte is in the range `0x20`–`0x7E` inclusive, return a character action
+         with the byte value as the codepoint (printable ASCII fast path). Exception:
+         byte `0x7F` (DEL) is treated as Backspace, not a printable character.
+
+      6. If the byte is a UTF-8 lead byte (`0xC0`–`0xF7`), enter UTF-8 collection mode.
+         See UTF-8 decoding.
+
+      7. All other bytes produce Unknown with no state change.
+    </byte-routing>
+
+    <legacy-control-characters order="3">
+      The following byte values map directly to actions without entering any state
+      machine:
+
+      - `0x01` → Ctrl+A
+      - `0x03` → Ctrl+C
+      - `0x05` → Ctrl+E
+      - `0x09` → Tab
+      - `0x0A` → Insert newline
+      - `0x0B` → Ctrl+K
+      - `0x0D` → Newline
+      - `0x0E` → Ctrl+N
+      - `0x10` → Ctrl+P
+      - `0x15` → Ctrl+U
+      - `0x17` → Ctrl+W
+      - `0x7F` → Backspace
+
+      All other byte values in the ranges `0x00`–`0x08`, `0x0C`, `0x0F`–`0x12`,
+      `0x13`–`0x14`, `0x16`, `0x18`–`0x1A` produce Unknown.
+    </legacy-control-characters>
+
+    <utf8-decoding order="4">
+      UTF-8 multibyte sequences are decoded incrementally. Lead bytes are recognized
+      by bit pattern:
+
+      - `110xxxxx` (range `0xC0`–`0xDF`): 2-byte sequence
+      - `1110xxxx` (range `0xE0`–`0xEF`): 3-byte sequence
+      - `11110xxx` (range `0xF0`–`0xF7`): 4-byte sequence
+
+      When a lead byte is detected, UTF-8 collection mode is entered: the byte is
+      stored, the expected total is set (2, 3, or 4), and Unknown is returned.
+
+      Each subsequent byte is tested as a continuation byte: it must match the
+      pattern `10xxxxxx` (value in `0x80`–`0xBF`). If the pattern does not match,
+      UTF-8 mode is exited immediately and Unknown is returned; the offending byte
+      is discarded without being re-processed.
+
+      When the collected byte count reaches the expected total, the codepoint is
+      assembled by extracting the data bits from each byte. The assembled codepoint
+      is then validated:
+
+      - Overlong encodings (a 2-byte encoding of a codepoint below U+0080, a 3-byte
+        encoding below U+0800, or a 4-byte encoding below U+10000) produce U+FFFD
+        (replacement character) instead of the encoded value.
+      - UTF-16 surrogate codepoints (U+D800 through U+DFFF) produce U+FFFD.
+      - Codepoints above U+10FFFF produce U+FFFD.
+
+      All valid or replaced codepoints are returned as a character action. UTF-8
+      collection mode is then exited.
+
+      <notable reason="invalid continuation byte discards the byte">
+        When a non-continuation byte is received while in UTF-8 mode, only the mode
+        is reset — the bad byte is not reprocessed. It is silently discarded, and the
+        next byte is treated as the start of a new sequence.
+      </notable>
+    </utf8-decoding>
+
+    <escape-sequence-parsing order="5">
+      When the ESC byte (`0x1B`) is received outside of escape mode, the parser
+      enters escape collection mode and returns Unknown. Subsequent bytes are
+      appended to the escape buffer (up to 15 bytes). On each byte, the buffer is
+      tested against the patterns below in order. When a pattern matches completely,
+      the corresponding action is returned and escape mode is exited.
+
+      <first-byte order="1">
+        The first byte after ESC determines the sequence class:
+
+        - `[` (0x5B): begins a CSI sequence; continue collecting.
+        - ESC (`0x1B`): a second consecutive ESC produces the Escape action and
+          exits escape mode.
+        - Any other byte: exit escape mode and return Unknown.
+
+        <notable reason="bare ESC key is not recognized via legacy sequences">
+          A bare ESC byte followed by nothing (or by a non-recognized byte) does not
+          produce the Escape action. The Escape action is produced only by a double
+          ESC or by the CSI u encoding `ESC [ 27 ; 1 u`. Terminals that send a bare
+          ESC for the Escape key are not supported without using CSI u mode.
+        </notable>
+      </first-byte>
+
+      <legacy-arrow-keys order="2">
+        Four 3-byte sequences `ESC [ A`, `ESC [ B`, `ESC [ C`, `ESC [ D`
+        (final bytes 0x41–0x44) map to arrow up, down, right, and left respectively.
+      </legacy-arrow-keys>
+
+      <modified-arrow-keys order="3">
+        Sequences of the form `ESC [ 1 ; N A/B/C/D` carry a modifier number N.
+        The NumLock bit (bit 7, value 128) is masked off before interpreting N.
+        Only modifier 5 (Ctrl) is handled; it maps the four arrow directions to
+        the four agent-navigation actions (Ctrl+Up/Down/Left/Right). All other
+        modifier values produce Unknown.
+      </modified-arrow-keys>
+
+      <mouse-scroll-sgr order="4">
+        Sequences beginning with `ESC [ <` and ending with `M` (press) are parsed
+        as SGR mouse sequences. The button number is extracted from the parameter
+        before the first semicolon. Button 64 produces scroll up; button 65 produces
+        scroll down. All other SGR mouse sequences produce Unknown.
+      </mouse-scroll-sgr>
+
+      <tilde-sequences order="5">
+        Selected sequences ending with `~` or matching specific Home/End forms map
+        to actions:
+
+        - `ESC [ H` and `ESC [ 1 ~` and `ESC [ 1 ; N H` → Ctrl+A (line start)
+        - `ESC [ F` and `ESC [ 4 ~` and `ESC [ 1 ; N F` → Ctrl+E (line end)
+        - `ESC [ 3 ~` → Delete
+        - `ESC [ 5 ~` → Page up
+        - `ESC [ 6 ~` → Page down
+
+        Modifier values in Home/End sequences are accepted but not further
+        distinguished; they all map to the same line-boundary action.
+      </tilde-sequences>
+
+      <csi-u-protocol order="6">
+        Sequences of the form `ESC [ keycode ; modifiers u` implement the CSI u
+        keyboard protocol. The keycode and modifiers are parsed as decimal integers.
+        The NumLock bit (bit 7) is masked off the modifier before use.
+
+        Modifier values:
+        - 1: no modifier
+        - 2: Shift
+        - 5: Ctrl
+
+        Keycode/modifier combinations and their actions:
+
+        - 13 / 1 → Newline
+        - 13 / 2, 3, 5, 6 → Insert newline
+        - 9 / 1 → Tab
+        - 27 / 1 → Escape
+        - 127 / 1 → Backspace
+        - 97 / 5 → Ctrl+A
+        - 99 / 5 → Ctrl+C
+        - 101 / 5 → Ctrl+E
+        - 107 / 5 → Ctrl+K
+        - 110 / 5 → Ctrl+N
+        - 112 / 5 → Ctrl+P
+        - 117 / 5 → Ctrl+U
+        - 119 / 5 → Ctrl+W
+        - 32–126 / 1 → Character action with the keycode as codepoint
+        - 32–126 / 2 → Character action with the shifted translation of the keycode
+        - Any keycode above 50000 → Unknown
+        - All other combinations → Unknown
+
+        For shifted characters (modifier 2, keycode 32–126), a keyboard layout
+        lookup is performed to determine what character would be produced by pressing
+        that key with Shift held. If the lookup fails for any reason (layout not
+        available, keycode not found, result codepoint is zero), the original keycode
+        is returned as the codepoint unchanged.
+      </csi-u-protocol>
+
+      <discardable-sequences order="7">
+        Sequences that end with `m` (SGR color and style codes) are silently discarded;
+        they produce Unknown. Certain short tilde sequences not listed in the tilde
+        table above are also silently discarded. These are recognized so that terminal
+        color output interleaved with key sequences does not leave the parser in a
+        permanently stuck escape state.
+      </discardable-sequences>
+
+      <escape-buffer-overflow order="8">
+        If 15 bytes have been collected in the escape buffer and no recognized
+        sequence has terminated, the next byte triggers overflow handling: the
+        escape buffer is reset, escape mode is exited, and Unknown is returned.
+        No bytes are processed after the overflow; the overflowing byte is discarded.
+      </escape-buffer-overflow>
+    </escape-sequence-parsing>
+
+    <state-independence order="6">
+      The escape sub-parser and the UTF-8 sub-parser are mutually exclusive at
+      runtime: the byte routing decision tree checks in-UTF-8 mode first. In
+      practice, a valid terminal will never interleave UTF-8 continuation bytes with
+      escape sequences, so this ordering produces correct results without any explicit
+      conflict detection.
+    </state-independence>
+
+  </behavior>
+
+</specification>

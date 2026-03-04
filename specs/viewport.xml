@@ -1,0 +1,131 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<specification topic="Viewport">
+
+  <topic-statement>
+    The viewport tracks how far the user has scrolled up from the bottom of the
+    document and derives the visible row range used to clip layer rendering on each
+    frame.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      The scroll offset field, scroll commands and their step sizes, automatic
+      scroll-to-bottom triggers, maximum offset calculation, viewport row derivation,
+      and resize clamping.
+    </in-scope>
+
+    <boundary name="Layer rendering">
+      How the derived viewport row is used to clip and render individual layers is
+      covered by the layer rendering specification.
+    </boundary>
+
+    <boundary name="Input buffer position">
+      The terminal row where the input buffer layer begins is calculated as part
+      of viewport derivation and exposed to the cursor positioning code. The
+      calculation is part of this specification; how the cursor uses that row
+      is out of scope.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Scroll state (per agent)">
+      <field name="scroll offset" type="non-negative integer" note="number of document rows the view has been scrolled up from the bottom; 0 means the bottom of the document is visible" />
+    </contract>
+
+    <contract name="Derived viewport">
+      <field name="scrollback start line" type="non-negative integer" note="index of the first scrollback logical line visible in the current frame" />
+      <field name="scrollback line count" type="non-negative integer" note="number of scrollback logical lines visible" />
+      <field name="input buffer start row" type="non-negative integer" note="terminal row (0-indexed from top) at which the input buffer layer begins; equals the terminal height when the input buffer is off-screen" />
+      <field name="separator visible" type="boolean" note="true when the separator layer intersects the visible range" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <scroll-offset-semantics order="1">
+      The scroll offset is a per-agent value representing how many document rows
+      the view has been scrolled upward from the natural bottom position. An offset
+      of zero means the bottom of the document is visible. An offset of N means
+      the view has been scrolled up by N rows.
+
+      The offset is stored on each agent independently, so switching between agents
+      preserves each agent's scroll position.
+    </scroll-offset-semantics>
+
+    <scroll-commands order="2">
+      Four scroll commands modify the offset:
+
+      - **Scroll up** (mouse wheel up): advances the offset by 3 rows, clamped to
+        the maximum offset.
+      - **Scroll down** (mouse wheel down): reduces the offset by 3 rows, clamped
+        to zero.
+      - **Page up**: advances the offset by one full terminal height in rows,
+        clamped to the maximum offset.
+      - **Page down**: reduces the offset by one full terminal height in rows,
+        clamped to zero.
+    </scroll-commands>
+
+    <auto-scroll-to-bottom order="3">
+      The scroll offset is reset to zero (scroll to bottom) by any of the following:
+
+      - Any character typed into the input buffer.
+      - Backspace, forward delete, or any line-kill key pressed.
+      - Any cursor movement key (arrow keys, line-start, line-end).
+      - The input buffer submitted (Enter pressed).
+      - The LLM begins producing a response.
+
+      The effect is that any active user input or new LLM output snaps the view
+      back to the bottom, ensuring the most recent content is always visible during
+      interactive use.
+    </auto-scroll-to-bottom>
+
+    <maximum-offset-calculation order="4">
+      The maximum valid offset is the document height minus the terminal height,
+      clamped to zero when the document fits entirely within the terminal. The
+      document height is the sum of the heights of all visible layers at the
+      current terminal width.
+
+      Before calculating the maximum, layout for the scrollback buffer and the
+      input buffer is updated to the current terminal width if it has changed.
+    </maximum-offset-calculation>
+
+    <viewport-derivation order="5">
+      On each frame, the visible row range is derived from the scroll offset and
+      terminal height:
+
+      - The last visible document row is the document height minus one minus the
+        scroll offset.
+      - The first visible document row is the last visible row plus one minus the
+        terminal height.
+      - These bounds define which layers and which rows within each layer are passed
+        to the layer rendering pipeline.
+
+      The derived values (first visible row, terminal height) are set on the layer
+      stack before rendering, so that each layer's render function receives pre-
+      clipped row parameters.
+
+      <notable reason="scroll offset may exceed maximum after resize">
+        When the terminal shrinks, the document height may decrease, making a
+        previously valid offset larger than the new maximum. The offset is not
+        corrected on the stored field; instead the clamped value is used when
+        deriving the viewport on the next frame. The stored offset remains
+        out-of-range until the next scroll command or auto-scroll event.
+      </notable>
+    </viewport-derivation>
+
+    <input-buffer-position-derivation order="6">
+      The terminal row where the input buffer begins is calculated by accumulating
+      the heights of all visible layers above the input buffer (banner, scrollback,
+      spinner, separator) and subtracting the first visible document row. If the
+      resulting position is negative or falls entirely below the terminal height,
+      the input buffer is considered off-screen and its start row is reported as
+      the terminal height.
+
+      If the input buffer starts above the viewport (the user has scrolled up so
+      far that the top of the input buffer is above the first visible row), the
+      start row is reported as zero (clamped to the top of the terminal).
+    </input-buffer-position-derivation>
+
+  </behavior>
+
+</specification>

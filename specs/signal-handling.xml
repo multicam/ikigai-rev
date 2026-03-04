@@ -1,0 +1,97 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<specification topic="Signal Handling">
+
+  <topic-statement>
+    The signal handling subsystem intercepts terminal resize and process
+    termination signals via atomic flags, deferring all consequential work
+    to safe points in the event loop.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      The three handled signals, the self-pipe-style atomic flag mechanism,
+      the resize handling path (dimension query and redraw), the quit handling
+      path (provider shutdown and loop exit), and event-loop integration.
+    </in-scope>
+
+    <boundary name="REPL event loop">
+      The structure of the select-based event loop and how it processes other
+      I/O events is covered by the REPL event loop specification.
+    </boundary>
+
+    <boundary name="Provider shutdown">
+      How providers terminate in-flight HTTP connections is handled by the
+      provider subsystem and is out of scope here.
+    </boundary>
+  </scope>
+
+  <behavior>
+
+    <signal-disposition order="1">
+      Three signals are intercepted:
+
+      - **Terminal resize (SIGWINCH)**: signals that the terminal dimensions
+        have changed.
+      - **User interrupt (SIGINT)**: signals that the user pressed Ctrl+C at
+        the terminal.
+      - **Termination (SIGTERM)**: signals that an external process has
+        requested shutdown.
+
+      All three use the same mechanism: the signal handler is a minimal
+      function that sets an atomic flag and returns immediately. No complex
+      work is performed inside the handler.
+    </signal-disposition>
+
+    <atomic-flag-mechanism order="2">
+      Each signal has a dedicated `volatile sig_atomic_t` flag. Setting this
+      type is guaranteed to be atomic on the target architecture, making it
+      safe to write from a signal handler and read from the main thread without
+      locks.
+
+      The flags are only written by signal handlers; they are read and cleared
+      exclusively by the event loop at designated check points. This separation
+      ensures that all consequential state changes occur in the event loop
+      context, where it is safe to call arbitrary functions.
+    </atomic-flag-mechanism>
+
+    <resize-handling order="3">
+      At the start of each event loop iteration, the resize flag is checked.
+      If set, the flag is cleared and the terminal's current dimensions are
+      queried from the kernel. The cached terminal dimensions are updated, and
+      a full screen redraw is performed to reflow the display at the new width.
+
+      <notable reason="SIGWINCH may fire multiple times during a resize drag">
+        Terminals may deliver SIGWINCH repeatedly as the user drags the window.
+        Each delivery sets the flag, but the event loop coalesces rapid
+        deliveries into a single redraw because the flag is level-triggered
+        (set-then-cleared), not edge-triggered.
+      </notable>
+    </resize-handling>
+
+    <quit-handling order="4">
+      Near the end of each event loop iteration, the quit flag is checked. If
+      set (by either SIGINT or SIGTERM), the flag is cleared and the shutdown
+      sequence runs:
+
+      1. All active agents are iterated.
+      2. For each agent, the provider instance (if initialized) is invalidated,
+         which terminates any in-flight HTTP connections.
+      3. The event loop's exit condition is set, causing the loop to terminate
+         after the current iteration completes.
+
+      <notable reason="Ctrl+C in the action dispatcher also sets the quit flag">
+        The quit flag is also set by the action dispatcher when the user presses
+        Ctrl+C while the REPL has keyboard focus. Both paths share the same
+        flag and the same shutdown sequence.
+      </notable>
+    </quit-handling>
+
+    <test-instrumentation order="5">
+      Signal handler functions are excluded from code coverage instrumentation.
+      OS signal delivery cannot be reliably triggered in unit tests, so
+      coverage of these handlers is accepted as a structural gap.
+    </test-instrumentation>
+
+  </behavior>
+
+</specification>

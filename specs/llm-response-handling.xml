@@ -1,0 +1,150 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<specification topic="LLM Response Handling">
+
+  <topic-statement>
+    The LLM response handler processes streaming events from the SSE parser
+    as they arrive, accumulates text and thinking content, transitions agent
+    state on completion, and persists the response to the database.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Streaming event routing (text delta, thinking delta, tool call events,
+      error, done), line-buffered display during streaming, thinking block
+      extraction and storage, token usage rendering, HTTP error categorization,
+      completion callback behavior (state transition, flush, database
+      persistence), and the interaction between interruption and in-flight
+      responses.
+    </in-scope>
+
+    <boundary name="SSE parser">
+      How raw HTTP response bytes are parsed into normalized stream events is
+      covered by the SSE parser specification.
+    </boundary>
+
+    <boundary name="Tool execution">
+      What happens after a tool call is extracted from the completed response
+      is covered by the tool execution specification.
+    </boundary>
+
+    <boundary name="Agent state machine">
+      The semantics of state transitions (WAITING_FOR_LLM → IDLE,
+      WAITING_FOR_LLM → EXECUTING_TOOL) are covered by the agent state
+      machine specification.
+    </boundary>
+  </scope>
+
+  <behavior>
+
+    <streaming-event-routing order="1">
+      As each SSE event arrives from the HTTP layer, the stream callback
+      dispatches based on event type:
+
+      - **Stream start**: Response state is cleared; streaming buffers are
+        reset; the first-line flag is set (the first line of a response gets
+        the model-name prefix).
+      - **Text delta**: The text is accumulated into the response buffer and
+        processed for line-buffered display.
+      - **Thinking delta**: The thinking text is accumulated silently; nothing
+        is rendered during streaming.
+      - **Tool call events** (start, delta, done): Silently acknowledged; the
+        provider assembles tool call data internally.
+      - **Error event**: The error message is stored for later display.
+      - **Done event**: Token usage counts (input, output, thinking) are stored
+        for rendering at completion.
+    </streaming-event-routing>
+
+    <line-buffered-display order="2">
+      Text deltas are displayed to the scrollback using a line buffer. Incoming
+      text is appended to the buffer. When a newline character is encountered,
+      the content up to and including the newline is flushed as a complete
+      scrollback line. The first line of each response is prefixed with the
+      model name.
+
+      Content remaining in the buffer after the final delta (a line with no
+      trailing newline) is flushed as a partial line at completion.
+    </line-buffered-display>
+
+    <thinking-block-handling order="3">
+      Thinking blocks arrive as thinking deltas during streaming and are
+      accumulated into a separate thinking buffer. At completion, the thinking
+      buffer is scanned for structured thinking content blocks containing:
+
+      - The thinking text itself (the model's reasoning)
+      - A cryptographic signature required to pass the block back to the
+        provider on the next turn
+
+      Separately, any redacted thinking blocks (opaque encrypted payloads) are
+      extracted and stored. Both the thinking block and the redacted thinking
+      block, if present, are associated with the tool call in the response and
+      included in the database persistence record.
+
+      <notable reason="thinking is not displayed during streaming">
+        Thinking content is silently accumulated and never rendered to the
+        scrollback display, even partially. Only the final text response is
+        shown to the user.
+      </notable>
+    </thinking-block-handling>
+
+    <completion-sequence order="4">
+      When the HTTP request completes, the completion callback executes the
+      following steps in order:
+
+      1. **Metadata logging**: The response is logged with model name, status,
+         token counts, and timestamps.
+      2. **Buffer flush**: Any remaining content in the line buffer is flushed
+         to the scrollback. If content was rendered, a trailing blank line is
+         appended.
+      3. **Token usage rendering**: If any token count is non-zero, a usage
+         event is appended to the scrollback showing input, output, and (if
+         present) thinking token counts.
+      4. **Tool call extraction**: If the response finish reason indicates tool
+         use, the first tool call block is extracted and stored as the agent's
+         pending tool call.
+      5. **State transition**: The agent transitions to IDLE if no tool call
+         was found, or to EXECUTING_TOOL if a tool call was found and execution
+         begins.
+      6. **Database persistence**: The assistant response is saved as an event
+         record. If a tool call is present, both the tool call record and
+         (after execution) the tool result record are persisted.
+    </completion-sequence>
+
+    <http-error-handling order="5">
+      HTTP and network errors are categorized into:
+
+      - **Authentication error** (401, 403)
+      - **Rate limit** (429)
+      - **Invalid request** (400)
+      - **Not found** (404)
+      - **Server error** (500, 502, 503)
+      - **Timeout**
+      - **Content filter** (provider-specific)
+      - **Network error** (connection failure, DNS failure)
+      - **Unknown**
+
+      On any error, the error message is stored on the agent. The agent
+      transitions to IDLE. No automatic retry is attempted; the user may
+      re-submit the request manually.
+    </http-error-handling>
+
+    <interruption-handling order="6">
+      When the user interrupts an in-flight response (via Ctrl+C or Escape),
+      the provider instance on the agent is invalidated. Invalidation terminates
+      the underlying HTTP connection. Any partial response text already rendered
+      to the scrollback remains visible. The partially-received assistant
+      message may be marked as interrupted in the database.
+
+      The agent remains in WAITING_FOR_LLM momentarily while the HTTP
+      termination propagates, then transitions to IDLE.
+    </interruption-handling>
+
+    <token-delta-tracking order="7">
+      The input token count from each request is stored. On the next request,
+      the difference between the new input token count and the stored count is
+      reported to the token cache, which uses this delta to maintain per-turn
+      accounting for the sliding context window.
+    </token-delta-tracking>
+
+  </behavior>
+
+</specification>

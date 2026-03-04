@@ -1,0 +1,325 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<specification topic="Control Socket">
+
+  <topic-statement>
+    The control socket system accepts JSON commands from external clients over
+    a Unix domain socket and dispatches responses, including deferred responses
+    for the wait_idle command.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Server initialization, connection lifecycle, message dispatch, all four
+      command handlers, the deferred wait_idle mechanism, and connection teardown.
+    </in-scope>
+
+    <boundary name="Framebuffer serialization">
+      The read_framebuffer command delegates serialization of the rendered
+      terminal state to a separate subsystem. This specification records what
+      is passed to that subsystem and what is returned — the serialization
+      logic itself is out of scope.
+    </boundary>
+
+    <boundary name="Token cache">
+      The read_token_cache command reads from the token accounting subsystem.
+      This specification records what values are read and how they are
+      assembled — the token cache internals are out of scope.
+    </boundary>
+
+    <boundary name="Key injection">
+      The send_keys command appends decoded bytes to a key injection buffer.
+      This specification records when and how that append occurs — the
+      downstream processing of injected keys is out of scope.
+    </boundary>
+
+    <boundary name="Agent state machine">
+      The wait_idle command observes the agent's current state. This
+      specification records what value is observed — the state machine
+      transitions are out of scope.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Request">
+      <field name="type" type="text" note="command name; determines dispatch" />
+      <field name="keys" type="text" required="false" note="send_keys only; the key sequence to inject" />
+      <field name="timeout_ms" type="integer" required="false" note="wait_idle only; milliseconds before timeout response" />
+    </contract>
+
+    <contract name="Response">
+      <field name="type" type="text" required="false" note="present on success responses; value is command-specific" />
+      <field name="error" type="text" required="false" note="present on error responses; human-readable description" />
+    </contract>
+
+    <contract name="Token cache response">
+      <field name="total_tokens" type="integer" />
+      <field name="budget" type="integer" />
+      <field name="turn_count" type="integer" />
+      <field name="context_start_index" type="integer" />
+      <field name="turns" type="array of objects" note="each object has index (integer) and tokens (integer)" />
+    </contract>
+
+    <contract name="Server state">
+      <field name="listening file descriptor" type="integer" />
+      <field name="client file descriptor" type="integer" note="negative one when no client is connected" />
+      <field name="socket path" type="text" />
+      <field name="wait idle pending" type="boolean" note="true when a wait_idle response has been deferred" />
+      <field name="wait idle deadline" type="integer" note="monotonic clock milliseconds at which a deferred wait_idle times out" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <server-initialization order="1">
+      The server is initialized with a runtime directory path and produces a
+      running socket server.
+
+      <runtime-directory order="1">
+        The runtime directory is created if it does not exist, with permissions
+        granting access only to the owner (mode 0700). If the directory already
+        exists, no error is produced. If creation fails, initialization fails
+        and no socket is created.
+      </runtime-directory>
+
+      <socket-creation order="2">
+        A Unix domain stream socket is created. The socket path is constructed
+        by combining the runtime directory with the current process identifier
+        in the form `ikigai-<pid>.sock`.
+
+        If the path would exceed the platform's maximum socket path length (108
+        bytes on Linux), initialization fails.
+
+        Any file already at the socket path is removed before binding. The
+        socket is bound to that path and begins listening with a backlog of one
+        pending connection.
+      </socket-creation>
+
+      <initialization-failure order="3">
+        If initialization fails at any step, any socket file descriptor created
+        during the attempt is closed. The caller receives an error. The runtime
+        treats the control socket as unavailable and continues operating without
+        it.
+      </initialization-failure>
+    </server-initialization>
+
+    <event-loop-integration order="2">
+      The server integrates with the application's main I/O multiplexing loop.
+      On each iteration, the server contributes its file descriptors to the
+      set of descriptors to monitor.
+
+      <listen-socket-monitoring order="1">
+        The listening socket is included in the monitored set unless a
+        wait_idle response is currently deferred. When a deferred wait_idle
+        is pending, the listening socket is excluded, preventing new
+        connections from being accepted until the deferred response is sent.
+
+        <notable reason="new connections blocked during deferred wait_idle">
+          A client connected and waiting for a wait_idle response holds
+          exclusive access to the server until that response fires. The
+          backlog of one means at most one additional connection attempt
+          will queue; any further attempts are refused by the operating
+          system.
+        </notable>
+      </listen-socket-monitoring>
+
+      <client-socket-monitoring order="2">
+        When a client is connected, its file descriptor is always included in
+        the monitored set, regardless of deferred state.
+      </client-socket-monitoring>
+
+      <processing-order order="3">
+        On each loop iteration, processing occurs in this order: first, the
+        deferred wait_idle tick runs; then, a pending new connection is
+        accepted if the listening socket is ready; then, a pending client
+        request is handled if the client socket is ready.
+      </processing-order>
+    </event-loop-integration>
+
+    <connection-lifecycle order="3">
+      <accepting-connections order="1">
+        When the listening socket becomes ready, a connection is accepted. If
+        a client is already connected when a new connection arrives, the
+        existing client's file descriptor is closed without notification before
+        the new connection is accepted.
+
+        <notable reason="silent client eviction">
+          Clients have no protection against eviction. A new incoming connection
+          will silently terminate any currently connected client, including one
+          waiting for a deferred wait_idle response.
+        </notable>
+      </accepting-connections>
+
+      <request-handling order="2">
+        When the connected client's socket becomes ready, up to 4095 bytes are
+        read. If the read returns zero bytes (EOF) or a negative value (error),
+        the client is disconnected: its file descriptor is closed, the client
+        file descriptor is set to negative one, and any pending wait_idle state
+        is reset.
+
+        If bytes are read successfully, the data is null-terminated. A newline
+        character, if present, is replaced with a null terminator, discarding
+        everything from the newline onward.
+
+        <notable reason="partial messages are processed">
+          If a request arrives without a trailing newline, it is processed as
+          received. There is no waiting for a complete message before dispatch.
+        </notable>
+      </request-handling>
+
+      <sending-responses order="3">
+        Responses are sent using the MSG_NOSIGNAL flag to prevent SIGPIPE
+        signals on broken pipe connections.
+
+        If the send fails or is partial, the client file descriptor is closed
+        immediately, any pending wait_idle state is reset, and the failure is
+        not reported to the caller.
+
+        After a response is sent successfully (for all commands except the
+        deferred case), the client connection is closed.
+
+        <notable reason="connection always closed after response">
+          The protocol is strictly one-request, one-response, one-close.
+          Clients must reconnect to send another request.
+        </notable>
+      </sending-responses>
+    </connection-lifecycle>
+
+    <message-dispatch order="4">
+      The received bytes are parsed as JSON. If parsing fails, an error
+      response is sent immediately: `{"error":"Invalid JSON"}`.
+
+      The `type` field of the parsed JSON object determines the command. The
+      following type values are recognized: `read_framebuffer`,
+      `read_token_cache`, `send_keys`, and `wait_idle`. Any other value, or
+      the absence of the `type` field, produces an error response:
+      `{"error":"Unknown message type"}`.
+    </message-dispatch>
+
+    <commands order="5">
+
+      <read-framebuffer order="1">
+        The current terminal framebuffer is serialized and returned.
+
+        If no framebuffer is available, the response is:
+        `{"error":"No framebuffer available"}`.
+
+        Otherwise, the framebuffer bytes, terminal dimensions (rows and
+        columns), cursor position (row and column), and input buffer
+        visibility flag are passed to the framebuffer serialization subsystem.
+        The serialized result is returned as the response.
+
+        If serialization fails, the response is:
+        `{"error":"Serialization failed"}`.
+      </read-framebuffer>
+
+      <read-token-cache order="2">
+        The current agent's token accounting data is read and returned as a
+        JSON object.
+
+        If no agent is active or no token cache is available, the response is:
+        `{"total_tokens":0,"budget":100000,"turn_count":0,"context_start_index":0,"turns":[]}`.
+
+        Otherwise, the total token count, budget, turn count, and context
+        start turn index are read from the cache. A JSON array is constructed
+        containing one object per turn, each with an `index` field (the
+        context start index plus the turn's zero-based position) and a
+        `tokens` field. The response assembles all of these into a JSON object.
+
+        <notable reason="response is unbounded in size">
+          The turns array grows with the number of turns. No limit is imposed
+          on the size of the response.
+        </notable>
+      </read-token-cache>
+
+      <send-keys order="3">
+        A sequence of key characters is injected into the application's input.
+
+        The `keys` field is extracted from the request. If absent, the response
+        is `{"error":"Missing keys field"}`.
+
+        The keys string is unescaped to produce a raw byte sequence. If
+        unescaping fails, the response is `{"error":"Failed to unescape keys"}`.
+
+        On success, the response `{"type":"ok"}` is sent and the connection is
+        closed. The unescaped byte sequence is then appended to the key
+        injection buffer for processing on the next event loop iteration.
+
+        <notable reason="keys arrive after response">
+          The client receives the success response and the connection is closed
+          before the keys are submitted to the input pipeline. The effect of the
+          keys is not visible until a subsequent event loop iteration.
+        </notable>
+
+        <notable reason="no escaping in C client library">
+          When the C client library constructs the send_keys JSON request, it
+          embeds the keys string directly into the JSON without any escaping.
+          A keys string containing double-quote characters, backslashes, or
+          newlines will produce malformed JSON, which the server will reject
+          with an invalid JSON error.
+        </notable>
+      </send-keys>
+
+      <wait-idle order="4">
+        The command waits until the current agent enters the idle state, up to
+        a specified timeout.
+
+        <already-pending order="1">
+          If a wait_idle response is already deferred from a previous request,
+          the response is `{"error":"wait_idle already pending"}` and the
+          command is not processed further.
+        </already-pending>
+
+        <timeout-validation order="2">
+          The `timeout_ms` field is extracted. If absent or not a positive
+          integer, the response is `{"error":"Missing or invalid timeout_ms"}`.
+        </timeout-validation>
+
+        <immediate-idle order="3">
+          If the agent's current state is idle at the moment the request is
+          processed, the response is `{"type":"idle"}` and the connection is
+          closed normally.
+        </immediate-idle>
+
+        <deferred-response order="4">
+          If the agent is not idle, the response is deferred. The current
+          monotonic clock time is read and the deadline is set to that time
+          plus the requested timeout in milliseconds. The wait_idle pending
+          flag is set. No response is sent and the connection is kept open.
+
+          On each subsequent event loop iteration, the deferred tick checks
+          two conditions:
+
+          First, if the agent's state is now idle, the response
+          `{"type":"idle"}` is sent and the connection is closed.
+
+          Second, if the monotonic clock time has reached or passed the
+          deadline, the response `{"type":"timeout"}` is sent and the
+          connection is closed.
+
+          In both cases, the wait_idle pending flag is cleared.
+
+          <notable reason="timeout is a soft deadline">
+            The timeout is checked once per event loop iteration, not on a
+            dedicated timer. The actual elapsed time before a timeout response
+            is sent may exceed the requested timeout by up to one full event
+            loop cycle.
+          </notable>
+
+          <notable reason="failed send clears deferred state">
+            If the deferred response send fails (e.g., because the client
+            disconnected), the connection is closed and the wait_idle pending
+            flag is cleared silently. No error is surfaced.
+          </notable>
+        </deferred-response>
+      </wait-idle>
+
+    </commands>
+
+    <server-shutdown order="6">
+      During shutdown, the client connection (if any) is closed, the listening
+      socket is closed, and the socket file is removed from the filesystem.
+    </server-shutdown>
+
+  </behavior>
+
+</specification>

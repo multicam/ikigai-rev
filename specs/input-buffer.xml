@@ -1,0 +1,206 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<specification topic="Input Buffer">
+
+  <topic-statement>
+    The input buffer stores UTF-8 text entered by the user, tracks a cursor
+    position within that text, and computes the display layout needed to render
+    the text correctly across wrapped terminal lines.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Text storage and growth, codepoint insertion and deletion, cursor position
+      as a dual byte-and-grapheme representation, word-level deletion, line-level
+      navigation and deletion, multi-line vertical movement with column
+      preservation, display width calculation with ANSI sequence exclusion,
+      physical-line count calculation, and layout cache invalidation.
+    </in-scope>
+
+    <boundary name="Rendering">
+      How the input buffer's text and cursor position are drawn to the terminal
+      is handled by the input layer renderer and is out of scope here.
+    </boundary>
+
+    <boundary name="Action dispatcher">
+      What user input triggers which editing operation is decided by the action
+      dispatcher and is out of scope here.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Input buffer">
+      <field name="text" type="dynamic byte array" note="UTF-8 encoded character data; all inserted content is valid UTF-8" />
+      <field name="length" type="non-negative integer" note="number of bytes currently in the text array, not counting any null terminator" />
+      <field name="cursor byte offset" type="non-negative integer" note="byte position of the cursor within the text array; authoritative for text manipulation" />
+      <field name="cursor grapheme offset" type="non-negative integer" note="count of Unicode grapheme clusters from the start of the text to the cursor; authoritative for display and navigation semantics" />
+      <field name="target column" type="non-negative integer" note="grapheme column preserved across vertical cursor movements; reset to zero by any horizontal movement" />
+      <field name="layout dirty" type="boolean" note="true when the cached physical line count is stale and must be recomputed" />
+      <field name="cached physical lines" type="non-negative integer" note="number of terminal rows the text occupies at the cached terminal width; valid only when layout is not dirty" />
+      <field name="cached terminal width" type="positive integer" note="terminal column width used for the most recent physical-line calculation" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <text-storage order="1">
+      Text is stored in a dynamically allocated byte array. The array grows
+      as characters are inserted; it never shrinks. All text stored in the
+      buffer is guaranteed to be valid UTF-8 — the insert operations encode
+      each codepoint to UTF-8 before appending, so no runtime validation is
+      performed on reads.
+    </text-storage>
+
+    <insertion order="2">
+      A Unicode codepoint is inserted at the current cursor position by encoding
+      it to its 1–4 byte UTF-8 representation and inserting those bytes at the
+      cursor's byte offset. A newline character is inserted as a single byte.
+      After insertion, the cursor advances by the number of bytes inserted, the
+      cursor's grapheme offset is resynchronized, and the layout cache is
+      invalidated.
+    </insertion>
+
+    <backspace-deletion order="3">
+      Backspace deletes the complete UTF-8 character immediately before the
+      cursor. The operation scans backward from the cursor's byte position to
+      find the boundary of the preceding character (skipping UTF-8 continuation
+      bytes), removes all of that character's bytes, and moves the cursor to
+      where the deleted character began. If the cursor is at position zero,
+      backspace is a no-op. The layout cache is invalidated on any deletion.
+    </backspace-deletion>
+
+    <forward-deletion order="4">
+      Forward delete removes the complete UTF-8 character at the cursor
+      position. The character's byte length is determined by its leading byte,
+      and all bytes are removed. The cursor does not move — it now points to
+      the character that immediately followed the deleted one. If the cursor is
+      at or past the end of the text, this is a no-op.
+    </forward-deletion>
+
+    <word-deletion order="5">
+      Word deletion removes the word immediately before the cursor, implementing
+      standard Ctrl+W semantics. The operation:
+
+      1. Skips whitespace bytes backward from the cursor.
+      2. Identifies the character class of the first non-whitespace byte
+         (alphanumeric, or punctuation / other).
+      3. Deletes backward through all consecutive bytes of the same class.
+
+      Character classes are: alphanumeric (ASCII letters and digits), whitespace
+      (space, tab, newline, carriage return), and all other bytes (including
+      multi-byte UTF-8 leading bytes, which are treated as alphanumeric for
+      this purpose). The cursor is moved to the deletion boundary.
+    </word-deletion>
+
+    <cursor-representation order="6">
+      The cursor is maintained as two synchronized values: a byte offset for
+      text manipulation and a grapheme offset for display and navigation. The
+      byte offset is the primary value for all text operations. After any
+      operation that changes the byte offset, the grapheme offset is
+      resynchronized by counting Unicode grapheme clusters from the start of
+      the buffer to the new byte position.
+
+      Grapheme cluster boundaries are determined by Unicode standard grapheme
+      break rules. A base character and its combining diacritics form a single
+      grapheme; independent characters each form their own grapheme.
+    </cursor-representation>
+
+    <horizontal-cursor-movement order="7">
+      Moving the cursor left positions it at the immediately preceding grapheme
+      boundary. Moving right positions it at the next grapheme boundary. Both
+      directions are no-ops at their respective boundaries (start and end of
+      text). Either movement resets the target column to zero.
+    </horizontal-cursor-movement>
+
+    <line-navigation order="8">
+      The buffer supports navigation to logical line boundaries defined by
+      newline characters:
+
+      - **Line start**: moves the cursor to the byte position immediately after
+        the preceding newline, or to zero for the first line.
+      - **Line end**: moves the cursor to the byte position of the next newline,
+        or to the text length if none follows. The newline itself is excluded
+        from the position.
+
+      Both operations reset the target column.
+
+      <notable reason="line-end excludes the newline byte">
+        Positioning at line end places the cursor before the newline, not after
+        it. Pressing right from line end moves to the next line's start.
+      </notable>
+    </line-navigation>
+
+    <vertical-cursor-movement order="9">
+      Moving the cursor up or down preserves the user's intended column across
+      lines of differing lengths.
+
+      On the first vertical movement, the current grapheme column is stored as
+      the target column. Subsequent vertical movements aim for that stored
+      target column in the destination line. If the destination line is shorter
+      than the target column, the cursor is placed at the line end.
+
+      Any horizontal movement (left, right, line-start, line-end, or word
+      deletion) resets the target column to zero, so the next vertical movement
+      establishes a fresh target.
+    </vertical-cursor-movement>
+
+    <line-deletion order="10">
+      Two line-deletion operations are supported:
+
+      - **Kill line**: deletes the entire current line, including its newline
+        character. The cursor moves to where the line began. If the buffer
+        becomes empty, the cursor is at position zero.
+      - **Kill to end of line**: deletes from the cursor to (but not including)
+        the newline. If the cursor is already at line end, this is a no-op.
+
+      Both operations invalidate the layout cache.
+    </line-deletion>
+
+    <layout-calculation order="11">
+      The buffer computes how many physical (wrapped) terminal rows its text
+      occupies at a given terminal width. The calculation:
+
+      1. Splits the text at newline characters into logical lines.
+      2. For each logical line, computes the display width by walking the UTF-8
+         text and summing per-codepoint display widths (0, 1, or 2 columns)
+         while skipping ANSI escape sequences entirely.
+      3. For each logical line, computes the physical row count as the ceiling
+         of display width divided by terminal width, with a minimum of one row
+         per logical line.
+      4. Sums the per-line physical row counts.
+
+      An empty buffer (no text) has zero physical lines.
+
+      <notable reason="ANSI sequences occupy no visual space">
+        ANSI color and formatting sequences embedded in the text are skipped
+        during display-width measurement so they do not inflate the computed
+        row count.
+      </notable>
+    </layout-calculation>
+
+    <layout-cache order="12">
+      The physical line count is cached alongside the terminal width at which
+      it was computed. The cache is invalidated whenever text is modified (set
+      dirty). On the next call that requires the layout, if the cache is dirty
+      or the terminal width has changed, the layout is recomputed and the cache
+      is updated.
+
+      Callers that change the terminal width should recompute after resizing;
+      the cache detects the mismatch automatically.
+    </layout-cache>
+
+    <clear-operation order="13">
+      Clearing the buffer sets the text length to zero, resets the cursor to
+      position zero, resets the target column, and invalidates the layout cache.
+      Allocated memory is not released — the buffer retains its capacity for
+      future input.
+    </clear-operation>
+
+    <error-handling order="14">
+      Memory allocation failures during text buffer growth cause an immediate
+      process abort. Navigation and editing operations at boundaries (cursor at
+      start or end, empty buffer) are silent no-ops and never return errors.
+    </error-handling>
+
+  </behavior>
+
+</specification>

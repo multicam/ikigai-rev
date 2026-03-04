@@ -1,0 +1,184 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<specification topic="Event Rendering">
+
+  <topic-statement>
+    The event rendering system converts conversation event records into styled text
+    lines and appends them to the scrollback display buffer.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      The twelve recognized event kinds, the visual output produced for each (text
+      content, color, prefix symbol), per-line color application, tool call and tool
+      result formatting, token usage display, the blank-line spacing convention, and
+      interruption styling.
+    </in-scope>
+
+    <boundary name="Scrollback buffer">
+      How appended lines are stored and laid out for rendering is covered by the
+      scrollback buffer specification. This specification covers only what text
+      is appended.
+    </boundary>
+
+    <boundary name="Terminal rendering">
+      How scrollback lines appear on screen is covered by the layer rendering
+      specification.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Event record">
+      <field name="kind" type="text" note="one of twelve recognized values; determines how the event is rendered" />
+      <field name="content" type="text or null" note="human-readable text content for display" />
+      <field name="data json" type="text" note="structured JSON payload; used by command, mark, usage, fork, and tool events" />
+      <field name="interrupted" type="boolean" note="when true, the event is rendered with cancellation styling" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <event-kinds order="1">
+      Twelve event kinds are recognized. Events fall into two groups: conversation
+      events (rendered to the scrollback) and metadata events (not rendered).
+
+      **Rendered:**
+      - `user` — text submitted by the user
+      - `assistant` — text produced by the LLM
+      - `tool_call` — a tool invocation request
+      - `tool_result` — the result of tool execution
+      - `fork` — a fork marker message
+      - `command` — the output of a slash command
+      - `mark` — a user bookmark
+      - `usage` — token count information
+
+      **Not rendered (silently ignored):**
+      - `system` — stored for LLM context but never displayed
+      - `rewind` — a rollback marker; handled by the replay system
+      - `clear` — handled by the caller before replay
+      - `agent_killed` — a metadata record for agent termination
+
+      An unrecognized kind returns an error.
+    </event-kinds>
+
+    <blank-line-convention order="2">
+      Every rendered event appends a blank line after its content. This blank line
+      is a separate logical line in the scrollback buffer. It provides consistent
+      visual spacing between events. Events that produce no output (such as zero
+      token counts) also produce no blank line.
+    </blank-line-convention>
+
+    <color-application order="3">
+      Color is applied using 256-color foreground ANSI sequences (`\x1b[38;5;<n>m`)
+      followed by a reset (`\x1b[0m`). When color output is disabled (the `NO_COLOR`
+      environment variable is set or `TERM=dumb`), no ANSI sequences are emitted.
+
+      For multi-line content, color is applied to each line individually. Every line
+      starts with the color sequence and ends with a reset. This prevents color state
+      from carrying over into the next scrollback line.
+    </color-application>
+
+    <interruption-styling order="4">
+      When the interrupted flag is true, the `user`, `tool_call`, and `tool_result`
+      events use cancellation styling: the prefix symbol changes to `✗` and the
+      color changes to a dark gray (256-color index 242). The `assistant` event
+      ignores the interrupted flag.
+    </interruption-styling>
+
+    <per-event-rendering order="5">
+
+      <user-event order="1">
+        The content is trimmed of trailing whitespace and rendered with a right-
+        pointing chevron prefix (`❯`). The default foreground color is used. A blank
+        line follows.
+      </user-event>
+
+      <assistant-event order="2">
+        The content is trimmed of trailing whitespace and rendered with a filled
+        circle prefix (`●`) in a light-gray color (256-color index 249). A blank
+        line follows.
+      </assistant-event>
+
+      <tool-call-event order="3">
+        The tool call content is formatted as `→ tool_name: key="value", key=value, …`
+        where:
+        - The tool name is taken from the event data.
+        - Arguments are parsed from the JSON arguments string and rendered as
+          key=value pairs. String values are double-quoted; all other JSON types
+          (numbers, booleans, null) are unquoted.
+        - If the arguments JSON is absent or invalid, the raw arguments string is
+          displayed instead.
+        - If no arguments are present, only the tool name is shown.
+        - The formatted text is truncated at 3 newlines or 400 characters, whichever
+          is first. A `…` suffix is appended on truncation.
+
+        The color is a dark gray (256-color index 242). A blank line follows.
+      </tool-call-event>
+
+      <tool-result-event order="4">
+        The tool result content is formatted as `← tool_name: output` where:
+        - The output is extracted from the result JSON based on its type:
+          - A JSON string is used directly.
+          - A JSON array has its elements joined with `, `.
+          - A JSON object or other type is serialized to JSON.
+        - If no result content is present, `(no output)` is shown.
+        - The formatted text is truncated at 3 newlines or 400 characters. A `…`
+          suffix is appended on truncation.
+
+        The color is a dark gray (256-color index 242). A blank line follows.
+      </tool-result-event>
+
+      <fork-event order="5">
+        The content is trimmed of trailing whitespace and rendered without a prefix,
+        in a dark gray color (256-color index 242). A blank line follows.
+      </fork-event>
+
+      <command-event order="6">
+        Two optional parts are rendered independently, each followed by its own blank
+        line if non-empty:
+
+        1. **Echo**: the `echo` field from the data JSON, rendered in a dark gray
+           color without a prefix.
+        2. **Output**: the `content` field, trimmed of trailing whitespace, rendered
+           in a dark gray color without a prefix.
+
+        Either part may be absent. If both are absent, nothing is rendered.
+      </command-event>
+
+      <mark-event order="7">
+        The label field from the data JSON is read. If present, the text `/mark LABEL`
+        is rendered. If absent, the text `/mark` is rendered. No color is applied.
+        A blank line follows.
+      </mark-event>
+
+      <usage-event order="8">
+        Token counts are read from the data JSON fields `input_tokens`,
+        `output_tokens`, and optionally `thinking_tokens`. If the total is zero,
+        nothing is rendered and no blank line is appended.
+
+        If `thinking_tokens` is present and non-zero, the format is:
+        `Tokens: <in> in + <out> out + <thinking> thinking = <total>`
+
+        Otherwise:
+        `Tokens: <in> in + <out> out = <total>`
+
+        The color is a dark gray (256-color index 242). A blank line follows.
+      </usage-event>
+
+    </per-event-rendering>
+
+    <triggers order="6">
+      Event rendering is called in two contexts:
+
+      1. **Live display**: when a new event is created during an active session
+         (user input submitted, command executed, LLM response completed, tool
+         executed), the event is rendered immediately and the result appears in the
+         scrollback.
+
+      2. **Database replay**: when an agent's session is restored from the database,
+         all stored events are replayed through the renderer in chronological order
+         to reconstruct the scrollback display.
+    </triggers>
+
+  </behavior>
+
+</specification>

@@ -1,0 +1,122 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<specification topic="Rendering Context">
+
+  <topic-statement>
+    The rendering context manages the terminal output buffer, converts logical
+    text and cursor positions into ANSI escape sequences, and serializes the
+    resulting framebuffer to the terminal (or, in headless mode, to a JSON
+    representation for remote inspection).
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Output buffer management and growth strategy, newline-to-CRLF conversion,
+      cursor position calculation from a byte offset (accounting for UTF-8
+      width, ANSI sequences, and line wrapping), atomic rendering to the
+      terminal, and headless framebuffer serialization to structured JSON.
+    </in-scope>
+
+    <boundary name="Layer composition">
+      How the seven display layers are stacked and clipped before being written
+      into the output buffer is covered by the layer rendering specification.
+    </boundary>
+
+    <boundary name="TTY setup">
+      How the terminal is switched to raw mode and the alternate screen is
+      managed is handled by the terminal subsystem and is out of scope here.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Rendering context">
+      <field name="terminal width" type="positive integer" note="terminal width in columns; fixed at context creation" />
+      <field name="terminal height" type="positive integer" note="terminal height in rows; fixed at context creation" />
+      <field name="terminal file descriptor" type="file descriptor" note="the TTY to write to; -1 in headless mode" />
+      <field name="output buffer" type="dynamic byte array" note="accumulates ANSI escape sequences and text before the atomic write; never shrinks" />
+      <field name="buffer used" type="non-negative integer" note="bytes currently occupied in the output buffer" />
+      <field name="buffer capacity" type="positive integer" note="total allocated bytes in the output buffer; grows by 1.5× or to required size, whichever is larger" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <output-buffer-management order="1">
+      All rendered content is accumulated in a dynamically growing byte array
+      before being written to the terminal. When an append would exceed the
+      current capacity, the buffer is reallocated to the larger of 1.5× the
+      current capacity or the exact size required. The buffer never shrinks
+      during a session.
+
+      Rendering is atomic: a single render pass assembles all content into the
+      buffer, then writes it to the terminal in one system call. This prevents
+      visual flicker and partial-frame display.
+    </output-buffer-management>
+
+    <newline-conversion order="2">
+      When text is appended to the output buffer, embedded newline characters
+      (`\n`) are converted to carriage-return-plus-newline pairs (`\r\n`).
+      This conversion is necessary for raw-mode terminals where the kernel no
+      longer performs CR/LF translation. The required buffer space is
+      pre-calculated by counting newlines before the append.
+    </newline-conversion>
+
+    <cursor-position-calculation order="3">
+      Given a byte offset into a text string, the rendering context calculates
+      the terminal row and column where the cursor should be positioned. The
+      calculation iterates from the start of the text, maintaining a running
+      column count and row count:
+
+      - Newline characters reset the column to zero and increment the row.
+      - ANSI CSI escape sequences (detected via the ANSI parser) are skipped
+        without advancing the column.
+      - Each UTF-8 codepoint is decoded and its display width (0, 1, or 2
+        columns) is added to the column count.
+      - When the column count reaches the terminal width, it wraps to zero and
+        the row increments (to account for soft line-wrapping).
+
+      The resulting row and column are converted to a 1-based ANSI cursor
+      positioning sequence (`\x1b[row;colH`) and written to the output buffer.
+    </cursor-position-calculation>
+
+    <atomic-render-sequence order="4">
+      A complete render to the terminal follows this sequence:
+
+      1. The cursor is hidden (`\x1b[?25l`).
+      2. The cursor is moved to the home position (`\x1b[H`).
+      3. All layer content (already assembled by the compositor) is written
+         to the output buffer.
+      4. The cursor is repositioned to the calculated input cursor location.
+      5. The cursor is made visible (`\x1b[?25h`).
+      6. The entire output buffer is written to the terminal file descriptor
+         in a single call.
+      7. The buffer used counter is reset to zero for the next frame.
+    </atomic-render-sequence>
+
+    <headless-framebuffer-serialization order="5">
+      In headless mode (no TTY attached), the output buffer is serialized to
+      structured JSON instead of being written to a file descriptor. The
+      serializer:
+
+      1. Parses the ANSI escape sequences in the buffer to extract per-character
+         styling attributes (foreground color, bold, dim, reverse video).
+      2. Groups consecutive characters that share the same styling into spans.
+      3. Reconstructs line structure by detecting carriage-return-plus-newline
+         sequences.
+      4. Extracts the cursor position from the ANSI cursor positioning sequence.
+      5. Emits a JSON object containing an array of rows (each row being an
+         array of styled spans) and the cursor position.
+
+      This JSON representation is what the control socket client reads when a
+      remote process calls the read-framebuffer operation.
+    </headless-framebuffer-serialization>
+
+    <last-row-handling order="6">
+      When the last rendered row of content exactly fills the terminal's last
+      physical row, writing a trailing CRLF would cause the terminal to scroll.
+      This is detected and suppressed: the CRLF that would follow the final row
+      is omitted, preventing unintended scrolling of the terminal display.
+    </last-row-handling>
+
+  </behavior>
+
+</specification>

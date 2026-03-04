@@ -1,0 +1,103 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<specification topic="Document Cache">
+
+  <topic-statement>
+    The document cache stores the contents of files referenced by internal URIs
+    in memory, eliminating repeated filesystem reads when the same document is
+    requested multiple times.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Cache entry structure, on-demand loading from the filesystem, URI-to-path
+      translation before lookup, cache miss handling, single-entry invalidation,
+      bulk clear, and error handling when a file cannot be loaded.
+    </in-scope>
+
+    <boundary name="URI translation">
+      How internal URIs are resolved to canonical filesystem paths is handled
+      by the paths subsystem and is out of scope here.
+    </boundary>
+
+    <boundary name="System prompt assembly">
+      How cached document contents are concatenated to form the system prompt
+      is handled by the LLM request assembly subsystem and is out of scope here.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Cache entry">
+      <field name="canonical path" type="text" note="absolute filesystem path after URI translation; used as the lookup key" />
+      <field name="content" type="text" note="raw file bytes as a null-terminated string; owned by the cache" />
+    </contract>
+
+    <contract name="Cache">
+      <field name="entries" type="dynamic array of cache entry" note="starts with capacity 4; doubles on overflow" />
+      <field name="entry count" type="non-negative integer" note="number of entries currently stored" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <lookup order="1">
+      A document is retrieved by supplying its internal URI. The URI is first
+      translated to a canonical filesystem path. If translation fails, an error
+      is returned immediately and the cache is not consulted.
+
+      The cache entries are scanned linearly for an entry whose canonical path
+      matches. On a hit, the stored content pointer is returned. The pointer is
+      owned by the cache and must not be freed by the caller; it remains valid
+      until the entry is invalidated or the cache is cleared.
+    </lookup>
+
+    <cache-miss-loading order="2">
+      On a cache miss, the file is read from the filesystem at the canonical
+      path. If the read succeeds, a new entry is added to the cache with the
+      canonical path and the file content, and the content is returned. If the
+      array is at capacity, it is doubled before the entry is added.
+
+      If the file cannot be read (for example, because it does not exist or is
+      not accessible), an error is returned and no entry is added to the cache.
+
+      <notable reason="content is owned by the cache">
+        The file content is allocated within the cache's memory context. Callers
+        receive a borrowed pointer and must not attempt to free it.
+      </notable>
+    </cache-miss-loading>
+
+    <invalidation order="3">
+      A single cache entry can be invalidated by supplying its internal URI.
+      The URI is translated to a canonical path, and the matching entry (if
+      any) is removed. Remaining entries are shifted to fill the gap.
+
+      If URI translation fails or no matching entry is found, the operation
+      returns without modifying the cache.
+
+      Bulk invalidation (clear) frees all entries, resets the count to zero,
+      and leaves the capacity and array allocation intact for reuse.
+    </invalidation>
+
+    <use-by-pinned-documents order="4">
+      The primary consumer is the system prompt assembly process. When building
+      an effective system prompt from pinned documents, each pinned document URI
+      is looked up in the cache in order. If a document fails to load, it is
+      silently skipped and the next pinned document is processed.
+
+      Bulk cache clears occur when the tool registry is refreshed (via the
+      `/refresh` command), ensuring that document contents are re-read from disk
+      if files have changed since they were last cached.
+    </use-by-pinned-documents>
+
+    <per-agent-isolation order="5">
+      Each agent owns a separate document cache instance. There is no shared
+      cache across agents. An agent's cache is freed when the agent is destroyed.
+    </per-agent-isolation>
+
+    <allocation-failure order="6">
+      Memory allocation failures during cache growth or content storage cause
+      an immediate process abort.
+    </allocation-failure>
+
+  </behavior>
+
+</specification>

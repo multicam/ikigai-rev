@@ -1,0 +1,204 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<specification topic="Input Cursor">
+
+  <topic-statement>
+    The input buffer cursor tracks the insertion point within a UTF-8 text
+    buffer and moves through the text in response to navigation operations,
+    respecting grapheme cluster boundaries for horizontal movement and
+    preserving column position across vertical movement.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Cursor position representation, horizontal and vertical movement,
+      line-boundary navigation, buffer-boundary behavior, target column
+      preservation, and synchronization with the text buffer.
+    </in-scope>
+
+    <boundary name="Text editing">
+      Text insertion and deletion operations update the cursor position after
+      modifying the buffer. This specification documents the cursor-side effects
+      of those operations, not the editing operations themselves.
+    </boundary>
+
+    <boundary name="Rendering">
+      The cursor position drives how the input area is displayed. What the
+      terminal renders is out of scope.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Cursor position">
+      <field name="byte offset" type="non-negative integer" note="position in UTF-8 bytes from the start of the buffer; ranges from 0 to text length inclusive" />
+      <field name="grapheme offset" type="non-negative integer" note="position in grapheme clusters from the start of the buffer; synchronized with byte offset" />
+    </contract>
+
+    <contract name="Input buffer navigation state">
+      <field name="cursor" type="cursor position" />
+      <field name="target column" type="non-negative integer" note="the grapheme column to aim for during vertical movement; zero means use the current column" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <position-representation order="1">
+      The cursor position is maintained as two synchronized values: a byte
+      offset and a grapheme offset. The byte offset is the absolute position
+      in the UTF-8 byte sequence. The grapheme offset is the count of grapheme
+      clusters from the start of the buffer to the cursor.
+
+      The valid range for the byte offset is zero to the current text length
+      inclusive. A byte offset equal to the text length represents the position
+      after the last character.
+
+      When the byte offset is set directly, the grapheme offset is recalculated
+      from scratch by scanning the text from the beginning to the new byte
+      offset, counting grapheme cluster boundaries using Unicode grapheme break
+      rules. The grapheme offset is never set independently.
+    </position-representation>
+
+    <horizontal-movement order="2">
+      Horizontal movement advances or retreats the cursor by exactly one
+      grapheme cluster. Grapheme cluster boundaries are determined by the
+      Unicode grapheme break algorithm, which accounts for combining characters,
+      zero-width joiners, and other multi-codepoint sequences that form a single
+      visible glyph.
+
+      <move-left order="1">
+        When moving left, if the byte offset is zero, the operation is a no-op.
+        Otherwise, the text is scanned from the beginning to identify the
+        grapheme cluster boundary immediately before the current position. The
+        cursor advances to that boundary. The grapheme offset decrements by one.
+      </move-left>
+
+      <move-right order="2">
+        When moving right, if the byte offset equals the text length, the
+        operation is a no-op. Otherwise, the next grapheme cluster boundary
+        after the current position is identified and the cursor advances to it.
+        The grapheme offset increments by one.
+      </move-right>
+
+      After any horizontal movement, the target column is reset to zero,
+      clearing any preserved column from a previous vertical movement.
+    </horizontal-movement>
+
+    <vertical-movement order="3">
+      Vertical movement places the cursor on the line above or below the
+      current line, at the same column position when possible.
+
+      <column-calculation order="1">
+        The column for vertical movement is measured in codepoints from the
+        start of the current line, not in grapheme clusters. Each Unicode
+        codepoint contributes one unit to the column count, regardless of
+        whether it forms part of a multi-codepoint grapheme cluster.
+
+        <notable reason="inconsistency with horizontal movement">
+          Horizontal movement uses true Unicode grapheme cluster boundaries,
+          but vertical movement measures columns by codepoint count. A text
+          containing combining characters or ZWJ sequences will produce
+          different effective positions when arriving at a column via vertical
+          movement versus arriving via horizontal movement.
+        </notable>
+      </column-calculation>
+
+      <target-column order="2">
+        Before the first vertical move in a sequence, the current column is
+        computed and stored as the target column. This target column is
+        preserved across subsequent vertical movements without intervening
+        horizontal movements or text edits.
+
+        When the target line is shorter than the target column, the cursor
+        is placed at the end of the target line. If a subsequent vertical move
+        reaches a longer line, the cursor returns to the target column (not
+        to the clamped position used on the shorter line).
+
+        The target column is reset to zero by any horizontal movement, any
+        line-boundary navigation, and any text modification. After a reset,
+        the next vertical movement establishes a new target column from the
+        current cursor position.
+      </target-column>
+
+      <move-up order="3">
+        When moving up, if the cursor is on the first line (no newline exists
+        before the cursor), the operation is a no-op.
+
+        Otherwise, the current line start and current column are determined.
+        The target column is set if not already set. The previous line is
+        identified by scanning backward from the current line start. The cursor
+        is placed at the target column within the previous line, clamped to
+        the line's length.
+      </move-up>
+
+      <move-down order="4">
+        When moving down, if the cursor is on the last line (no newline exists
+        at or after the cursor), the operation is a no-op.
+
+        Otherwise, the current column and target column are determined. The
+        next line is identified by scanning forward past the current newline.
+        The cursor is placed at the target column within the next line, clamped
+        to the line's length.
+      </move-down>
+    </vertical-movement>
+
+    <line-boundary-navigation order="4">
+      <move-to-line-start order="1">
+        The cursor moves to the position immediately after the nearest preceding
+        newline, or to position zero if no preceding newline exists. If the
+        cursor is already at the line start, the operation is a no-op. The
+        target column is reset to zero.
+      </move-to-line-start>
+
+      <move-to-line-end order="2">
+        The cursor moves to the position of the nearest following newline
+        character. If no following newline exists, the cursor moves to the text
+        length. If the cursor is already at that position, the operation is a
+        no-op. The target column is reset to zero.
+
+        <notable reason="cursor lands on the newline, not after it">
+          The line-end position is the byte offset of the newline character
+          itself. Pressing right from this position will advance past the
+          newline onto the next line, rather than staying at the current line
+          end.
+        </notable>
+      </move-to-line-end>
+    </line-boundary-navigation>
+
+    <cursor-after-text-edits order="5">
+      Text modification operations update the cursor after changing the buffer.
+
+      <after-insertion order="1">
+        When a character is inserted at the current position, the cursor
+        advances by the number of bytes the inserted character occupies in
+        UTF-8 encoding. The grapheme offset is recalculated. The target
+        column is reset to zero.
+      </after-insertion>
+
+      <after-backspace order="2">
+        When a character before the cursor is deleted, the cursor retreats by
+        the number of bytes of the deleted character. The entire character
+        (which may be multiple bytes for non-ASCII codepoints) is deleted as a
+        unit. At byte offset zero, deletion is a no-op and the cursor does not
+        move. The target column is reset to zero.
+      </after-backspace>
+
+      <after-forward-delete order="3">
+        When a character at the cursor position is deleted, the cursor position
+        does not change. At the text end, deletion is a no-op. The target
+        column is reset to zero.
+      </after-forward-delete>
+
+      <after-clear order="4">
+        When the entire buffer is cleared, the cursor is reset to byte offset
+        zero and grapheme offset zero. The target column is reset to zero.
+      </after-clear>
+    </cursor-after-text-edits>
+
+    <empty-buffer order="6">
+      When the buffer contains no text, every movement operation is a no-op.
+      The cursor remains at byte offset zero and grapheme offset zero. No
+      target column is established.
+    </empty-buffer>
+
+  </behavior>
+
+</specification>

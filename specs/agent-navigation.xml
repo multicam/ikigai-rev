@@ -1,0 +1,128 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<specification topic="Agent Navigation">
+
+  <topic-statement>
+    The agent navigation subsystem maintains an ordered array of active agents,
+    tracks the currently visible agent, and provides tree-based navigation
+    (parent, sibling, and child) to move between agents.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      The agent array (add, lookup by UUID, remove), the current agent pointer,
+      tree navigation (to parent, previous sibling, next sibling, most recent
+      child), per-agent state preservation across switches, dead-agent handling,
+      and the reap operation that removes dead agents.
+    </in-scope>
+
+    <boundary name="Agent fork">
+      How a new child agent is created and inserted into the array is covered
+      by the agent fork specification.
+    </boundary>
+
+    <boundary name="Kill operation">
+      How an agent is marked dead in the database is covered by the inter-agent
+      messaging specification.
+    </boundary>
+
+    <boundary name="REPL event loop">
+      How agent switch events are triggered by user input is covered by the
+      REPL event loop and command dispatch specifications.
+    </boundary>
+  </scope>
+
+  <behavior>
+
+    <agent-array order="1">
+      All active agents are stored in a single dynamically-sized pointer array
+      within the REPL context. The array starts empty and grows by doubling
+      capacity when an insertion would exceed it (initial expansion is to 4
+      slots).
+
+      Agents are stored in insertion order. The array is not sorted; linear
+      scans are used for all lookups.
+    </agent-array>
+
+    <add-operation order="2">
+      An agent is added to the end of the array. If the array is at capacity,
+      it is reallocated with doubled capacity before insertion.
+    </add-operation>
+
+    <lookup-operation order="3">
+      An agent is located by UUID string. Lookup accepts both full UUIDs and
+      prefix strings (minimum four characters). Exact matches take priority over
+      prefix matches. If multiple agents share a prefix (ambiguous), the lookup
+      returns no result.
+    </lookup-operation>
+
+    <remove-operation order="4">
+      An agent is removed by UUID. The matching entry is located by linear scan,
+      removed, and the remaining entries are shifted to fill the gap. If the
+      removed agent was the current agent, the current pointer is set to null.
+    </remove-operation>
+
+    <current-agent order="5">
+      The REPL maintains a single pointer to the currently visible agent. Only
+      one agent is shown to the user at a time. The scrollback, input buffer,
+      and viewport state displayed are those of the current agent.
+
+      Each agent stores its own input buffer and viewport scroll offset
+      independently. Switching agents automatically restores whatever state
+      that agent was in when last viewed — no explicit save or restore is
+      needed.
+    </current-agent>
+
+    <tree-navigation order="6">
+      Navigation moves the current pointer according to parent-child
+      relationships derived from each agent's stored parent UUID:
+
+      - **To parent**: finds the agent whose UUID matches the current agent's
+        parent UUID. No-op if the current agent has no parent (it is the root).
+      - **To previous sibling**: collects all siblings (agents with the same
+        parent as the current agent), locates the current agent in that list,
+        and moves to the preceding entry, wrapping around to the last sibling.
+      - **To next sibling**: same as previous, but moves to the following
+        entry with wraparound to the first sibling.
+      - **To most recent child**: collects all direct children of the current
+        agent, sorts them by creation timestamp, and moves to the most recently
+        created one. No-op if the current agent has no children.
+
+      <notable reason="sibling collection is limited to 64 entries">
+        When collecting siblings or children for navigation, the array is
+        limited to 64 entries. If an agent has more than 64 siblings or
+        children, the navigation considers only the first 64.
+      </notable>
+    </tree-navigation>
+
+    <dead-agent-handling order="7">
+      Killing an agent marks it as dead (in the database and with an in-memory
+      flag) but does not immediately remove it from the array. The killed agent
+      remains visible and navigable until it is explicitly reaped.
+
+      If the user is viewing a dead agent, they continue to see it. The
+      scrollback displays a system message indicating the kill. The user can
+      navigate away and the agent remains in place until reaped.
+    </dead-agent-handling>
+
+    <reap-operation order="8">
+      The reap operation removes all dead agents from the array. Before removal,
+      if the current agent is among those being reaped (or has an ancestor being
+      reaped), the current agent is switched to the first living (non-dead)
+      agent in the array.
+
+      Dead agents and their descendants are identified, removed from the array
+      in a single pass, and their memory is freed. Each reaped agent is also
+      marked as reaped in the database (preserving the database row for audit
+      purposes while removing it from the live set).
+
+      <notable reason="reaping cascades to descendants">
+        When an agent is reaped, all of its descendants are also reaped,
+        regardless of whether they are individually marked dead. This prevents
+        orphaned child agents from remaining in the array when their parent
+        is removed.
+      </notable>
+    </reap-operation>
+
+  </behavior>
+
+</specification>

@@ -1,0 +1,80 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<specification topic="Pinned Documents">
+
+  <topic-statement>
+    Pinned documents are filesystem paths attached to an agent that are loaded
+    and concatenated in order to form the agent's system prompt on every LLM
+    request.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      The pinned document list (storage, ordering, add, remove), the /pin and
+      /unpin commands, validation behavior on add, duplicate detection, and
+      database persistence of pin and unpin events.
+    </in-scope>
+
+    <boundary name="Document cache">
+      How file contents are read from the filesystem and cached in memory is
+      covered by the document cache specification.
+    </boundary>
+
+    <boundary name="System prompt assembly">
+      How the pinned document list is consumed to assemble the system prompt on
+      each request is covered by the LLM request specification.
+    </boundary>
+  </scope>
+
+  <behavior>
+
+    <storage order="1">
+      Each agent holds a dynamically sized array of path strings representing
+      its pinned documents. Documents are stored in insertion (FIFO) order.
+      The array grows by reallocation when a new pin would exceed capacity.
+      On unpin, the removed entry's memory is freed and subsequent entries are
+      shifted to fill the gap; the array is reallocated to the new exact size.
+    </storage>
+
+    <pin-command order="2">
+      The `/pin` command with a path argument adds that path to the pinned list:
+
+      1. If the path is already in the pinned list, the command reports that the
+         document is already pinned and does nothing further (idempotent).
+      2. If the document cache is available, the file is loaded to validate that
+         it can be read. If the file cannot be found, a warning is displayed,
+         but the path is pinned anyway. This allows pinning documents that do
+         not yet exist on disk.
+      3. The path is appended to the pinned array.
+      4. A pin event is persisted to the database.
+
+      The `/pin` command with no arguments displays the current pinned document
+      list and takes no other action.
+
+      <notable reason="missing files are pinned with a warning, not rejected">
+        A path that does not exist at pin time is accepted and stored. The
+        warning is informational only. The missing document will be silently
+        skipped during system prompt assembly on subsequent requests.
+      </notable>
+    </pin-command>
+
+    <unpin-command order="3">
+      The `/unpin` command requires a path argument. It performs an exact string
+      match against the pinned list. If the path is not found, a "not pinned"
+      message is displayed and the command returns without error. If found, the
+      entry is removed and the array is compacted. A corresponding unpin event
+      is persisted to the database.
+
+      Failing to provide a path argument is an error.
+    </unpin-command>
+
+    <persistence order="4">
+      Pin and unpin events are recorded in the database as command events with
+      a JSON payload containing the command name and the path argument. These
+      records are replayed during session restoration to reconstruct the pinned
+      document list. Persistence failures are logged as warnings; the in-memory
+      state is authoritative.
+    </persistence>
+
+  </behavior>
+
+</specification>

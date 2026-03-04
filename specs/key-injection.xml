@@ -1,0 +1,148 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<specification topic="Key Injection">
+
+  <topic-statement>
+    The key injection system buffers programmatically supplied byte sequences
+    and feeds them into the REPL input pipeline one byte at a time, ahead of
+    real keyboard input.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Buffer initialization, byte appending with dynamic growth, single-byte
+      draining with auto-reset, pending-byte query, escape sequence unescaping,
+      and event loop integration with priority over TTY input.
+    </in-scope>
+
+    <boundary name="Input parser">
+      Drained bytes are fed to the same stateful input parser that processes
+      real keyboard bytes. The parsing of bytes into semantic actions (arrow
+      keys, control characters, Unicode codepoints, etc.) is out of scope.
+    </boundary>
+
+    <boundary name="Control socket">
+      The control socket supplies raw key strings that are unescaped before
+      being appended to the buffer. The socket protocol and command dispatch
+      are out of scope; this specification covers behavior from the point at
+      which unescaped bytes are available.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Injection buffer state">
+      <field name="data" type="byte array" note="dynamically allocated; initial capacity 256 bytes; never shrinks" />
+      <field name="write position" type="non-negative integer" note="byte offset of the next append; increases monotonically until drain completes" />
+      <field name="read position" type="non-negative integer" note="byte offset of the next byte to drain" />
+      <field name="capacity" type="positive integer" note="allocated size; doubles when an append would exceed it" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <buffer-initialization order="1">
+      The buffer is created with an initial capacity of 256 bytes. Both the
+      write position and the read position start at zero.
+    </buffer-initialization>
+
+    <byte-appending order="2">
+      A byte sequence of a given length is appended to the buffer. If the
+      current write position plus the incoming length would reach or exceed
+      the current capacity, the capacity is doubled repeatedly until it is
+      large enough. The bytes are then copied into the buffer starting at
+      the write position, and the write position is advanced by the number
+      of bytes appended.
+
+      The read position is not affected by an append.
+
+      <notable reason="capacity never shrinks">
+        Once the buffer grows, it does not release that capacity, even after
+        the buffer is fully drained and reset.
+      </notable>
+    </byte-appending>
+
+    <byte-draining order="3">
+      A single byte is removed from the front of the unread portion of the
+      buffer and returned to the caller.
+
+      If the read position equals the write position (no unread bytes remain),
+      the operation signals that no byte is available and returns without
+      modifying any state.
+
+      If an unread byte is available, it is read from the current read
+      position and the read position is advanced by one. If after this
+      advance the read position equals the write position (the buffer has
+      been fully drained), both positions are reset to zero, making the
+      entire buffer capacity available for future appends.
+
+      <notable reason="drain is one byte at a time">
+        The caller must call drain repeatedly to consume multiple bytes. This
+        constraint is intentional — see event loop integration below.
+      </notable>
+    </byte-draining>
+
+    <pending-query order="4">
+      The number of unread bytes in the buffer is the write position minus
+      the read position. This value is zero when the buffer is empty and
+      positive when bytes are waiting to be drained.
+    </pending-query>
+
+    <escape-unescaping order="5">
+      Before bytes are appended, a key string may be unescaped to convert
+      C-style escape sequences into their raw byte equivalents. The input
+      string is scanned left to right. Each recognized escape sequence is
+      replaced with the corresponding byte:
+
+      `\r` produces a carriage return byte (0x0D).
+      `\n` produces a linefeed byte (0x0A).
+      `\t` produces a tab byte (0x09).
+      `\\` produces a backslash byte (0x5C).
+      `\xNN` where `NN` are two hexadecimal digits produces the byte with
+      that numeric value.
+
+      Any backslash not followed by one of these recognized sequences is
+      output as a literal backslash byte. The character following the
+      backslash is processed normally on the next step.
+
+      All non-backslash characters are copied verbatim to the output.
+    </escape-unescaping>
+
+    <event-loop-integration order="6">
+      On each iteration of the main event loop, the injection buffer is
+      checked for pending bytes before the event loop blocks on I/O.
+
+      <priority-over-tty order="1">
+        If the buffer contains at least one unread byte, one byte is drained
+        and fed to the input parser. The event loop then continues to the
+        next iteration without waiting for I/O. This repeats until the buffer
+        is empty.
+
+        Only when the buffer is empty does the event loop proceed to block
+        on I/O, at which point real keyboard input may be read.
+      </priority-over-tty>
+
+      <one-byte-per-iteration order="2">
+        Only one byte is drained per event loop iteration, even if many bytes
+        are pending. After each byte is processed, the frame is rendered and
+        the loop restarts.
+
+        <notable reason="prevents interleaving with TTY escape sequences">
+          The input parser is stateful. A multi-byte escape sequence (such
+          as an arrow key) must be delivered as consecutive bytes to the
+          same parser invocations. If injected bytes were drained in bulk
+          and then real TTY bytes arrived, the two streams could interleave
+          inside an escape sequence, producing incorrect parse results. The
+          one-byte-per-iteration design ensures injected bytes are fully
+          consumed before any TTY bytes enter the parser.
+        </notable>
+      </one-byte-per-iteration>
+
+      <same-parser-as-tty order="3">
+        Injected bytes are fed to the same stateful input parser instance
+        that receives real keyboard bytes. From the parser's perspective,
+        injected bytes are indistinguishable from bytes typed at the keyboard.
+      </same-parser-as-tty>
+    </event-loop-integration>
+
+  </behavior>
+
+</specification>

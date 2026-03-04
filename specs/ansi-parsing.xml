@@ -1,0 +1,93 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<specification topic="ANSI Escape Sequence Parsing">
+
+  <topic-statement>
+    The ANSI parsing module detects and measures CSI escape sequences embedded
+    in terminal text so that display-width calculations and rendering can skip
+    over non-printing control sequences.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      CSI sequence structure and recognition, the skip operation that returns
+      a sequence's byte length, color output enablement based on environment
+      variables, and 256-color foreground sequence generation.
+    </in-scope>
+
+    <boundary name="Display width calculation">
+      How the widths of individual Unicode codepoints are determined (using
+      utf8proc for East Asian wide characters and emoji) is handled by the
+      scrollback layout subsystem and is out of scope here. The ANSI module
+      provides only the CSI skip step.
+    </boundary>
+
+    <boundary name="Other escape sequence families">
+      OSC sequences (ESC + ']'), DCS sequences, and other escape sequence
+      types are not recognized by this module. Only CSI sequences (ESC + '[')
+      are handled.
+    </boundary>
+  </scope>
+
+  <behavior>
+
+    <csi-sequence-structure order="1">
+      A CSI sequence has the following byte structure:
+
+      1. **Introducer**: ESC (0x1B) followed by '[' (0x5B)
+      2. **Parameter bytes** (zero or more): bytes in the range 0x30–0x3F
+         (digits, semicolons, colons, and related punctuation)
+      3. **Intermediate bytes** (zero or more): bytes in the range 0x20–0x2F
+         (space through slash)
+      4. **Terminal byte** (exactly one): a byte in the range 0x40–0x7E
+         (letters and symbols)
+
+      Any byte outside its expected range causes the sequence to be considered
+      invalid.
+    </csi-sequence-structure>
+
+    <skip-operation order="2">
+      Given a text buffer and a byte position, the skip operation determines
+      whether a CSI sequence begins at that position and, if so, returns the
+      total byte length of the sequence (including the two-byte introducer and
+      the terminal byte). If the position does not begin a valid CSI sequence,
+      zero is returned.
+
+      If the buffer ends before the terminal byte is encountered (an incomplete
+      sequence), zero is returned. This makes the operation safe to call on
+      partial streaming data.
+
+      The operation does not modify the buffer; it only reads.
+    </skip-operation>
+
+    <typical-usage order="3">
+      Callers that need to compute the display width of a text string iterate
+      byte-by-byte through the text. At each position, the skip operation is
+      called first. If it returns a non-zero length, the caller advances past
+      the entire sequence without counting any display columns for it. If it
+      returns zero, the caller decodes the UTF-8 codepoint at that position
+      and adds its display width to the running total.
+
+      This pattern allows ANSI color and formatting codes to be embedded in
+      stored text without inflating computed display widths or physical line
+      counts.
+    </typical-usage>
+
+    <color-enablement order="4">
+      Color output is enabled by default but disabled when either the
+      `NO_COLOR` environment variable is set (regardless of its value) or the
+      `TERM` environment variable is set to the value `dumb`. This check is
+      performed once at startup and stored as a global flag consulted by all
+      color-emitting code.
+    </color-enablement>
+
+    <color-sequence-generation order="5">
+      Given a 256-color palette index (0–255), the module generates the
+      corresponding ANSI SGR foreground color sequence into a caller-supplied
+      buffer. The sequence follows the format `\x1b[38;5;<n>m`. If the supplied
+      buffer is too small to hold the sequence, zero is written and the
+      operation is a no-op rather than truncating.
+    </color-sequence-generation>
+
+  </behavior>
+
+</specification>

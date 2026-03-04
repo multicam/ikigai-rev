@@ -1,0 +1,186 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<specification topic="Message Model">
+
+  <topic-statement>
+    The message model represents LLM conversation turns as role-tagged arrays of
+    typed content blocks and converts between the persistent database storage format
+    and the provider request format.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      The three message roles, the five content block types and their fields, message
+      creation, conversion from database records to provider messages, and the
+      handling of thinking blocks and tool call signatures.
+    </in-scope>
+
+    <boundary name="Provider serialization">
+      How messages are serialized into provider-specific JSON request bodies
+      (Anthropic, OpenAI, Google) is handled by the respective provider
+      implementations and is out of scope.
+    </boundary>
+
+    <boundary name="Token budgeting">
+      The selection of which messages to include in a request based on token counts
+      is managed by the token cache subsystem and is out of scope.
+
+      <shared topic="Token Cache">
+        The token cache tracks per-turn token costs and prunes the oldest turns when
+        the total exceeds the configured budget, advancing a context start index past
+        the removed messages.
+      </shared>
+    </boundary>
+
+    <boundary name="Database persistence">
+      How messages are written to or read from the PostgreSQL database is managed by
+      the database layer and is out of scope.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Message">
+      <field name="role" type="enumeration" note="one of: user, assistant, tool" />
+      <field name="content blocks" type="array of content block" note="ordered array; may contain one or more blocks" />
+      <field name="content count" type="non-negative integer" note="number of blocks in the array" />
+      <field name="provider metadata" type="text or null" note="reserved JSON string for provider-specific extensions; null in all current cases" />
+      <field name="interrupted" type="boolean" note="true if the message was cancelled before completion" />
+    </contract>
+
+    <contract name="Content block — text">
+      <field name="type" type="text constant" note="text" />
+      <field name="text" type="text" note="the message text; must not be null or empty" />
+    </contract>
+
+    <contract name="Content block — tool call">
+      <field name="type" type="text constant" note="tool_call" />
+      <field name="id" type="text" note="provider-assigned tool call identifier; must not be null" />
+      <field name="name" type="text" note="tool function name; must not be null" />
+      <field name="arguments" type="text" note="tool arguments as a JSON string; must not be null" />
+      <field name="thought signature" type="text or null" note="cryptographic signature from the model's thinking step; used for round-tripping; null for providers that do not supply it" />
+    </contract>
+
+    <contract name="Content block — tool result">
+      <field name="type" type="text constant" note="tool_result" />
+      <field name="tool call id" type="text" note="identifies the tool call this result answers; must not be null" />
+      <field name="content" type="text" note="tool execution output; must not be null" />
+      <field name="is error" type="boolean" note="true if the tool execution failed" />
+    </contract>
+
+    <contract name="Content block — thinking">
+      <field name="type" type="text constant" note="thinking" />
+      <field name="text" type="text" note="the model's reasoning text" />
+      <field name="signature" type="text" note="cryptographic signature required to pass the thinking block back to the provider on subsequent turns" />
+    </contract>
+
+    <contract name="Content block — redacted thinking">
+      <field name="type" type="text constant" note="redacted_thinking" />
+      <field name="data" type="text" note="provider-encrypted opaque payload (base64-encoded); must be passed back verbatim" />
+    </contract>
+
+    <contract name="Database record (source format for conversion)">
+      <field name="id" type="64-bit integer" note="database row identifier; 0 if the record was not loaded from the database" />
+      <field name="kind" type="text" note="discriminates message type; see conversion behavior for all recognized values" />
+      <field name="content" type="text or null" note="human-readable text content for simple messages" />
+      <field name="data json" type="text or null" note="structured JSON payload for tool call and tool result messages" />
+      <field name="interrupted" type="boolean" note="preserved from the database record" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <message-roles order="1">
+      Three roles are defined:
+
+      - **User**: messages submitted by the human operator.
+      - **Assistant**: messages produced by the LLM, including text responses and
+        tool call requests.
+      - **Tool**: messages supplying tool execution results back to the LLM.
+
+      System prompts are not represented as messages. They are passed separately in
+      the request structure and never appear in the message array.
+    </message-roles>
+
+    <content-block-ordering order="2">
+      A single message may contain multiple content blocks. The typical combinations
+      are:
+
+      - A user or assistant text message contains a single text block.
+      - A tool call message from the assistant may contain:
+        - A thinking block followed by a tool call block.
+        - A thinking block, a redacted-thinking block, and a tool call block.
+        - A redacted-thinking block followed by a tool call block.
+        - A tool call block alone.
+      - A tool result message contains a single tool result block.
+
+      Blocks within a message are ordered: thinking blocks precede redacted-thinking
+      blocks, which precede the tool call block.
+    </content-block-ordering>
+
+    <database-conversion order="3">
+      Database records are converted to provider messages according to the `kind`
+      field. The following kinds produce provider messages:
+
+      <user-message order="1">
+        Kind `user`: produces an assistant-role message with a single text block
+        containing the `content` field value.
+
+        <notable reason="kind name mismatch">
+          The database kind is `user` but the resulting message role is user,
+          as expected. The naming is consistent.
+        </notable>
+      </user-message>
+
+      <assistant-message order="2">
+        Kind `assistant`: produces an assistant-role message with a single text
+        block containing the `content` field value.
+      </assistant-message>
+
+      <tool-call-message order="3">
+        Kind `tool_call`: produces an assistant-role message by parsing the
+        `data_json` field. The JSON object contains:
+
+        - `tool_call_id`: the tool call identifier
+        - `tool_name`: the tool function name
+        - `tool_args`: the arguments JSON string
+        - `thinking` (optional object): with `text` and `signature` fields
+        - `redacted_thinking` (optional object): with a `data` field
+
+        If a `thinking` object is present, a thinking block is prepended. If a
+        `redacted_thinking` object is present, a redacted-thinking block follows the
+        thinking block. The tool call block is always last.
+      </tool-call-message>
+
+      <tool-result-message order="4">
+        Kinds `tool_result` and `tool`: produce a tool-role message by parsing the
+        `data_json` field. The JSON object contains:
+
+        - `tool_call_id`: the tool call identifier this result answers
+        - `output`: the result content string
+        - `success` (boolean): whether the tool succeeded
+
+        The `is_error` field on the tool result block is the logical inverse of
+        `success`. If the `success` field is absent, `is_error` defaults to false.
+      </tool-result-message>
+
+      <system-message order="5">
+        Kind `system`: produces no message. System prompts are not included in the
+        message array; the caller receives a null output and proceeds to populate
+        the request's system-prompt field by other means.
+      </system-message>
+
+      <non-conversation-kinds order="6">
+        Kinds `clear`, `mark`, `rewind`, `agent_killed`, `command`, and `fork` are
+        metadata records. They do not produce provider messages. Whether and how the
+        caller handles them is outside the scope of this specification.
+      </non-conversation-kinds>
+    </database-conversion>
+
+    <allocation-failure order="4">
+      All message and content block allocations are performed with a hierarchical
+      allocator. If any allocation fails, the process aborts immediately. There is
+      no partial-allocation recovery path.
+    </allocation-failure>
+
+  </behavior>
+
+</specification>

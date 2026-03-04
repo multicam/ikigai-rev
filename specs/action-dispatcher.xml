@@ -1,0 +1,160 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<specification topic="Action Dispatcher">
+
+  <topic-statement>
+    The action dispatcher routes each decoded input action to the appropriate
+    REPL behavior, with state-dependent handling for interruption, scrolling,
+    completion, and text editing.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      The dispatch table covering all recognized action types, state-dependent
+      branching (agent state, viewport offset, active completion), the priority
+      ordering for actions with multiple possible targets, and the handling of
+      unrecognized actions.
+    </in-scope>
+
+    <boundary name="Input parsing">
+      How raw terminal input is decoded into semantic action types is handled
+      by the input parser and is out of scope here.
+    </boundary>
+
+    <boundary name="Viewport">
+      The mechanics of scroll offset adjustment and auto-scroll behavior are
+      covered by the viewport specification.
+    </boundary>
+
+    <boundary name="Tab completion">
+      The mechanics of completion candidate navigation and item commitment are
+      covered by the tab completion specification.
+    </boundary>
+
+    <boundary name="Input cursor">
+      The mechanics of cursor movement and text insertion within the input buffer
+      are covered by the input cursor specification.
+    </boundary>
+
+    <boundary name="LLM request">
+      How a submitted user message is assembled into an LLM API request is
+      covered by the LLM request specification.
+    </boundary>
+  </scope>
+
+  <behavior>
+
+    <dispatch-overview order="1">
+      On each input event, the dispatcher receives a single action value and
+      selects behavior via a switch statement covering all recognized action
+      types. Actions that are not recognized are silently ignored with no state
+      change.
+    </dispatch-overview>
+
+    <enter-action order="2">
+      When the Enter action is received, the current input buffer text is
+      submitted as a user message and an LLM request is initiated, provided
+      the input buffer is non-empty and the agent is in the idle state.
+
+      <notable reason="submit clears the buffer">
+        The input buffer is cleared and the viewport is scrolled to the bottom
+        as part of the submission.
+      </notable>
+    </enter-action>
+
+    <escape-action order="3">
+      The Escape action is state-dependent:
+
+      - If the agent is waiting for an LLM response or executing a tool, the
+        in-flight operation is interrupted.
+      - If a completion menu is active, the completion is dismissed.
+      - Otherwise, Escape has no effect.
+    </escape-action>
+
+    <ctrl-c-action order="4">
+      The Ctrl+C action unconditionally sets the quit flag, which causes the
+      application to exit on the next event loop iteration. If the agent is
+      waiting for an LLM response or executing a tool, the in-flight operation
+      is also interrupted before the quit flag is set.
+    </ctrl-c-action>
+
+    <vertical-arrow-actions order="5">
+      The up and down arrow actions are dispatched to one of three targets in
+      priority order:
+
+      1. **Viewport scroll**: if the viewport is scrolled up (offset is non-zero
+         for up-arrow, or the viewport is not at the bottom for down-arrow), the
+         scroll offset is adjusted by one row.
+      2. **Completion navigation**: if a completion menu is active and the
+         viewport is at the bottom, the selected completion item is moved up or
+         down.
+      3. **Cursor history**: if no completion is active and the viewport is at
+         the bottom, the input buffer is replaced with the previous or next
+         entry from command history.
+
+      <notable reason="scroll takes priority over completion navigation">
+        If the user has scrolled the viewport upward, up and down arrows scroll
+        the viewport rather than navigating completion candidates, even if a
+        completion menu is visible.
+      </notable>
+    </vertical-arrow-actions>
+
+    <horizontal-arrow-actions order="6">
+      The left and right arrow actions always move the cursor in the input
+      buffer. If a completion menu is active, it is dismissed before the cursor
+      moves.
+    </horizontal-arrow-actions>
+
+    <space-action order="7">
+      If a completion menu is active, the Space action commits the currently
+      selected completion candidate into the input buffer and dismisses the menu.
+      If no completion is active, Space inserts a space character at the cursor
+      position.
+    </space-action>
+
+    <tab-action order="8">
+      The Tab action opens or advances the completion menu. If no menu is active,
+      a new completion session is started for the current input. If a menu is
+      already active, the next candidate is selected.
+    </tab-action>
+
+    <ctrl-n-ctrl-p-actions order="9">
+      The Ctrl+N and Ctrl+P actions are explicit no-ops. They are recognized by
+      the dispatcher but produce no state change.
+
+      <notable reason="Ctrl+N and Ctrl+P are disabled">
+        These key bindings are reserved but intentionally inactive. They do not
+        navigate history or perform any other action.
+      </notable>
+    </ctrl-n-ctrl-p-actions>
+
+    <page-scroll-actions order="10">
+      Page Up and Page Down scroll the viewport by one full screen height.
+      Home and End scroll the viewport to the top and bottom of the scrollback
+      respectively.
+    </page-scroll-actions>
+
+    <text-editing-actions order="11">
+      The remaining recognized actions operate directly on the input buffer:
+
+      - **Backspace**: deletes the character before the cursor.
+      - **Delete**: deletes the character at the cursor.
+      - **Ctrl+U**: clears the entire input buffer.
+      - **Ctrl+W**: deletes the word before the cursor.
+      - **Ctrl+A / Home (line)**: moves the cursor to the start of the input.
+      - **Ctrl+E / End (line)**: moves the cursor to the end of the input.
+      - **Character**: inserts the decoded Unicode codepoint at the cursor.
+
+      For all text-editing actions, if a completion menu is active it is
+      dismissed before the edit is applied, except for character insertion which
+      may trigger a completion refresh.
+    </text-editing-actions>
+
+    <auto-scroll-on-input order="12">
+      Any action that modifies the input buffer or submits a message resets the
+      viewport scroll offset to zero (bottom of scrollback), ensuring the user
+      always sees the most recent content while typing.
+    </auto-scroll-on-input>
+
+  </behavior>
+
+</specification>

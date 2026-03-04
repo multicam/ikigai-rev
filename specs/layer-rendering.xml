@@ -1,0 +1,331 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<specification topic="Layer Rendering">
+
+  <topic-statement>
+    The layer rendering pipeline composes an ordered stack of independently-sized layers
+    into a single terminal frame by clipping each layer to a scrollable viewport and
+    writing the result in one atomic operation.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Layer protocol (visibility, height, render contracts), the fixed seven-layer stack
+      composition, viewport clipping algorithm, per-frame output assembly, atomic TTY
+      write, cursor position calculation from text, SIGWINCH-triggered resize handling,
+      and the per-layer rendering behavior for each of the seven layer types.
+    </in-scope>
+
+    <boundary name="Scrollback layout">
+      The computation of physical row counts for scrollback text, including line wrapping
+      at a given terminal width, is performed by the scrollback layout subsystem and is
+      out of scope here.
+    </boundary>
+
+    <boundary name="Input cursor tracking">
+      The byte-offset representation of the cursor position within the input buffer is
+      maintained by the input cursor subsystem. This specification covers only how that
+      byte offset is translated to a terminal row and column for the final cursor
+      placement escape sequence.
+    </boundary>
+
+    <boundary name="Spinner animation timing">
+      The periodic timer that advances the spinner animation frame is managed by the
+      event loop. This specification covers only the frame set and what the spinner
+      renders on each call.
+    </boundary>
+
+    <boundary name="Tab completion state">
+      Whether a completion session is active, and the list of candidates it contains,
+      is managed by the tab completion subsystem. This specification covers only how
+      those candidates are rendered.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Layer protocol">
+      <field name="visibility predicate" type="function" note="returns true if the layer should participate in the current frame; when false, the height and render functions are not called for this frame" />
+      <field name="height function" type="function" note="accepts the terminal width in columns and returns the layer's total height in rows, accounting for line wrapping" />
+      <field name="render function" type="function" note="accepts the terminal width, a zero-indexed first row within the layer, and a row count; appends exactly that many rows to the output buffer" />
+    </contract>
+
+    <contract name="Layer stack">
+      <field name="layers" type="ordered array of layer references" note="seven layers in fixed top-to-bottom order: banner, scrollback, spinner, separator, input buffer, completion, status" />
+      <field name="scroll position" type="non-negative integer" note="the document row at the top of the visible area; 0 means the beginning of the stack" />
+      <field name="viewport height" type="positive integer" note="the terminal height in rows; determines how many document rows are visible" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <layer-stack-composition order="1">
+      The layer stack always contains exactly seven layers in a fixed top-to-bottom order:
+
+      1. Banner — a decorative ASCII-art header, 6 rows tall when visible.
+      2. Scrollback — the conversation history; variable height.
+      3. Spinner — a one-row animated wait indicator.
+      4. Separator — a one-row horizontal rule with optional embedded text.
+      5. Input buffer — the editable command line; variable height.
+      6. Completion — the tab-completion candidate list; one row per candidate.
+      7. Status — a two-row footer showing the active model name and thinking level.
+
+      The order is fixed at initialization and never changes at runtime.
+    </layer-stack-composition>
+
+    <visibility-rules order="2">
+      Each layer's visibility predicate governs whether it appears in a given frame.
+
+      <banner order="1">
+        The banner is visible when an external toggle flag is set. It is shown at
+        startup by default.
+      </banner>
+
+      <scrollback order="2">
+        The scrollback layer is always visible. Its height may be zero when the
+        conversation history is empty, but its visibility predicate always returns
+        true.
+      </scrollback>
+
+      <spinner order="3">
+        The spinner is visible when the active agent is waiting for an LLM response
+        or executing a tool. It is hidden in all other agent states.
+      </spinner>
+
+      <separator order="4">
+        The separator is always visible.
+      </separator>
+
+      <input-buffer order="5">
+        The input buffer is visible when the active agent is idle — that is, when it
+        is neither waiting for an LLM response nor executing a tool.
+      </input-buffer>
+
+      <completion order="6">
+        The completion layer is visible when a tab-completion session is active.
+        When no completion session exists, the layer is skipped entirely.
+      </completion>
+
+      <status order="7">
+        The status layer is visible when an external toggle flag is set.
+      </status>
+    </visibility-rules>
+
+    <rendering-loop order="3">
+      A frame is produced by iterating over the seven layers from top to bottom,
+      accumulating their visible content into a single output buffer.
+
+      For each layer, in order:
+
+      1. The visibility predicate is evaluated. If it returns false, the layer is
+         skipped entirely — its height and render functions are not called.
+
+      2. The height function is called with the current terminal width. The result
+         is the layer's total height in document rows.
+
+      3. The layer's position in the document is determined by summing the heights
+         of all preceding visible layers. This gives the contiguous range of
+         document rows the layer occupies.
+
+      4. The intersection of that range with the visible viewport is computed. If
+         the layer falls entirely outside the viewport — either above it or below
+         it — the layer's render function is not called.
+
+      5. If the layer intersects the viewport, clip parameters are derived: the
+         first row of the layer that falls within the viewport (a zero-indexed
+         offset into the layer's own row space), and the number of rows to render
+         (trimmed at both the top and the bottom of the viewport as needed).
+
+      6. The render function is called with the terminal width, the clipped first
+         row, and the clipped row count. It appends exactly that many rows to the
+         output buffer.
+
+      The loop terminates early if the accumulated document rows reach the bottom
+      of the viewport before all layers have been processed.
+    </rendering-loop>
+
+    <atomic-frame-write order="4">
+      The final framebuffer is assembled from a fixed preamble, the accumulated
+      layer content, and a fixed postamble, then written to the terminal file
+      descriptor in a single write call.
+
+      Preamble (prepended before layer content):
+      - Hide cursor: `\x1b[?25l`
+      - Move cursor to top-left home position: `\x1b[H`
+
+      Postamble (appended after layer content):
+      - Erase from cursor to end of screen: `\x1b[J`
+      - Cursor visibility: `\x1b[?25h` (show) when the input buffer is visible,
+        `\x1b[?25l` (hide) otherwise
+      - Cursor position: `\x1b[<row>;<col>H` (1-indexed) at the computed input
+        cursor location, placed immediately before the visibility sequence
+
+      The write is not split into multiple calls; the entire framebuffer is
+      transmitted atomically.
+
+      <notable reason="trailing CRLF removed when content fills the terminal">
+        If the total document height is greater than or equal to the terminal
+        height, and the assembled layer content ends with a carriage-return
+        followed by a line-feed (`\r\n`), that final two-byte sequence is
+        removed before writing. A CRLF on the last terminal row causes the
+        terminal to scroll the display up by one row, which misplaces the
+        cursor. Removing the trailing CRLF prevents this artifact.
+      </notable>
+    </atomic-frame-write>
+
+    <cursor-position-calculation order="5">
+      The terminal cursor is positioned at the screen location corresponding to
+      the input buffer's current byte cursor offset. The calculation scans the
+      input buffer text from byte zero to the cursor offset, tracking row and
+      column.
+
+      For each character encountered:
+      - A newline character resets the column to zero and increments the row,
+        without consuming a display width.
+      - An ANSI escape sequence (detected by the leading `\x1b[` introducer) is
+        skipped in its entirety and contributes zero display width.
+      - Any other character contributes its Unicode display width to the column:
+        zero for combining characters, one for standard-width characters, and
+        two for wide characters such as CJK ideographs.
+      - When the column would exceed the terminal width, the row increments and
+        the column resets to zero before applying the character's width.
+
+      After scanning, if the column equals the terminal width exactly, the row
+      increments and the column resets to zero (the cursor is at the start of
+      the next line).
+
+      The calculated row and column are relative to the start of the input buffer
+      layer. They are offset by the document row at which the input buffer begins
+      to produce absolute screen coordinates, then converted to 1-indexed values
+      for the cursor-position escape sequence.
+
+      <notable reason="cursor position is recalculated every frame">
+        The cursor position is not maintained incrementally. On each frame, the
+        entire input buffer from byte zero to the cursor offset is re-scanned.
+      </notable>
+    </cursor-position-calculation>
+
+    <resize-handling order="6">
+      When the terminal window is resized, the operating system delivers a SIGWINCH
+      signal. The signal handler records the event by setting a flag (a
+      `volatile sig_atomic_t`) and returns immediately, performing no other work.
+
+      On each iteration of the REPL event loop, the flag is tested. When set, the
+      flag is cleared and a resize procedure is invoked. The resize procedure
+      queries the new terminal dimensions via an `ioctl` call, updates the stored
+      terminal width and height, and triggers a full re-render at the new
+      dimensions.
+
+      <notable reason="resize is deferred to the event loop">
+        The signal handler only sets a flag. Terminal queries, layout
+        recalculation, and rendering occur in the event loop on the next
+        iteration, avoiding the use of non-async-signal-safe functions inside
+        the signal handler.
+      </notable>
+    </resize-handling>
+
+    <per-layer-rendering order="7">
+      Each layer type produces its rows by appending bytes to the output buffer.
+      Every row, without exception, ends with an erase-to-end-of-line sequence
+      (`\x1b[K`) followed by carriage-return and line-feed (`\r\n`), unless
+      otherwise noted.
+
+      <banner-rendering order="1">
+        The banner is always exactly 6 rows.
+
+        Row 0: A full-width horizontal border of double horizontal line characters
+        (═, U+2550), drawn in a dim-gray 256-color foreground.
+
+        Rows 1–4: An ASCII-art face composed of box-drawing characters for eye
+        frames, filled with a cyan foreground for the frames and an amber-gold
+        foreground for the pupils. A mouth on row 4 uses a coral-pink foreground.
+        The application name, version string, and a tagline appear alongside the
+        face in soft-blue and light-gray foregrounds respectively.
+
+        Row 5: A second full-width border identical to row 0.
+
+        All color is applied with 256-color SGR foreground sequences
+        (`\x1b[38;5;<n>m`) and reset with `\x1b[0m`.
+      </banner-rendering>
+
+      <scrollback-rendering order="2">
+        The scrollback layer maps the requested row range to logical text lines
+        using the scrollback layout subsystem. For each text byte in range,
+        newline characters are replaced with `\x1b[K\r\n`. Lines that end
+        without a newline receive a trailing `\x1b[K\r\n` to complete the
+        final row.
+      </scrollback-rendering>
+
+      <spinner-rendering order="3">
+        The spinner renders one row: a single Braille animation frame character
+        followed by a space and the fixed text "Waiting for response...".
+
+        The animation cycles through ten Braille characters in order:
+        ⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏
+
+        The active frame advances every 120 milliseconds and wraps back to the
+        first character after the tenth.
+      </spinner-rendering>
+
+      <separator-rendering order="4">
+        The separator renders one row of horizontal box-drawing characters
+        (─, U+2500) spanning the full terminal width.
+
+        When navigation context is available (the current agent's position in the
+        process tree), a navigation string is embedded in the separator. It
+        contains abbreviated identifiers for the parent agent, previous sibling,
+        current agent (bracketed), next sibling, and a child count, separated by
+        directional arrow characters. The number of box-drawing characters is
+        reduced to accommodate the embedded string, keeping the total visual
+        width equal to the terminal width.
+
+        When debug information is available, a debug string showing the render
+        timing and viewport offsets is also embedded alongside the navigation
+        string.
+
+        The visual widths of embedded strings are measured by scanning their
+        bytes and excluding all ANSI escape sequences, so that color codes do
+        not distort the character count.
+
+        Render timing in the debug string is displayed as an integer number of
+        microseconds when below 1000 µs, and as a decimal number of milliseconds
+        with one decimal place when 1000 µs or above.
+      </separator-rendering>
+
+      <input-buffer-rendering order="5">
+        The input buffer layer renders the command text. Newline characters are
+        replaced with `\x1b[K\r\n`. Text that does not end with a newline receives
+        a trailing `\x1b[K\r\n`.
+
+        <notable reason="empty input buffer occupies one row">
+          When the input buffer contains no text, the layer height is 1, not 0.
+          A single blank row (only `\x1b[K\r\n`) is rendered to preserve space
+          for cursor placement.
+        </notable>
+      </input-buffer-rendering>
+
+      <completion-rendering order="6">
+        The completion layer renders one row per visible candidate. The currently
+        selected candidate is highlighted with reverse video combined with bold
+        (`\x1b[7;1m`) and the attributes are reset after the candidate text
+        (`\x1b[0m`). All other candidates are rendered without highlighting.
+
+        If the viewport clips the bottom of the completion list, only the
+        candidates that fall within the clipped row count are rendered.
+      </completion-rendering>
+
+      <status-rendering order="7">
+        The status layer is always exactly 2 rows.
+
+        Row 0: A full-width separator of horizontal box-drawing characters
+        (─, U+2500), identical in style to the separator layer's rule but without
+        any embedded text.
+
+        Row 1: A robot emoji (🤖) followed by the active model name and thinking
+        level, separated by a slash, in a soft-blue 256-color foreground. If no
+        model is configured, the text "(no model)" is shown instead.
+      </status-rendering>
+
+    </per-layer-rendering>
+
+  </behavior>
+
+</specification>

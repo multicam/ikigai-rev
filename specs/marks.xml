@@ -1,0 +1,122 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<specification topic="Marks">
+
+  <topic-statement>
+    The marks system creates named conversation checkpoints and restores the
+    conversation to any checkpoint on demand, truncating messages and rebuilding
+    the display from the retained history.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Mark creation, the mark data record, mark storage on the agent, the rewind
+      operation (message truncation, mark pruning, scrollback reconstruction),
+      database persistence of mark and rewind events, and the relationship between
+      a mark's index and the live message array.
+    </in-scope>
+
+    <boundary name="Scrollback rendering">
+      How events are rendered into scrollback lines during scrollback reconstruction
+      is handled by the event rendering subsystem and is out of scope here.
+    </boundary>
+
+    <boundary name="Database persistence">
+      How events are written to and read from the database is managed by the
+      database layer and is out of scope.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Mark">
+      <field name="message index" type="non-negative integer" note="the number of messages in the agent's message array at the time the mark was created; this becomes the truncation point on rewind" />
+      <field name="label" type="text or null" note="optional human-readable name for the mark; null if no label was supplied" />
+      <field name="timestamp" type="timestamp" note="wall-clock time when the mark was created" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <mark-creation order="1">
+      A mark is created when the user runs the `/mark` command, optionally
+      followed by a label string. The mark records the current size of the
+      agent's in-memory message array as its message index and the current
+      wall-clock time as its timestamp. The label, if provided, is stored
+      verbatim; if omitted, the label is null.
+
+      The new mark is appended to the agent's dynamic mark array, which grows
+      as needed. A mark creation event is persisted to the database. Persistence
+      is best-effort: a failure is logged but does not prevent the mark from
+      existing in memory.
+    </mark-creation>
+
+    <rewind-operation order="2">
+      Rewinding to a mark restores the conversation to the state it was in when
+      that mark was created. The operation proceeds in four steps:
+
+      <message-truncation order="1">
+        The agent's in-memory message array is truncated to the mark's message
+        index. All messages at and beyond that index are discarded. Messages
+        before the index are retained unchanged.
+      </message-truncation>
+
+      <mark-pruning order="2">
+        All marks whose message index is greater than the target mark's message
+        index are removed from the agent's mark array. The target mark itself
+        is retained, allowing the user to rewind to the same point again.
+      </mark-pruning>
+
+      <scrollback-reconstruction order="3">
+        The scrollback display buffer is cleared and rebuilt by replaying all
+        database events from the beginning of the conversation through the now-
+        truncated message history. Each retained event is passed through the
+        event renderer in chronological order to reconstruct the visible display.
+      </scrollback-reconstruction>
+
+      <rewind-persistence order="4">
+        A rewind event is persisted to the database recording that a rewind
+        occurred. Persistence is best-effort.
+      </rewind-persistence>
+
+      <notable reason="target mark is kept after rewind">
+        The mark that was rewound to is not removed from the mark array.
+        Subsequent rewinds to the same mark are therefore possible without
+        recreating it.
+      </notable>
+    </rewind-operation>
+
+    <mark-array-storage order="3">
+      Marks are stored in a dynamically sized pointer array on the agent. The
+      array grows by reallocation when a new mark would exceed the current
+      capacity. Each array slot holds a pointer to an individually allocated
+      mark record. The array is owned by the agent and freed with it.
+    </mark-array-storage>
+
+    <database-record-kinds order="4">
+      Two database event kinds relate to marks:
+
+      - **mark**: written when a mark is created; stores the optional label in
+        the data payload.
+      - **rewind**: written when a rewind is performed; identifies the target
+        mark in the data payload.
+
+      Both are metadata records and are not rendered to the scrollback display.
+      During session replay, the rewind record signals the replay system to
+      truncate the replayed event stream at the corresponding point.
+    </database-record-kinds>
+
+    <message-index-semantics order="5">
+      A mark's message index equals the number of messages present when the mark
+      was created, not a zero-based index into any particular message. Rewinding
+      to a mark truncates the array to exactly that count, preserving exactly
+      the messages that existed before the mark was placed.
+
+      <notable reason="mark captures a count, not a message reference">
+        If messages are added after a mark is created and the conversation is
+        then rewound, the mark's message index correctly identifies the
+        truncation boundary regardless of how many messages were added in between.
+      </notable>
+    </message-index-semantics>
+
+  </behavior>
+
+</specification>

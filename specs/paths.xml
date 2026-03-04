@@ -1,0 +1,109 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<specification topic="Paths">
+
+  <topic-statement>
+    The paths system resolves application directory locations from a fixed set of
+    environment variables and translates between absolute filesystem paths and
+    application-scoped `ik://` URIs.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Environment variable validation, the nine managed directory paths, tilde
+      expansion for user-relative paths, and bidirectional translation between
+      `ik://` URIs and absolute filesystem paths.
+    </in-scope>
+
+    <boundary name="Directory creation">
+      This module performs no filesystem operations. It does not create, check for,
+      or modify directories. Path strings are resolved and stored; whether the
+      directories exist is determined elsewhere.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Managed paths">
+      <field name="binary directory" type="text" note="resolved from IKIGAI_BIN_DIR" />
+      <field name="configuration directory" type="text" note="resolved from IKIGAI_CONFIG_DIR" />
+      <field name="data directory" type="text" note="resolved from IKIGAI_DATA_DIR" />
+      <field name="libexec directory" type="text" note="resolved from IKIGAI_LIBEXEC_DIR; used as the system tools directory" />
+      <field name="cache directory" type="text" note="resolved from IKIGAI_CACHE_DIR" />
+      <field name="state directory" type="text" note="resolved from IKIGAI_STATE_DIR" />
+      <field name="runtime directory" type="text" note="resolved from IKIGAI_RUNTIME_DIR" />
+      <field name="user tools directory" type="text" note="derived by tilde-expanding ~/.ikigai/tools/; not from an environment variable" />
+      <field name="project tools directory" type="text" note="the fixed relative path .ikigai/tools/; not expanded or resolved" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <initialization order="1">
+      At initialization, the seven environment variables (`IKIGAI_BIN_DIR`,
+      `IKIGAI_CONFIG_DIR`, `IKIGAI_DATA_DIR`, `IKIGAI_LIBEXEC_DIR`,
+      `IKIGAI_CACHE_DIR`, `IKIGAI_STATE_DIR`, `IKIGAI_RUNTIME_DIR`) are read.
+      Each must be present and non-empty. If any variable is absent or empty,
+      initialization fails and an invalid-argument error is returned naming the
+      missing variable. No partial state is stored on failure.
+
+      After the seven environment variables are validated, the user tools directory
+      is derived by performing tilde expansion on the fixed string `~/.ikigai/tools/`.
+      If tilde expansion fails (because `HOME` is not set), initialization fails with
+      an I/O error.
+
+      The project tools directory is stored as the fixed relative string
+      `.ikigai/tools/` without expansion.
+
+      All nine path strings are stored as owned copies inside the paths structure.
+      Callers receive read-only pointers; they must not free them.
+    </initialization>
+
+    <tilde-expansion order="2">
+      Tilde expansion replaces a leading `~` with the value of the `HOME`
+      environment variable. The recognized forms are:
+
+      - `~` alone → replaced entirely with `$HOME`
+      - `~/rest` → `$HOME/rest`
+
+      A path that does not begin with `~` is returned unchanged.
+
+      If the path begins with `~` and `HOME` is not set, an I/O error is returned.
+      The expansion is available as a standalone operation in addition to being used
+      during initialization.
+    </tilde-expansion>
+
+    <ik-uri-translation order="3">
+      The `ik://` URI scheme provides a stable, location-independent name for files
+      stored under the state or data directories. Two translations are supported.
+
+      <path-to-uri order="1">
+        An absolute filesystem path is translated to an `ik://` URI by checking
+        whether the path begins with the state directory or the data directory:
+
+        - A path under the data directory at the `system/` sub-path prefix is
+          translated to `ik://system/<remainder>`.
+        - A path under the state directory is translated to `ik://<remainder>`.
+        - Paths not under either directory are left unchanged.
+
+        Multiple occurrences in the same string are each translated independently.
+      </path-to-uri>
+
+      <uri-to-path order="2">
+        An `ik://` URI is translated to an absolute filesystem path by replacing
+        the `ik://` prefix:
+
+        - `ik://system/<remainder>` → `<data directory>/system/<remainder>`
+        - `ik://<remainder>` → `<state directory>/<remainder>`
+
+        Multiple occurrences in the same string are each translated independently.
+
+        <notable reason="false-positive prevention">
+          A sequence that looks like `ik://` but is preceded by an alphanumeric
+          character or underscore (for example `myik://`) is not treated as an
+          `ik://` URI and is left unchanged.
+        </notable>
+      </uri-to-path>
+    </ik-uri-translation>
+
+  </behavior>
+
+</specification>

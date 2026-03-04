@@ -1,0 +1,79 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<specification topic="Toolset Filter">
+
+  <topic-statement>
+    The toolset filter restricts which tools from the tool registry are offered
+    to the LLM on each request, allowing an agent to work with a named subset
+    of available tools.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      The whitelist data structure on the agent, the /toolset command (setting,
+      listing, and clearing the filter), delimiter parsing, and database
+      persistence. Toolset inheritance during agent forking is covered in the
+      agent fork specification.
+    </in-scope>
+
+    <boundary name="Tool request assembly">
+      How the whitelist is applied when building the tools array for an LLM
+      request (filtering the tool registry) is covered by the LLM request
+      specification.
+    </boundary>
+
+    <boundary name="Tool registry">
+      How tools are discovered and registered is covered by the tool execution
+      specification.
+    </boundary>
+  </scope>
+
+  <behavior>
+
+    <whitelist-storage order="1">
+      The toolset filter is stored on the agent as a dynamically sized array
+      of tool name strings, alongside a count of entries. An empty array (count
+      of zero) means no filter is active and all registered tools are offered
+      to the LLM. A non-empty array means only tools whose names appear in the
+      list are offered.
+    </whitelist-storage>
+
+    <toolset-command order="2">
+      The `/toolset` command with a tool name list sets the filter, replacing
+      any existing filter entirely:
+
+      1. The argument string is tokenized using both spaces and commas as
+         delimiters (they may be mixed freely: `"tool1, tool2 tool3"` is valid).
+      2. Each token becomes one entry in the new whitelist array.
+      3. The existing whitelist is replaced.
+      4. A toolset event is persisted to the database with the original argument
+         string (not the tokenized form).
+
+      The `/toolset` command with no arguments lists the current whitelist and
+      takes no other action.
+
+      <notable reason="both spaces and commas are valid delimiters">
+        Users may separate tool names with spaces, commas, or a mix of both.
+        The delimiter style is not preserved — on session restoration, the
+        original argument string is replayed and re-tokenized.
+      </notable>
+    </toolset-command>
+
+    <clear-behavior order="3">
+      Providing an argument string that contains no non-whitespace tokens (for
+      example, an argument containing only spaces or commas) results in a
+      zero-count filter, which is equivalent to no filter (all tools visible).
+      No explicit "clear" sub-command exists; providing an empty effective
+      argument achieves this effect.
+    </clear-behavior>
+
+    <persistence order="4">
+      Toolset changes are persisted to the database as command events containing
+      the original argument string. During session restoration, the most recent
+      toolset command in the agent's history is replayed to reconstruct the
+      filter. If no toolset command exists in the history but the agent was
+      forked, the toolset is inherited from the fork event.
+    </persistence>
+
+  </behavior>
+
+</specification>

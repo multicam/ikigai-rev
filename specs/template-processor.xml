@@ -1,0 +1,189 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<specification topic="Template Processor">
+
+  <topic-statement>
+    The template processor substitutes named variable placeholders in text with
+    values drawn from agent context, configuration, environment variables, and
+    runtime-computed functions.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Placeholder syntax recognition, scanning and substitution, all four
+      variable namespaces and their resolvable fields, escape sequences, and
+      the collection of unresolved placeholder names.
+    </in-scope>
+
+    <boundary name="Caller">
+      The caller supplies text and, optionally, agent context and configuration.
+      What the caller does with the processed output — including assembling a
+      system prompt from multiple documents — is out of scope.
+    </boundary>
+
+    <boundary name="Environment">
+      Environment variable values are read from the process environment at the
+      moment of substitution. The environment itself is out of scope.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Input">
+      <field name="text" type="text" note="the source document to process; may contain any UTF-8 content" />
+      <field name="agent context" type="object" required="false" nullable="true" note="provides agent.* namespace values; if null, all agent.* variables are unresolvable" />
+      <field name="configuration" type="object" required="false" nullable="true" note="provides config.* namespace values; if null, all config.* variables are unresolvable" />
+    </contract>
+
+    <contract name="Output">
+      <field name="processed text" type="text" note="the input text with all resolved placeholders replaced and $$ sequences converted to literal $" />
+      <field name="unresolved variables" type="list of text" note="deduplicated list of placeholder expressions that could not be resolved, in first-occurrence order" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <scanning order="1">
+      The input text is scanned left to right, one character at a time. The
+      output is built incrementally by appending characters or resolved values
+      as each position is processed.
+
+      <escape-sequence order="1">
+        When two consecutive dollar signs (`$$`) are encountered, exactly one
+        dollar sign is appended to the output and the scanner advances past
+        both characters. The character following the second `$` is processed
+        normally on the next step.
+
+        <notable reason="escape prevents interpolation">
+          The sequence `$${agent.uuid}` produces the literal text
+          `${agent.uuid}` in the output — the double dollar escapes the
+          opening of what would otherwise be a placeholder.
+        </notable>
+      </escape-sequence>
+
+      <placeholder-recognition order="2">
+        When a dollar sign followed by an opening brace (`${`) is encountered,
+        the scanner searches forward for the next closing brace (`}`). If a
+        closing brace is found, the text between `${` and `}` is the variable
+        name and is passed to variable resolution. If no closing brace is found,
+        the dollar sign is appended to the output as a literal character and
+        the scanner advances past it only, leaving `{` and subsequent text to
+        be processed normally.
+      </placeholder-recognition>
+
+      <other-characters order="3">
+        Any character that is not part of a `$$` sequence or a `${...}` opener
+        is appended to the output verbatim, including lone dollar signs not
+        followed by `{`.
+      </other-characters>
+    </scanning>
+
+    <variable-resolution order="2">
+      A variable name is a dot-separated pair: a namespace and a field. The
+      namespace determines which resolution source is consulted. If resolution
+      produces a value, that value is appended to the output in place of the
+      `${...}` placeholder. If resolution produces no value, the original
+      placeholder text (including `${` and `}`) is appended to the output
+      unchanged, and the placeholder is recorded in the unresolved list.
+
+      <agent-namespace order="1">
+        Variables in the `agent` namespace resolve against the provided agent
+        context. If no agent context is provided, all agent-namespace variables
+        are unresolvable.
+
+        The following fields are recognized:
+
+        `uuid` — the agent's unique identifier, as text. If null, unresolvable.
+
+        `name` — the agent's display name. If null, unresolvable.
+
+        `parent_uuid` — the unique identifier of the parent agent. If null,
+        unresolvable.
+
+        `provider` — the name of the LLM provider in use (e.g., `anthropic`,
+        `openai`, `google`). If null, unresolvable.
+
+        `model` — the model identifier in use. If null, unresolvable.
+
+        `created_at` — the agent's creation timestamp as a decimal integer
+        string. Always resolvable when an agent context is provided.
+
+        Any other field name in the `agent` namespace is unresolvable.
+      </agent-namespace>
+
+      <config-namespace order="2">
+        Variables in the `config` namespace resolve against the provided
+        configuration. If no configuration is provided, all config-namespace
+        variables are unresolvable.
+
+        The following fields are recognized:
+
+        Text fields (unresolvable when null): `openai_model`, `db_host`,
+        `db_name`, `db_user`, `default_provider`, `listen_address`,
+        `openai_system_message`.
+
+        Integer fields (always resolvable when configuration is provided,
+        formatted as decimal strings): `db_port`, `max_tool_turns`,
+        `max_output_size`, `history_size`, `listen_port`.
+
+        Floating-point fields (always resolvable when configuration is
+        provided, formatted to two decimal places): `openai_temperature`.
+
+        Integer field (always resolvable when configuration is provided,
+        formatted as decimal string): `openai_max_completion_tokens`.
+
+        Any other field name in the `config` namespace is unresolvable.
+      </config-namespace>
+
+      <env-namespace order="3">
+        Variables in the `env` namespace resolve by looking up the field name
+        as an environment variable in the process environment at the moment of
+        substitution. If the variable is set, its value is used. If the
+        variable is not set, the placeholder is unresolvable.
+      </env-namespace>
+
+      <func-namespace order="4">
+        Variables in the `func` namespace produce computed values regardless
+        of agent context or configuration.
+
+        `func.now` — the current UTC time formatted as an ISO 8601 timestamp
+        (e.g., `2024-01-01T00:00:00Z`). If the system clock cannot be read,
+        unresolvable.
+
+        `func.cwd` — the current working directory of the process as an
+        absolute path. If the directory cannot be obtained, unresolvable.
+
+        `func.hostname` — the system hostname. If the hostname cannot be
+        obtained, unresolvable.
+
+        `func.random` — a freshly generated version-4 UUID in lowercase
+        hyphenated form (e.g., `550e8400-e29b-41d4-a716-446655440000`).
+
+        Any other field name in the `func` namespace is unresolvable.
+      </func-namespace>
+
+      <unknown-namespace order="5">
+        A variable whose namespace is not `agent`, `config`, `env`, or `func`
+        is unresolvable. The placeholder is appended to the output verbatim
+        and recorded in the unresolved list.
+      </unknown-namespace>
+    </variable-resolution>
+
+    <unresolved-tracking order="3">
+      Each placeholder that cannot be resolved is recorded in the unresolved
+      list. Before recording, the list is checked for an existing entry with
+      the same placeholder text. If an identical placeholder has already been
+      recorded, it is not added again. The unresolved list contains each
+      distinct unresolved placeholder exactly once, in the order of its first
+      appearance in the input text.
+    </unresolved-tracking>
+
+    <always-succeeds order="4">
+      The template processor does not return an error. For any valid input, it
+      produces processed text and an unresolved list. Placeholders that cannot
+      be resolved are passed through to the output verbatim rather than
+      causing failure. The only condition that terminates the process is a
+      memory allocation failure, which aborts the process.
+    </always-succeeds>
+
+  </behavior>
+
+</specification>

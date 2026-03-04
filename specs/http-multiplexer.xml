@@ -1,0 +1,129 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<specification topic="HTTP Multiplexer">
+
+  <topic-statement>
+    The HTTP multiplexer manages concurrent non-blocking HTTP requests by
+    integrating a multi-handle HTTP client into the select-based event loop,
+    driving requests to completion through repeated polling.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Request lifecycle (addition, polling, streaming callbacks, completion
+      detection), file descriptor registration with select, timeout hints,
+      response body accumulation, error categorization, and cleanup on
+      cancellation or destruction.
+    </in-scope>
+
+    <boundary name="REPL event loop">
+      How the event loop calls into the multiplexer at each iteration is
+      covered by the REPL event loop specification.
+    </boundary>
+
+    <boundary name="Provider serialization">
+      How request bodies and response bodies are formatted for specific LLM
+      providers is handled by the provider implementations and is out of scope
+      here.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Request">
+      <field name="URL" type="text" note="fully qualified HTTP or HTTPS endpoint" />
+      <field name="method" type="text" note="HTTP method (GET, POST, etc.)" />
+      <field name="headers" type="ordered list of text" note="HTTP request headers as name: value strings" />
+      <field name="body" type="bytes or absent" note="request body for POST and similar methods; absent for GET" />
+      <field name="streaming callback" type="function or null" note="invoked with each chunk of response data as it arrives; null if streaming is not needed" />
+      <field name="completion callback" type="function" note="invoked once when the request finishes, with HTTP status, error information, and the full accumulated response body" />
+    </contract>
+
+    <contract name="Completion result">
+      <field name="outcome" type="enumeration" note="one of: success (2xx), client error (4xx), server error (5xx), network error" />
+      <field name="HTTP status code" type="integer or absent" note="the HTTP response code; absent on network-level errors" />
+      <field name="error message" type="text or null" note="human-readable description on failure; null on success" />
+      <field name="response body" type="bytes" note="the complete accumulated response body; valid for the duration of the completion callback only" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <request-addition order="1">
+      A request is submitted by supplying the URL, method, headers, optional
+      body, and callbacks. The multiplexer initializes a new transfer handle,
+      configures it with the supplied options, registers a write callback for
+      incoming data, and adds it to the active transfer pool. An internal
+      response buffer (initially 4,096 bytes, growing by doubling) is allocated
+      for the request. The call returns immediately; the request is processed
+      asynchronously on subsequent event loop iterations.
+    </request-addition>
+
+    <fd-set-registration order="2">
+      Before each select call, the event loop queries the multiplexer for the
+      file descriptors currently associated with active transfers and for a
+      timeout hint (in milliseconds). The multiplexer populates the read, write,
+      and exception FD sets by delegating to the underlying multi-handle
+      interface. The event loop incorporates these sets into its select call and
+      uses the minimum of the multiplexer's timeout hint and its own timeout.
+    </fd-set-registration>
+
+    <polling order="3">
+      When select returns (either because an FD became ready or because the
+      timeout expired), the event loop calls the multiplexer's perform
+      operation. Perform advances all active transfers — reading socket data,
+      parsing response headers, and invoking data callbacks — and returns a
+      count of still-running transfers.
+    </polling>
+
+    <streaming-callback order="4">
+      As response bytes arrive on the network, the write callback fires
+      synchronously within the perform call. For each chunk:
+
+      1. If a streaming callback was registered for the request, it is invoked
+         with the chunk bytes. This allows the provider to process partial
+         responses (for example, parsing server-sent events) without waiting
+         for the full body.
+      2. The bytes are appended to the request's response buffer, extending
+         it by doubling capacity as needed. This produces a complete accumulated
+         body regardless of whether a streaming callback is registered.
+
+      <notable reason="accumulation is independent of streaming">
+        The response body is always accumulated in full, even when a streaming
+        callback is provided. The completion callback always receives the
+        complete body.
+      </notable>
+    </streaming-callback>
+
+    <completion-detection order="5">
+      After each perform call, the multiplexer checks the transfer completion
+      queue. For each completed transfer:
+
+      1. The outcome is determined: 2xx responses are success; 4xx are client
+         errors; 5xx are server errors; cURL-level failures (network timeouts,
+         DNS errors, connection refused) are network errors.
+      2. The completion callback is invoked with the outcome, HTTP status code
+         (if available), error message (if applicable), and the accumulated
+         response body.
+      3. The transfer handle is removed from the pool and freed.
+      4. The request's internal resources (response buffer, header list) are
+         released.
+
+      The completion callback must not assume the response body or error message
+      remain valid after the callback returns.
+    </completion-detection>
+
+    <cancellation-and-cleanup order="6">
+      When the multiplexer is destroyed or a cancel operation is invoked, all
+      in-flight transfers are stopped:
+
+      1. Each active transfer handle is removed from the multi-handle pool.
+      2. Transfer-specific resources (response buffer, header list, body copy)
+         are freed.
+      3. If destroying (not just cancelling), the multi-handle itself is
+         released.
+
+      Completion callbacks are not invoked for cancelled transfers.
+    </cancellation-and-cleanup>
+
+  </behavior>
+
+</specification>

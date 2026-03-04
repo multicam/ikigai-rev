@@ -1,0 +1,218 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<specification topic="REPL Event Loop">
+
+  <topic-statement>
+    The REPL event loop multiplexes terminal input, LLM HTTP responses, control socket
+    commands, and timed animations on a single thread using a unified select call with
+    a dynamically calculated timeout.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      The main loop structure, event source priority ordering, timeout calculation,
+      frame rendering integration, signal handling integration, key injection draining,
+      headless mode, and loop termination.
+    </in-scope>
+
+    <boundary name="Frame rendering">
+      What each frame render produces — layer composition, output buffer assembly, atomic
+      TTY write — is covered by the layer rendering specification. This specification
+      covers only when a render is triggered.
+    </boundary>
+
+    <boundary name="Key injection">
+      The buffer that stores programmatically injected bytes and the byte-draining
+      protocol are covered by the key injection specification. This specification
+      covers only how the loop integrates with that buffer.
+    </boundary>
+
+    <boundary name="Individual event handlers">
+      What happens when a terminal byte is parsed, an LLM response arrives, or a
+      control socket command is processed is covered by the input parser, provider,
+      and control socket specifications respectively.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Shared context">
+      <field name="terminal context" type="reference" note="holds the TTY file descriptor and terminal dimensions; tty_fd is -1 in headless mode" />
+      <field name="database context" type="reference or null" note="primary database connection; null if database is not configured" />
+      <field name="command history" type="reference" note="in-memory history structure shared across all agents" />
+      <field name="tool registry" type="reference" note="registered tools available to all agents" />
+      <field name="fork pending" type="atomic boolean" note="true while a fork operation is in progress; prevents concurrent forks" />
+      <field name="session id" type="64-bit integer" note="database session identifier; 0 if no database" />
+    </contract>
+
+    <contract name="Output buffer">
+      <field name="data" type="byte array" note="accumulated rendered content; grows on demand" />
+      <field name="size" type="non-negative integer" note="bytes currently used" />
+      <field name="capacity" type="positive integer" note="allocated bytes; doubles when an append would exceed it" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <loop-structure order="1">
+      The loop runs until one of the termination conditions is met. Each iteration
+      executes the following phases in strict order:
+
+      1. Signal check: pending resize and quit signals are checked and handled
+         before any blocking.
+
+      2. Key injection drain: if the key injection buffer contains pending bytes,
+         one byte is drained, fed to the input parser, an action is dispatched, and
+         a frame is rendered if the action was recognized. The iteration then
+         restarts immediately (skipping the select call) until the buffer is empty.
+
+      3. Timeout calculation: the minimum of all active per-source timeouts is
+         computed. See timeout calculation.
+
+      4. I/O multiplexing: `select` blocks on the TTY file descriptor, the control
+         socket file descriptors, and all in-flight LLM HTTP connection descriptors
+         (registered by the provider) until one or more become ready or the timeout
+         expires.
+
+      5. If `select` returns with an error code of `EINTR`, signals are re-checked
+         and the loop restarts; any other error breaks the loop.
+
+      6. If `select` times out (ready count is zero), the scroll detector timeout
+         handler is invoked.
+
+      7. If the TTY file descriptor is ready and is a valid descriptor (not −1),
+         one byte is read and processed through the input parser.
+
+      8. Control socket events are dispatched to the control socket handler.
+
+      9. LLM HTTP events are processed for all agents regardless of the ready
+         count from `select`.
+
+      10. If the current agent's spinner is visible, the monotonic clock is checked
+          and the spinner frame is advanced if the interval has elapsed; if the
+          frame advanced, a frame is rendered.
+
+      11. All agents are polled for completed tool execution threads.
+
+      12. All agents are checked for deferred fork prompts; any found are dispatched
+          to the LLM.
+    </loop-structure>
+
+    <timeout-calculation order="2">
+      The timeout passed to `select` is the minimum of all active per-source
+      timeouts. A source contributes its timeout only when it is active; inactive
+      sources are excluded from the minimum.
+
+      - **Spinner animation**: 80 ms when the current agent's spinner is visible.
+      - **Tool execution polling**: 50 ms when any agent is in the executing-tool
+        state.
+      - **LLM HTTP**: the minimum timeout requested by all active provider HTTP
+        sessions (varies by provider and network conditions).
+      - **Scroll detector**: a variable timeout managed by the scroll detector
+        subsystem.
+
+      If no source is active, the default timeout is 1000 ms. The loop never blocks
+      indefinitely when any time-sensitive source is active.
+    </timeout-calculation>
+
+    <event-source-priority order="3">
+      Event sources are handled in the following priority order within each
+      iteration:
+
+      1. Signals (SIGWINCH, SIGINT, SIGTERM) — checked synchronously before blocking.
+      2. Key injection buffer — drained before `select` if bytes are pending; each
+         byte triggers a full restart of the loop.
+      3. Terminal TTY input — processed after `select` returns.
+      4. Control socket — processed after terminal input.
+      5. LLM HTTP (curl_multi) — processed after control socket, for all agents.
+      6. Spinner animation timer — polled after LLM HTTP processing.
+      7. Tool completion polling — polled after spinner check.
+      8. Deferred fork prompts — polled last.
+
+      <notable reason="curl events are processed regardless of select ready count">
+        The ready count returned by `select` is ignored when processing LLM HTTP
+        events. The provider's `perform` function is called for every agent on every
+        iteration. The provider handles the case where no work is available.
+      </notable>
+    </event-source-priority>
+
+    <frame-rendering-triggers order="4">
+      A frame is rendered only in response to specific events, not on every
+      iteration. The events that trigger a render are:
+
+      - A key injection byte produces a recognized input action.
+      - A terminal input byte produces a recognized input action.
+      - The spinner frame advances.
+      - An LLM response chunk is received for the current agent.
+      - A tool execution completes for any agent.
+      - A control socket scroll command is received.
+      - A scroll detector timeout fires.
+      - A SIGWINCH resize is handled.
+    </frame-rendering-triggers>
+
+    <headless-mode order="5">
+      In headless mode the application runs without a terminal. The terminal context
+      is initialized with a fixed size of 100 columns by 50 rows and a TTY file
+      descriptor of −1.
+
+      The differences from normal mode are:
+
+      - The TTY file descriptor is never added to the `select` read set, so terminal
+        input is never processed from a physical terminal.
+      - Write errors when rendering frames are silently ignored (writing to −1 fails
+        by definition but is expected).
+      - Standard output and standard error are not redirected to `/dev/null`
+        (unlike normal mode, where they are redirected to suppress interference with
+        the alternate terminal screen).
+      - The control socket is the only interactive I/O channel.
+
+      The framebuffer is still assembled and stored on every render, making it
+      available to the control socket `read_framebuffer` command.
+
+      <notable reason="frame rendering still occurs in headless mode">
+        Despite no physical terminal, every event that normally triggers a render
+        still assembles a framebuffer. The write attempt fails silently. This ensures
+        the framebuffer stored for control socket reads reflects the current state.
+      </notable>
+    </headless-mode>
+
+    <signal-handling-integration order="6">
+      Signal handlers set global volatile flags and return immediately. The loop
+      polls these flags at the start of each iteration and after `select` returns
+      `EINTR`.
+
+      - SIGWINCH: the resize flag is cleared, terminal dimensions are re-queried
+        via an ioctl, the stored dimensions are updated, and a frame is rendered.
+      - SIGINT and SIGTERM: the quit flag is cleared, all cached provider instances
+        are released, and the quit flag on the REPL context is set to trigger loop
+        termination.
+
+      <shared topic="Resize Handling">
+        SIGWINCH sets a volatile flag. On the next loop iteration the flag is
+        cleared, new dimensions are queried, and a re-render is triggered. This
+        defers non-async-signal-safe operations out of the signal handler.
+      </shared>
+    </signal-handling-integration>
+
+    <termination order="7">
+      The loop exits when any of the following conditions becomes true:
+
+      - The REPL quit flag is set (by a quit signal or a control socket exit command).
+      - A terminal read returns zero bytes (EOF — terminal closed) or a non-`EINTR`
+        error.
+      - A fatal error is returned by `select`.
+
+      On exit, the control socket is destroyed. A talloc destructor on the REPL
+      context waits for any running tool execution thread to complete before
+      releasing resources.
+    </termination>
+
+    <framebuffer-storage order="8">
+      After each render, the assembled framebuffer (the complete sequence of terminal
+      escape codes and text content that was written to the TTY) is stored on the
+      REPL context, replacing the previous framebuffer. The cursor row and column at
+      the time of the render are also stored. The control socket `read_framebuffer`
+      command returns this stored buffer.
+    </framebuffer-storage>
+
+  </behavior>
+
+</specification>

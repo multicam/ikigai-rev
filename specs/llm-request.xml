@@ -1,0 +1,144 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<specification topic="LLM Request">
+
+  <topic-statement>
+    The LLM request builder assembles a system prompt from pinned documents,
+    selects messages from the active context window, applies an optional tool
+    filter, and dispatches the request asynchronously to the configured provider.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Submission trigger, system prompt assembly from pinned documents, message
+      selection using the context window index, tool definition assembly with
+      whitelist filtering, thinking level configuration, asynchronous dispatch,
+      and maximum output token handling.
+    </in-scope>
+
+    <boundary name="Provider serialization">
+      How the assembled request is serialized into a provider-specific JSON body
+      (Anthropic Messages API, OpenAI Chat Completions, Google Generative Language)
+      is handled by the respective provider implementations and is out of scope.
+    </boundary>
+
+    <boundary name="Token budget management">
+      How the context window index is advanced when the token budget is exceeded
+      is covered by the token cache specification. This specification covers only
+      how that index is consumed when selecting messages.
+
+      <shared topic="Token Cache">
+        The token cache tracks per-turn token costs and advances a context start
+        index when cumulative token usage exceeds the budget. Messages before the
+        context start index are excluded from subsequent requests.
+      </shared>
+    </boundary>
+
+    <boundary name="Response handling">
+      What happens after the request is dispatched — streaming response parsing,
+      tool call extraction, and state transitions — is covered by the SSE parser
+      and agent state machine specifications.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Request">
+      <field name="system prompt" type="text or null" note="assembled from pinned documents; null if no system prompt is available" />
+      <field name="messages" type="ordered array of message" note="conversation messages from the context start index to the end of the in-memory array; deep-copied from agent state" />
+      <field name="model" type="text" note="the agent's configured model identifier" />
+      <field name="thinking" type="thinking configuration" note="the agent's configured thinking level; determines whether thinking blocks are requested and at what budget" />
+      <field name="tools" type="ordered array of tool definition" note="tools from the registry, filtered by the agent's toolset whitelist if one is set" />
+      <field name="max output tokens" type="integer or absent" note="defaults to absent (provider chooses); set to a provider-specific default when thinking is enabled" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <trigger order="1">
+      An LLM request is submitted when the user presses Enter and the input buffer
+      does not begin with `/` (which would indicate a slash command). The current
+      text is extracted from the input buffer, the buffer is cleared, and the text
+      is submitted as a new user message.
+    </trigger>
+
+    <user-message-addition order="2">
+      Before the request is built, the submitted text is added to the agent's
+      in-memory message array as a user-role text message. The token cache is
+      notified of a new turn boundary. The message is also persisted asynchronously
+      to the database; a database write failure is logged but does not prevent the
+      request from proceeding.
+    </user-message-addition>
+
+    <system-prompt-assembly order="3">
+      The system prompt is assembled using the first available source in the
+      following priority order:
+
+      1. **Pinned documents**: if the agent has one or more pinned document paths,
+         their contents are read from the document cache in the order they were
+         pinned and concatenated to form the system prompt.
+      2. **Default system file**: if no pinned documents are set, the application
+         looks for a default system prompt file in the data directory. If the file
+         exists, its content is used.
+      3. **Configuration fallback**: if neither of the above is available, the
+         system prompt from the application configuration is used.
+
+      If none of the three sources yields a non-empty string, the request is sent
+      without a system prompt.
+    </system-prompt-assembly>
+
+    <message-selection order="4">
+      Messages are selected from the agent's in-memory message array starting at
+      the context start index provided by the token cache. All messages from that
+      index to the end of the array are included. Each selected message is deep-
+      copied into the request; the agent's in-memory array is not modified.
+
+      If no token cache is configured, the context start index is zero and all
+      messages are included.
+
+      Messages before the context start index (those that have been pruned from
+      the active context window) are excluded. They remain in the agent's in-memory
+      array but are not sent to the provider.
+    </message-selection>
+
+    <tool-assembly order="5">
+      Tool definitions are added to the request from the shared tool registry. If
+      the agent has a toolset whitelist (a non-empty list of allowed tool names),
+      only tools whose names appear in the whitelist are added. If no whitelist is
+      set, all registered tools are added.
+
+      For each included tool, the name, description, and parameter schema are
+      extracted from the registry entry's stored schema document.
+    </tool-assembly>
+
+    <thinking-configuration order="6">
+      The agent's configured thinking level is set on the request. Provider
+      serializers interpret this level to include provider-specific thinking
+      parameters in the API request body. When thinking is enabled on a budget-
+      based model, the maximum output tokens is adjusted upward to accommodate
+      the thinking budget in addition to the response output.
+
+      When thinking is at its minimum level (disabled), no thinking configuration
+      is included in the serialized request.
+    </thinking-configuration>
+
+    <async-dispatch order="7">
+      The assembled request is dispatched by calling the provider's start-stream
+      function, which registers the HTTP request with the application's multiplexed
+      HTTP session manager and returns immediately. The request is processed
+      asynchronously on subsequent event loop iterations as data becomes available.
+
+      The agent's provider instance is created lazily on the first request if it
+      has not yet been initialized. If the provider cannot be initialized (for
+      example, because the API key is absent), the request is not submitted and
+      an error is displayed.
+
+      <notable reason="request is discarded after dispatch">
+        The request object is allocated on a temporary context and freed after the
+        start-stream call returns. The provider retains only what it needs
+        internally for the in-flight HTTP session; it does not hold a reference to
+        the request structure.
+      </notable>
+    </async-dispatch>
+
+  </behavior>
+
+</specification>
