@@ -1,0 +1,44 @@
+<specification topic="Token Estimation">
+
+  <topic-statement>
+    The token estimator converts a byte count into an estimated number of
+    tokens using a fixed bytes-per-token ratio.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Converting a byte count to an estimated token count by dividing by a
+      fixed ratio.
+    </in-scope>
+  </scope>
+
+  <data-contracts>
+    <contract name="Input">
+      <field name="byte count" type="unsigned integer" />
+    </contract>
+    <contract name="Output">
+      <field name="estimated token count" type="signed 32-bit integer" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <estimation order="1">
+      The byte count is divided by 4 using integer division (remainders are
+      discarded). The quotient is returned as a signed 32-bit integer.
+
+      A byte count of 0, 1, 2, or 3 each produce an estimate of 0.
+      Every group of 4 bytes produces an estimate of 1 additional token.
+
+      <notable reason="silent overflow on large inputs">
+        The result is not range-checked before being stored as a signed 32-bit
+        integer. When the byte count divided by 4 exceeds 2,147,483,647 (roughly
+        8.6 billion bytes), the behavior is undefined by the C11 standard.
+        In practice this produces a silently incorrect (typically negative)
+        result with no error indication.
+      </notable>
+    </estimation>
+
+  </behavior>
+
+</specification>

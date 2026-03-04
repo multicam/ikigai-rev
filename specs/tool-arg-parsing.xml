@@ -1,0 +1,147 @@
+<specification topic="Tool Argument Parsing">
+
+  <topic-statement>
+    The tool argument parser extracts typed values from JSON-encoded tool
+    call argument strings.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Parsing a JSON object string and extracting either a string-typed or
+      integer-typed field value by key name.
+    </in-scope>
+
+    <boundary name="JSON Library">
+      The argument string is parsed into an in-memory document by a JSON
+      library. This topic drives the parse and field lookup but does not
+      implement the parsing.
+    </boundary>
+
+    <boundary name="Memory Management">
+      Extracted string values are duplicated into a caller-provided allocation
+      context. This topic initiates the allocation; ownership of the returned
+      string belongs to that context.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="String Extraction Input">
+      <field name="allocation context" type="pointer" note="talloc context; may be null for root allocation" />
+      <field name="arguments JSON" type="text" note="null-terminated JSON string" />
+      <field name="key" type="text" note="field name to extract" />
+    </contract>
+    <contract name="String Extraction Output">
+      <field name="value" type="text" nullable="true" note="null on any failure" />
+    </contract>
+    <contract name="Integer Extraction Input">
+      <field name="arguments JSON" type="text" note="null-terminated JSON string" />
+      <field name="key" type="text" note="field name to extract" />
+      <field name="output location" type="pointer" note="must be non-null" />
+    </contract>
+    <contract name="Integer Extraction Output">
+      <field name="success flag" type="boolean" note="true if value was written, false on any failure" />
+      <field name="value" type="integer" note="written to output location only on success; untouched on failure" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <string-extraction order="1">
+      Extracting a string value from a JSON argument string follows these steps
+      in order, returning null at the first failure:
+
+      <null-guard order="1">
+        If the argument string or the key is null, null is returned immediately
+        without attempting any parsing.
+      </null-guard>
+
+      <json-parse order="2">
+        The argument string is parsed as JSON. If parsing fails (malformed JSON,
+        empty input, or other read error), null is returned.
+      </json-parse>
+
+      <root-type-check order="3">
+        The root value of the parsed document must be a JSON object. If the root
+        is absent or is any other type (array, string, number, boolean, or null),
+        the document is freed and null is returned.
+      </root-type-check>
+
+      <key-lookup order="4">
+        The requested key is looked up in the root object. If the key is not
+        present, the document is freed and null is returned.
+      </key-lookup>
+
+      <type-check order="5">
+        The value associated with the key must be a JSON string. If it is any
+        other type (number, boolean, object, array, or null), the document is
+        freed and null is returned.
+      </type-check>
+
+      <string-copy order="6">
+        The string content is duplicated into the caller-provided allocation
+        context. The JSON document is freed. The duplicated string is returned.
+
+        If the allocation fails, the process terminates immediately (out-of-memory
+        is treated as an unrecoverable condition). This path is the only
+        unrecoverable failure mode.
+      </string-copy>
+
+      <notable reason="all failures indistinguishable">
+        Null is returned for any failure — missing key, wrong type, invalid JSON,
+        or null input — with no indication of which condition occurred.
+      </notable>
+    </string-extraction>
+
+    <integer-extraction order="2">
+      Extracting an integer value from a JSON argument string follows the same
+      parse-and-lookup sequence, returning false at the first failure:
+
+      <null-guard order="1">
+        If the argument string, the key, or the output location is null, false
+        is returned immediately without parsing.
+      </null-guard>
+
+      <json-parse order="2">
+        The argument string is parsed as JSON. If parsing fails, false is
+        returned.
+      </json-parse>
+
+      <root-type-check order="3">
+        The root must be a JSON object. Any other root type causes the document
+        to be freed and false to be returned.
+      </root-type-check>
+
+      <key-lookup order="4">
+        The key is looked up in the root object. If absent, the document is
+        freed and false is returned.
+      </key-lookup>
+
+      <type-check order="5">
+        The value must be a JSON integer type. Floating-point numbers, strings,
+        booleans, objects, arrays, and null all cause the document to be freed
+        and false to be returned.
+      </type-check>
+
+      <integer-extraction order="6">
+        The integer value is read as a signed 64-bit integer. The document is
+        freed. The 64-bit value is cast to a platform-native integer and written
+        to the output location. True is returned.
+
+        <notable reason="silent truncation on overflow">
+          The 64-bit value is cast to a native integer without range validation.
+          If the JSON integer value exceeds the maximum or minimum value
+          representable by a native integer, the stored result is silently
+          truncated. No error is returned.
+        </notable>
+      </integer-extraction>
+
+      <notable reason="all failures indistinguishable">
+        False is returned for any failure — missing key, wrong type, invalid JSON,
+        null parameters — with no indication of which condition occurred. The
+        output location is not written on failure.
+      </notable>
+    </integer-extraction>
+
+  </behavior>
+
+</specification>

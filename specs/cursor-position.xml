@@ -1,0 +1,167 @@
+<specification topic="Cursor Position Calculation">
+
+  <topic-statement>
+    The cursor position calculator determines the visual screen row and column
+    of a cursor within a UTF-8 text buffer, accounting for line wrapping and
+    ANSI escape sequences.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Translating a byte offset within a UTF-8 text buffer into a zero-based
+      (row, column) screen coordinate pair, given a terminal width.
+    </in-scope>
+
+    <boundary name="UTF-8 Decoding">
+      Each non-newline, non-escape byte sequence at the current position is
+      decoded to determine its Unicode codepoint. The byte count consumed and
+      the resulting codepoint are used to advance the column and byte position.
+    </boundary>
+
+    <boundary name="ANSI Escape Parsing">
+      When the current byte begins an ANSI CSI (Control Sequence Introducer)
+      escape sequence, the byte span of the complete sequence is provided so
+      the cursor can skip past it without counting display columns.
+    </boundary>
+
+    <boundary name="Callers">
+      The computed (row, column) pair is written to a caller-provided output
+      location. Callers convert the zero-based coordinates to one-based
+      terminal coordinates before issuing ANSI cursor-positioning commands.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Input">
+      <field name="text buffer" type="byte sequence" note="must be non-null; length may be zero" />
+      <field name="text length" type="unsigned integer" note="byte count of the buffer" />
+      <field name="cursor byte offset" type="unsigned integer" note="byte position to resolve; may exceed text length" />
+      <field name="terminal width" type="signed 32-bit integer" note="column count of the display" />
+    </contract>
+    <contract name="Output">
+      <field name="screen row" type="signed 32-bit integer" note="zero-based row index" />
+      <field name="screen col" type="signed 32-bit integer" note="zero-based column index" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <initialization order="1">
+      Both the current row and current column begin at zero. The scan position
+      begins at the start of the buffer.
+    </initialization>
+
+    <scanning order="2">
+      The buffer is scanned from the start toward the cursor byte offset. Each
+      byte is classified in order of priority: newline, ANSI escape, then
+      UTF-8 character.
+
+      <newline-handling order="1">
+        If the current byte is a newline character (0x0A), the row counter
+        increments by one and the column resets to zero. The scan position
+        advances by one byte. No other processing is done for this byte.
+
+        <notable reason="carriage return ignored">
+          Only 0x0A is treated as a line terminator. A carriage return (0x0D)
+          is not recognized as a newline and is instead processed as a regular
+          character through UTF-8 decoding.
+        </notable>
+      </newline-handling>
+
+      <ansi-escape-skipping order="2">
+        If the current position begins a valid ANSI CSI escape sequence, the
+        entire sequence is skipped without changing the row or column. A valid
+        CSI sequence begins with ESC followed by '[', then zero or more
+        parameter bytes (0x30–0x3F), zero or more intermediate bytes
+        (0x20–0x2F), and a final byte (0x40–0x7E). If the sequence is
+        incomplete before the end of the buffer, it is not recognized as a
+        valid CSI escape.
+
+        <notable reason="incomplete sequences cause errors">
+          An unrecognized or incomplete escape at any position causes the
+          byte at that position to be submitted for UTF-8 decoding. The ESC
+          byte (0x1B) is not valid UTF-8, so this results in an error being
+          returned to the caller.
+        </notable>
+      </ansi-escape-skipping>
+
+      <utf8-character-processing order="3">
+        For any byte that is neither a newline nor the start of a recognized
+        ANSI CSI escape, a Unicode codepoint is decoded from the buffer at the
+        current position. If decoding fails (invalid or truncated UTF-8), the
+        calculation terminates immediately and returns an error carrying the
+        byte offset where the invalid sequence was found.
+
+        On successful decoding, the display width of the codepoint is
+        determined:
+        - Standard and narrow characters have a width of 1.
+        - Wide characters (CJK ideographs, many emoji) have a width of 2.
+        - Combining characters and most control characters have a width of 0.
+
+        <notable reason="negative width not guarded">
+          Some control codepoints produce a display width of -1. This value
+          is not validated or clamped before being added to the column counter,
+          which can make the column negative and produce undefined arithmetic
+          in subsequent wrap checks.
+        </notable>
+
+        Before adding the character's width to the column, a wrap check is
+        performed: if the current column plus the character's width exceeds
+        the terminal width, the row increments by one and the column resets
+        to zero. The character's width is then added to the column. The scan
+        position advances by the number of bytes consumed by the UTF-8
+        sequence.
+      </utf8-character-processing>
+    </scanning>
+
+    <post-scan-boundary-wrap order="3">
+      After the scan completes (when the scan position reaches or passes the
+      cursor byte offset), a final check is applied: if the column equals
+      exactly the terminal width, the row increments by one and the column
+      resets to zero.
+
+      This handles the case where the cursor lands precisely at the right
+      edge of a line, placing it at the start of the next line rather than
+      one column past the last visible position.
+
+      <notable reason="boundary condition only applied once at end">
+        The exact-boundary wrap is only checked once, after the loop
+        terminates. During the loop, only the strictly-exceeds condition
+        triggers a wrap. A character whose addition brings the column to
+        exactly the terminal width does not wrap inside the loop; the wrap
+        is deferred until after the loop exits.
+      </notable>
+    </post-scan-boundary-wrap>
+
+    <output-and-return order="4">
+      The computed row and column are written to the caller-provided output
+      location. On success, the caller's allocation context is returned as
+      the success value.
+
+      On failure (invalid UTF-8 encountered during scanning), an error is
+      returned carrying the error code INVALID_ARG and a message containing
+      the byte offset where decoding failed. The output location is not
+      written on failure.
+    </output-and-return>
+
+    <edge-cases order="5">
+
+      <cursor-offset-exceeds-length>
+        If the cursor byte offset is greater than the text length, the scan
+        loop exits immediately without processing any bytes, and the output
+        is (row=0, col=0). No error is returned.
+      </cursor-offset-exceeds-length>
+
+      <terminal-width-not-validated>
+        <notable reason="no validation of terminal width">
+          The terminal width is not validated. A value of zero or a negative
+          value causes the exceeds-width condition to be true for every
+          character, wrapping to a new row after each one.
+        </notable>
+      </terminal-width-not-validated>
+
+    </edge-cases>
+
+  </behavior>
+
+</specification>

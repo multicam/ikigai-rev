@@ -1,0 +1,124 @@
+<specification topic="Format Buffer">
+
+  <topic-statement>
+    The format buffer accumulates formatted text incrementally and provides
+    access to the assembled result as a null-terminated string.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Creating a format buffer, appending text via printf-style formatting or
+      direct string append, inserting indentation, retrieving the accumulated
+      string and its length, and applying a line-and-character truncation limit
+      when appending content.
+    </in-scope>
+
+    <boundary name="Byte Array">
+      The format buffer stores its content in an underlying resizable byte
+      array. This topic drives growth through appends but does not manage
+      the byte array's internal layout.
+    </boundary>
+
+    <boundary name="Callers">
+      Callers create the buffer, append to it, then retrieve the final string.
+      The returned string pointer remains valid for the lifetime of the
+      caller-provided allocation context.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Format Buffer">
+      <field name="underlying byte array" type="opaque" note="resizes automatically as content is appended" />
+      <field name="allocation context" type="pointer" note="the talloc context provided at creation" />
+    </contract>
+    <contract name="Truncated Append Input">
+      <field name="content" type="text" note="must be non-null" />
+      <field name="content length" type="unsigned integer" note="byte count of content" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <creation order="1">
+      A new format buffer is created under a caller-provided allocation context.
+      The internal byte array is initialized with a 32-byte growth increment.
+      The buffer begins empty. If any allocation fails during creation, the
+      process terminates immediately.
+
+      The allocation context is stored internally and used when the accumulated
+      string is later retrieved.
+    </creation>
+
+    <printf-style-append order="2">
+      A format string and variadic arguments are rendered to a temporary buffer
+      using standard printf-style formatting. The byte count required for the
+      formatted output is determined first; then the formatted bytes are
+      appended one at a time to the internal byte array.
+
+      If the printf rendering fails (format string error or output truncation
+      detected), an error is returned. The buffer's existing content is not
+      modified on error.
+
+      If any internal memory allocation fails, the process terminates
+      immediately.
+    </printf-style-append>
+
+    <string-append order="3">
+      A null-terminated string is appended to the internal byte array one byte
+      at a time. An empty string is a no-op that returns success without
+      modifying the buffer. If any internal memory allocation fails, the process
+      terminates immediately.
+    </string-append>
+
+    <indentation order="4">
+      A non-negative indentation level is specified. That many space characters
+      (0x20) are appended to the buffer. A level of zero is a no-op. Negative
+      indentation levels are not accepted (the caller must ensure the value is
+      non-negative). If any internal memory allocation fails, the process
+      terminates immediately.
+    </indentation>
+
+    <string-retrieval order="5">
+      The accumulated content is returned as a null-terminated string. If the
+      last byte in the buffer is not already a null terminator, one is appended
+      before returning. The returned pointer points into the buffer's internal
+      storage and remains valid until the buffer's allocation context is freed.
+
+      <notable reason="mutates buffer on first call">
+        Retrieving the string is not a pure read operation. If the buffer does
+        not yet end with a null terminator, this operation appends one,
+        permanently modifying the buffer's byte array. Subsequent retrievals
+        detect the null terminator already present and return without further
+        modification.
+      </notable>
+    </string-retrieval>
+
+    <length-retrieval order="6">
+      The number of content bytes in the buffer is returned, excluding any
+      trailing null terminator. If the last byte is a null terminator, the
+      reported length is one less than the internal array size. Otherwise the
+      length equals the internal array size. This operation does not modify
+      the buffer.
+    </length-retrieval>
+
+    <truncated-append order="7">
+      Content up to a combined limit of 3 lines and 400 characters is appended
+      to the buffer. The content is scanned byte by byte:
+
+      - Each newline (0x0A) increments the line count. If the line count
+        exceeds 3, scanning stops at the newline position.
+      - Each byte increments the character count. If the character count
+        reaches 400, scanning stops after that byte.
+
+      If scanning stopped before the end of the content, only the bytes up
+      to the stopping point are appended, followed by "..." to indicate
+      truncation. If the entire content fits within the limits, it is appended
+      in full without the truncation indicator.
+
+      If the content length is zero, the literal text "(no output)" is appended
+      instead of the content.
+    </truncated-append>
+
+  </behavior>
+
+</specification>

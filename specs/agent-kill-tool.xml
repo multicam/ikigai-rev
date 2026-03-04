@@ -1,0 +1,131 @@
+<specification topic="Agent Kill Tool">
+
+  <topic-statement>
+    The agent kill tool terminates a single running agent by UUID, updating
+    its status in the database and synchronizing the change to in-memory state.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Validation of the kill request, the database status transition from
+      running to dead, deferred in-memory state update, and the JSON result
+      produced for the calling LLM.
+    </in-scope>
+
+    <boundary name="Tool Argument Parsing">
+      The UUID of the target agent is extracted from a JSON argument string.
+      This topic receives the extracted string.
+    </boundary>
+
+    <boundary name="Agent Database Layer">
+      This topic queries whether an agent exists and what its current status
+      and parent UUID are. It also issues the status transition that marks an
+      agent dead. The database operations are the authoritative source for
+      agent state.
+    </boundary>
+
+    <boundary name="Tool Result Wrapping">
+      The raw result or error produced by this topic is wrapped in an envelope
+      format before being returned to the tool execution infrastructure.
+    </boundary>
+
+    <boundary name="REPL State">
+      After the database transition completes, a deferred callback updates the
+      in-memory agent list held by the REPL. This topic deposits data for the
+      callback to consume; the REPL itself is not accessed during the main
+      execution phase.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Tool Arguments">
+      <field name="uuid" type="text" note="UUID of the agent to terminate" />
+    </contract>
+    <contract name="Success Result">
+      <field name="killed" type="array of text" note="contains exactly the target UUID" />
+    </contract>
+    <contract name="Error Result">
+      <field name="error" type="text" note="human-readable description" />
+      <field name="code" type="text" note="one of: PARSE_ERROR, INVALID_ARG, AGENT_NOT_FOUND, ALREADY_DEAD, CANNOT_KILL_ROOT, CANNOT_KILL_PARENT, DB_ERROR" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <argument-parsing order="1">
+      The JSON argument string is parsed. If parsing fails, the tool returns
+      an error with code PARSE_ERROR and does not proceed.
+
+      The parsed object must contain a field named "uuid" whose value is a
+      string. If the field is absent or not a string, the tool returns an
+      error with code INVALID_ARG.
+    </argument-parsing>
+
+    <target-validation order="2">
+      The target agent is looked up by UUID in the database. If no matching
+      agent is found, the tool returns an error with code AGENT_NOT_FOUND.
+
+      If the agent exists but its status is not "running", the tool returns
+      an error with code ALREADY_DEAD. No status transition is performed.
+
+      If the target agent has no parent (identifying it as the root agent),
+      the tool returns an error with code CANNOT_KILL_ROOT. The root agent
+      is never killable.
+    </target-validation>
+
+    <caller-validation order="3">
+      The calling agent's own record is fetched from the database. If this
+      lookup fails, the tool returns an error with code DB_ERROR.
+
+      If the calling agent's parent UUID matches the target UUID — meaning
+      the calling agent is attempting to kill its own parent — the tool
+      returns an error with code CANNOT_KILL_PARENT.
+    </caller-validation>
+
+    <status-transition order="4">
+      The target agent's status is changed from "running" to "dead" in the
+      database, and its end timestamp is recorded. This operation only affects
+      rows whose current status is "running", making it a no-op if the agent
+      was already dead by the time the update executes.
+
+      If the database update fails, the tool returns an error with code
+      DB_ERROR.
+    </status-transition>
+
+    <deferred-memory-update order="5">
+      After the database transition succeeds, the target UUID is stored for
+      processing by a deferred callback that runs on the main thread after
+      the tool handler returns. That callback scans the REPL's in-memory
+      agent list and sets the matching entry's dead flag to true.
+
+      <notable reason="silent no-op for unknown agents">
+        If the target UUID does not appear in the REPL's in-memory agent
+        list (possible if the agent was created in a different process or
+        session), the deferred callback completes without error and without
+        updating any in-memory entry.
+      </notable>
+    </deferred-memory-update>
+
+    <success-result order="6">
+      On success, the tool returns a JSON object containing a "killed" field
+      whose value is an array containing the target UUID as its sole element.
+
+      <notable reason="no cascade">
+        Only the directly specified agent is terminated. Descendant agents
+        are not killed. The "killed" array always contains exactly one UUID,
+        regardless of how many descendants the target has.
+      </notable>
+    </success-result>
+
+  </behavior>
+
+  <state-transitions>
+    <transition trigger="successful kill">
+      Target agent status changes from "running" to "dead"; end timestamp recorded
+    </transition>
+    <transition trigger="successful kill (deferred)">
+      Matching in-memory agent entry's dead flag set to true
+    </transition>
+  </state-transitions>
+
+</specification>

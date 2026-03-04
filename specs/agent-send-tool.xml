@@ -1,0 +1,102 @@
+<specification topic="Agent Send Tool">
+
+  <topic-statement>
+    The agent send tool delivers a message body from the calling agent to
+    another named running agent via the mail system.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Argument validation, recipient lookup, mail record insertion, and the
+      JSON result returned to the calling LLM.
+    </in-scope>
+
+    <boundary name="Tool Argument Parsing">
+      The recipient UUID and message body are extracted from a JSON argument
+      string. This topic receives those extracted strings.
+    </boundary>
+
+    <boundary name="Mail Storage">
+      A mail record is inserted into persistent storage, associating the
+      message with the session, sender, and recipient. This topic triggers
+      the insert but does not manage the storage schema.
+    </boundary>
+
+    <boundary name="Agent Database Layer">
+      The recipient agent is looked up to verify it exists and is currently
+      running. This topic receives a binary exists/running verdict.
+    </boundary>
+
+    <boundary name="Inter-Agent Notification">
+      After the mail record is persisted, a best-effort notification is
+      dispatched to wake the recipient agent. This topic initiates the
+      notification but does not control delivery.
+    </boundary>
+
+    <boundary name="Tool Result Wrapping">
+      The raw result or error is wrapped in an envelope format before being
+      returned to the tool execution infrastructure.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Tool Arguments">
+      <field name="to" type="text" note="UUID of the recipient agent" />
+      <field name="message" type="text" note="message body to deliver" />
+    </contract>
+    <contract name="Success Result">
+      <field name="status" type="text" note="always the string 'sent'" />
+      <field name="to" type="text" note="the recipient UUID" />
+    </contract>
+    <contract name="Error Result">
+      <field name="error" type="text" note="human-readable description" />
+      <field name="code" type="text" note="one of: PARSE_ERROR, INVALID_ARG, SEND_FAILED" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <argument-parsing order="1">
+      The JSON argument string is parsed. If parsing fails, the tool returns
+      an error with code PARSE_ERROR and does not proceed.
+
+      The parsed object must contain both a "to" field and a "message" field,
+      each with a string value. If either field is absent or not a string, the
+      tool returns an error with code INVALID_ARG.
+    </argument-parsing>
+
+    <send-delegation order="2">
+      The recipient UUID and message body are passed to the core send
+      operation, which:
+
+      1. Rejects an empty message body, returning an error.
+      2. Looks up the recipient agent and rejects the send if the recipient
+         does not exist or is not currently running.
+      3. Creates a mail record associating the current session, the calling
+         agent's UUID, the recipient UUID, the message body, the current
+         timestamp, and an unread status.
+      4. Inserts the mail record into persistent storage.
+      5. Emits a best-effort notification to wake the recipient agent. If the
+         database connection is currently inside a transaction, the notification
+         is silently skipped rather than risking aborting the transaction.
+         Notification failures are otherwise silently ignored.
+
+      If any step in the core send operation fails, the tool returns an error
+      with code SEND_FAILED and the error description from the core operation.
+    </send-delegation>
+
+    <success-result order="3">
+      On success, the tool returns a JSON object containing a "status" field
+      with the value "sent" and a "to" field containing the recipient UUID.
+    </success-result>
+
+  </behavior>
+
+  <state-transitions>
+    <transition trigger="successful send">
+      A new mail record is persisted with unread status; recipient agent may
+      receive a wake notification
+    </transition>
+  </state-transitions>
+
+</specification>
