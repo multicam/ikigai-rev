@@ -1,0 +1,398 @@
+<specification topic="Token Count Cache">
+
+  <topic-statement>
+    The token count cache tracks per-component token costs for an agent's sliding context window.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Cache lifecycle (creation, cloning), per-component cost retrieval (system prompt, tool
+      definitions, per-turn, total), known-cost recording, cache invalidation, structural
+      operations (adding turns, pruning oldest turn, removing turns from a given index), budget
+      configuration, and non-computing introspection.
+    </in-scope>
+
+    <boundary name="Provider Token Counting">
+      This topic submits a constructed request to the provider and receives either a token count
+      integer or a failure indication. Requests are constructed from agent messages, model name,
+      and system prompt text as part of this topic's computation; the counting itself is across
+      this boundary.
+    </boundary>
+
+    <boundary name="Agent Context">
+      This topic reads the agent's message list (role and content per message), current message
+      count, model name, and effective system prompt. It does not modify the agent.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Cache State">
+      <field name="system prompt token cost" type="int32" note="uncached sentinel when not yet known" />
+      <field name="tool definitions token cost" type="int32" note="uncached sentinel when not yet known" />
+      <field name="per-turn token costs" type="int32 array" note="each entry independently uncached or known; array grows dynamically" />
+      <field name="active turn count" type="unsigned integer" />
+      <field name="turn array capacity" type="unsigned integer" note="initial 8; doubles on overflow" />
+      <field name="total token cost" type="int32" note="uncached sentinel when not yet known" />
+      <field name="token budget" type="int32" note="default 100000" />
+      <field name="context start message index" type="unsigned integer" note="index into agent message list of oldest active message" />
+      <field name="pruned turn count" type="unsigned integer" note="cumulative count of turns removed from the front" />
+    </contract>
+
+    <contract name="Message Content Block">
+      <field name="type" type="enumerated" note="text, tool call, tool result, thinking, or other" />
+      <field name="text content" type="string" required="false" nullable="true" note="present when type is text or thinking" />
+      <field name="tool call arguments" type="string" required="false" nullable="true" note="present when type is tool call" />
+      <field name="tool result content" type="string" required="false" nullable="true" note="present when type is tool result" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <creation order="1">
+      A new cache is created associated with a specific agent. All component costs — system
+      prompt, tool definitions, and total — are initialized to uncached. The per-turn array is
+      allocated with an initial capacity of 8 entries and a turn count of 0. The token budget
+      defaults to 100,000. The context start message index is 0. The pruned turn count is 0.
+    </creation>
+
+    <cloning order="2">
+      A cache is cloned for a different agent (used when an agent is forked). The clone receives
+      copies of all cached values from the source: system cost, tool cost, total cost, all per-turn
+      costs, context start message index, pruned turn count, and token budget. If the source's
+      turn array capacity is 0, the clone uses a capacity of 8; otherwise the source's capacity
+      is used. The clone is associated with the new agent, not the source agent.
+    </cloning>
+
+    <retrieving-system-tokens order="3">
+      When the system token cost is requested:
+
+      <cached-hit order="1">
+        If the system token cost is already known, it is returned immediately.
+      </cached-hit>
+
+      <provider-computation order="2">
+        If uncached, the agent's effective system prompt text is retrieved. A request is
+        constructed using the agent's model name and the system prompt. The request is submitted
+        to the provider for token counting.
+
+        <notable reason="null model name fallback">
+          If the agent has no model name set, the string "default" is used.
+        </notable>
+
+        If the provider returns a count, that count is stored as the system token cost, the total
+        token cost is reset to uncached, and the count is returned.
+      </provider-computation>
+
+      <bytes-fallback order="3">
+        If any step in provider computation fails — prompt retrieval fails, request construction
+        fails, or the provider call fails — the system prompt's byte length is divided by 4
+        (integer division, truncating toward zero) and that value is returned.
+
+        <notable reason="fallback not stored">
+          The bytes-based estimate is not stored. The system token cost remains uncached, and
+          the total token cost is not reset. On the next request for the system cost, the provider
+          will be contacted again.
+        </notable>
+
+        <notable reason="null prompt treated as zero bytes">
+          If the system prompt is null, the byte length is treated as 0 and 0 is returned.
+        </notable>
+      </bytes-fallback>
+    </retrieving-system-tokens>
+
+    <retrieving-tool-tokens order="4">
+      When the tool definitions token cost is requested:
+
+      <cached-hit order="1">
+        If the tool token cost is already known, it is returned immediately.
+      </cached-hit>
+
+      <provider-computation order="2">
+        If uncached, a request is constructed using only the agent's model name — no system
+        prompt and no messages. The request is submitted to the provider for token counting.
+
+        <notable reason="null model name fallback">
+          If the agent has no model name set, the string "default" is used.
+        </notable>
+
+        If the provider returns a count, that count is stored as the tool token cost, the total
+        token cost is reset to uncached, and the count is returned.
+      </provider-computation>
+
+      <failure-fallback order="3">
+        If request construction or the provider call fails, 0 is returned.
+
+        <notable reason="fallback not stored">
+          The value 0 is not stored. The tool token cost remains uncached.
+        </notable>
+
+        <notable reason="fallback is zero not a bytes estimate">
+          Unlike system and per-turn costs, the tool definitions fallback on failure is 0,
+          not a bytes-based estimate.
+        </notable>
+      </failure-fallback>
+    </retrieving-tool-tokens>
+
+    <retrieving-turn-tokens order="5">
+      When the token cost of a specific turn is requested by its zero-based index:
+
+      <out-of-bounds-check order="1">
+        If the requested index is greater than or equal to the active turn count, the process
+        terminates abnormally.
+      </out-of-bounds-check>
+
+      <cached-hit order="2">
+        If that turn's token cost is already known, it is returned immediately.
+      </cached-hit>
+
+      <turn-bounds-resolution order="3">
+        The boundaries of the turn within the agent's message list are found by iterating forward
+        from the context start message index, counting user-role messages. Turn index N begins at
+        the (N+1)th user-role message encountered and ends at the message immediately before the
+        (N+2)th user-role message. The last active turn (with no subsequent user-role message)
+        extends through the final message in the agent's list.
+      </turn-bounds-resolution>
+
+      <provider-computation order="4">
+        A request is constructed from the turn's messages using the agent's model name. The
+        request is submitted to the provider for token counting.
+
+        If the provider returns a count, that count is stored as the turn's token cost, the
+        total token cost is reset to uncached, and the count is returned.
+      </provider-computation>
+
+      <bytes-fallback order="5">
+        If the provider call fails, the byte lengths of qualifying content across all messages
+        in the turn are summed. The sum is divided by 4 (integer division, truncating toward
+        zero) and returned. This value is not stored; the turn's cost remains uncached.
+
+        Qualifying content types and their contributing fields:
+        - Text blocks: the text field, if not null
+        - Tool call blocks: the arguments field, if not null
+        - Tool result blocks: the content field, if not null
+        - Thinking blocks: the text field, if not null
+
+        Content blocks of all other types contribute 0 bytes. Null fields contribute 0 bytes.
+      </bytes-fallback>
+
+      <no-messages-fallback order="6">
+        If no messages are found for the turn (turn bounds resolution yields nothing), 0 is
+        returned.
+      </no-messages-fallback>
+    </retrieving-turn-tokens>
+
+    <retrieving-total-tokens order="6">
+      When the total token cost is requested:
+
+      <cached-hit order="1">
+        If the total token cost is already known, it is returned immediately.
+      </cached-hit>
+
+      <summing order="2">
+        If uncached, the system token cost, tool token cost, and each per-turn token cost are
+        retrieved in sequence (each triggering its own computation logic if uncached). The sum
+        of all retrieved values is stored as the total token cost and returned.
+
+        <notable reason="total always stored even with estimates">
+          The total is stored regardless of whether any component costs used bytes-based
+          estimates rather than provider counts. On the next request for the total, the stored
+          value is returned without recomputing any component — even if those components are
+          still individually marked uncached and would produce a different result if re-queried.
+        </notable>
+      </summing>
+    </retrieving-total-tokens>
+
+    <recording-known-turn-cost order="7">
+      A confirmed token count for a specific turn can be stored directly (used after turn
+      completion when the response carries an authoritative token delta). If the turn index is
+      greater than or equal to the active turn count, the process terminates abnormally. The
+      stored value replaces any previously cached value for that turn, and the total token cost
+      is reset to uncached.
+    </recording-known-turn-cost>
+
+    <invalidation order="8">
+      Four operations reset cached values to uncached:
+
+      <invalidate-all order="1">
+        All component costs — system, tools, every per-turn entry, and total — are reset to
+        uncached. The turn count, context start index, and pruned turn count are not changed.
+      </invalidate-all>
+
+      <reset order="2">
+        All component costs are reset to uncached. Additionally, the active turn count is set to
+        0, the context start message index is set to 0, and the pruned turn count is set to 0.
+        Per-turn array capacity is not changed.
+      </reset>
+
+      <invalidate-system order="3">
+        The system token cost and the total token cost are reset to uncached.
+      </invalidate-system>
+
+      <invalidate-tools order="4">
+        The tool token cost and the total token cost are reset to uncached.
+      </invalidate-tools>
+    </invalidation>
+
+    <adding-a-turn order="9">
+      When a new turn slot is appended, a new uncached entry is added to the per-turn array.
+      If the array is already at capacity, its capacity is doubled before adding the entry.
+
+      <notable reason="zero-capacity edge case">
+        If the current capacity is 0 at the time of growth, the new capacity is set to 8.
+      </notable>
+
+      The active turn count is incremented by 1. The total token cost is reset to uncached.
+    </adding-a-turn>
+
+    <pruning-oldest-turn order="10">
+      When the oldest active turn is removed from context:
+
+      <no-op-case order="1">
+        If the active turn count is 0, nothing happens.
+      </no-op-case>
+
+      <total-adjustment order="2">
+        If both the total token cost and the oldest turn's token cost are known, the oldest
+        turn's cost is subtracted from the total. If the result is negative, the total is reset
+        to uncached.
+
+        If either value is uncached, the total is reset to uncached.
+      </total-adjustment>
+
+      <context-start-advancement order="3">
+        The context start message index advances to the index of the second user-role message
+        encountered starting from the current context start index. If no second user-role message
+        exists in the agent's message list from that point forward, the context start index is
+        set to the agent's total message count (one past the last message).
+      </context-start-advancement>
+
+      <accounting order="4">
+        The pruned turn count is incremented by 1.
+      </accounting>
+
+      <array-shift order="5">
+        All per-turn cost entries are shifted one position toward index 0, removing the entry
+        that was at index 0. The active turn count is decremented by 1.
+      </array-shift>
+    </pruning-oldest-turn>
+
+    <removing-turns-from-index order="11">
+      When turns from a given index onward (inclusive) are removed:
+
+      <out-of-bounds-check order="1">
+        If the turn index is strictly greater than the active turn count, the process terminates
+        abnormally.
+      </out-of-bounds-check>
+
+      <no-op-case order="2">
+        If the turn index equals the active turn count, nothing happens.
+      </no-op-case>
+
+      <total-adjustment order="3">
+        For each turn being removed — from the given index to the last active turn — if that
+        turn's cost is uncached, the total is reset to uncached and iteration stops. If the
+        turn's cost is known and the total is currently known, that cost is subtracted from the
+        total; if the result is negative, the total is reset to uncached.
+      </total-adjustment>
+
+      <truncation order="4">
+        The active turn count is set to the given index.
+      </truncation>
+
+      <conditional-context-reset order="5">
+        If the active turn count is now 0 and the context start message index is greater than 0,
+        the context start message index is reset to 0 and the pruned turn count is reset to 0.
+
+        <notable reason="reset only when context was advanced">
+          If the active turn count reaches 0 but the context start message index is already 0
+          (no pruning had ever occurred), the pruned turn count is not touched and remains at
+          whatever value it held — though this value is also 0 in normal operation.
+        </notable>
+      </conditional-context-reset>
+    </removing-turns-from-index>
+
+    <budget-operations order="12">
+      A token budget value can be read or set at any time. Reading returns the current budget
+      without any side effects. Setting stores the new value immediately. No validation is
+      performed on the supplied budget value.
+    </budget-operations>
+
+    <non-computing-introspection order="13">
+      Several read operations return state without triggering any computation:
+
+      <turn-count order="1">
+        Returns the active turn count.
+      </turn-count>
+
+      <context-start-turn order="2">
+        Returns the pruned turn count, which is the absolute index of the oldest active turn
+        relative to the full history.
+      </context-start-turn>
+
+      <context-start-index order="3">
+        Returns the context start message index: the position in the agent's message list of the
+        oldest message currently included in active context.
+      </context-start-index>
+
+      <peek-total order="4">
+        Returns the cached total if known, or 0 if uncached. Does not compute.
+      </peek-total>
+
+      <peek-turn-tokens order="5">
+        Returns the cached cost for a specific turn index if known, or 0 if uncached. If the
+        turn index is greater than or equal to the active turn count, the process terminates
+        abnormally. Does not compute.
+      </peek-turn-tokens>
+    </non-computing-introspection>
+
+  </behavior>
+
+  <state-transitions>
+    <transition trigger="system cost retrieved via provider">
+      System token cost changes from uncached to the provider count; total resets to uncached.
+    </transition>
+    <transition trigger="system cost retrieved via bytes fallback">
+      System token cost remains uncached; total is unchanged.
+    </transition>
+    <transition trigger="tool cost retrieved via provider">
+      Tool token cost changes from uncached to the provider count; total resets to uncached.
+    </transition>
+    <transition trigger="tool cost retrieval fails">
+      Tool token cost remains uncached; total is unchanged.
+    </transition>
+    <transition trigger="turn cost retrieved via provider">
+      That turn's cost changes from uncached to the provider count; total resets to uncached.
+    </transition>
+    <transition trigger="turn cost retrieved via bytes fallback">
+      That turn's cost remains uncached; total is unchanged.
+    </transition>
+    <transition trigger="total retrieved while uncached">
+      Total token cost changes from uncached to the sum of all current component costs.
+    </transition>
+    <transition trigger="known turn cost recorded">
+      That turn's cost updated to the given value; total resets to uncached.
+    </transition>
+    <transition trigger="turn added">
+      Active turn count increases by 1; new turn entry is uncached; total resets to uncached.
+      Array capacity may double.
+    </transition>
+    <transition trigger="oldest turn pruned">
+      Active turn count decreases by 1; per-turn array shifts left; context start index
+      advances to next user-role message; pruned turn count increases by 1; total is adjusted
+      or reset to uncached.
+    </transition>
+    <transition trigger="turns removed from index">
+      Active turn count truncated to the given index; total adjusted or reset to uncached;
+      context start index and pruned turn count may reset to 0 if all turns removed and context
+      had been advanced.
+    </transition>
+    <transition trigger="invalidate-all">
+      All component costs and total reset to uncached.
+    </transition>
+    <transition trigger="reset">
+      All costs reset to uncached; turn count, context start index, and pruned turn count all
+      set to 0.
+    </transition>
+  </state-transitions>
+
+</specification>
