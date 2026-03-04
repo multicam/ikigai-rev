@@ -1,0 +1,135 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<specification topic="OpenAI API Routing">
+
+  <topic-statement>
+    The OpenAI API routing system selects between the Chat Completions API
+    and the Responses API based on the model identifier, and maps thinking
+    levels to provider-specific reasoning effort strings for each model.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      The hardcoded model classification tables that determine which API
+      endpoint is used, the reasoning model designation, and the per-model
+      thinking-level-to-effort-string mappings.
+    </in-scope>
+
+    <boundary name="Request serialization">
+      The structural differences between Chat Completions and Responses API
+      request bodies are covered by the provider serialization specification.
+      This specification covers only which API path is chosen and what effort
+      string is produced for a given model and thinking level.
+    </boundary>
+  </scope>
+
+  <behavior>
+
+    <api-selection order="1">
+      Every request to the OpenAI provider is routed to one of two API
+      endpoints. The selection is determined by looking up the model
+      identifier in a hardcoded list of Responses API models:
+
+      <responses-api-models order="1">
+        The following model identifiers are routed to the Responses API
+        (`/v1/responses`):
+
+        - `o1`, `o1-mini`, `o1-preview`
+        - `o3`, `o3-mini`, `o3-pro`
+        - `o4-mini`
+        - `gpt-5`, `gpt-5-mini`, `gpt-5-nano`, `gpt-5-pro`
+        - `gpt-5.1`, `gpt-5.1-chat-latest`, `gpt-5.1-codex`
+        - `gpt-5.2`, `gpt-5.2-chat-latest`, `gpt-5.2-codex`
+
+        All other model identifiers — including any not present in the table —
+        are routed to the Chat Completions API (`/v1/chat/completions`).
+
+        <notable reason="exact string match only">
+          Lookup is by exact string comparison. A model such as `gpt-5.0` or
+          `o3-medium` does not match any entry and silently routes to Chat
+          Completions, even if it is semantically a reasoning model.
+        </notable>
+      </responses-api-models>
+
+      <runtime-override order="2">
+        The provider instance records a `use_responses_api` flag at creation
+        time. When that flag is set, every request through that instance is
+        forced to the Responses API regardless of the model identifier. When
+        the flag is not set, the model-identifier lookup governs the choice
+        per request.
+      </runtime-override>
+    </api-selection>
+
+    <reasoning-model-designation order="2">
+      A model is a reasoning model if and only if its identifier appears in
+      a hardcoded list:
+
+      - `o1`, `o1-mini`, `o1-preview`
+      - `o3`, `o3-mini`, `o3-pro`
+      - `o4-mini`
+      - `gpt-5`, `gpt-5-mini`, `gpt-5-nano`, `gpt-5-pro`
+      - `gpt-5.1`, `gpt-5.1-chat-latest`, `gpt-5.1-codex`
+      - `gpt-5.2`, `gpt-5.2-chat-latest`, `gpt-5.2-codex`
+
+      The reasoning model list and the Responses API model list contain
+      the same entries. A model is a reasoning model if and only if it uses
+      the Responses API.
+
+      Reasoning model designation affects whether a reasoning effort
+      parameter is included in the request. For non-reasoning models no
+      effort parameter is ever added.
+    </reasoning-model-designation>
+
+    <reasoning-effort-mapping order="3">
+      For reasoning models, a thinking level is translated to a per-model
+      effort string that is passed in the request. Each model has its own
+      mapping:
+
+      <effort-table order="1">
+        Model-specific effort strings by thinking level (MIN / LOW / MED / HIGH):
+
+        - `o1`: `"low"` / `"low"` / `"medium"` / `"high"`
+          (MIN and LOW are identical; no lower effort available)
+        - `o1-mini`: `"low"` / `"low"` / `"medium"` / `"high"`
+        - `o1-preview`: `"low"` / `"low"` / `"medium"` / `"high"`
+        - `o3`: `"none"` / `"low"` / `"medium"` / `"high"`
+          (thinking can be disabled with `"none"` at MIN)
+        - `o3-mini`: `"none"` / `"low"` / `"medium"` / `"high"`
+        - `o3-pro`: `"low"` / `"low"` / `"medium"` / `"high"`
+        - `o4-mini`: `"none"` / `"low"` / `"medium"` / `"high"`
+        - `gpt-5`: `"minimal"` / `"low"` / `"medium"` / `"high"`
+          (MIN uses `"minimal"`, distinct from `"none"`)
+        - `gpt-5-mini`: `"minimal"` / `"low"` / `"medium"` / `"high"`
+        - `gpt-5-nano`: `"none"` / `"low"` / `"medium"` / `"high"`
+        - `gpt-5-pro`: `"none"` / `"low"` / `"medium"` / `"high"`
+        - `gpt-5.1`: `"minimal"` / `"low"` / `"medium"` / `"high"`
+        - `gpt-5.1-chat-latest`: `"medium"` / `"medium"` / `"medium"` / `"medium"`
+          (all four levels produce the same effort; this model is always medium)
+        - `gpt-5.1-codex`: `"none"` / `"low"` / `"medium"` / `"high"`
+        - `gpt-5.2`: `"none"` / `"low"` / `"medium"` / `"xhigh"`
+          (HIGH uses `"xhigh"`, a super-high effort level)
+        - `gpt-5.2-chat-latest`: `"medium"` / `"medium"` / `"high"` / `"xhigh"`
+        - `gpt-5.2-codex`: `"none"` / `"low"` / `"medium"` / `"xhigh"`
+
+        <notable reason="gpt-5.1-chat-latest is always medium">
+          Regardless of the configured thinking level, this model always
+          receives `"medium"` effort. The level selection has no effect.
+        </notable>
+
+        <notable reason="xhigh is not a standard effort level">
+          The `"xhigh"` string is sent verbatim to the API for certain
+          gpt-5.2 models at HIGH thinking level. Whether the API accepts
+          this value is determined by the API, not by this implementation.
+        </notable>
+      </effort-table>
+
+      <unknown-model-behavior order="2">
+        If a model is designated as a reasoning model but its identifier does
+        not appear in the effort mapping table, no effort parameter is
+        included in the request. The model receives a Responses API request
+        with no reasoning configuration.
+      </unknown-model-behavior>
+    </reasoning-effort-mapping>
+
+  </behavior>
+
+</specification>

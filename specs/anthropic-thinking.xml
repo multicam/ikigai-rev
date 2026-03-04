@@ -1,0 +1,164 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<specification topic="Anthropic Thinking Configuration">
+
+  <topic-statement>
+    The Anthropic thinking configuration system translates an abstract
+    thinking level into the provider-specific parameters that control
+    extended thinking depth for Claude models.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      The two thinking modes (budget-based and adaptive), the model
+      classification that selects between them, the budget calculation
+      algorithm including power-of-2 rounding, the per-model budget
+      limits, the effort string mapping for adaptive models, and the
+      criteria that determine whether a model supports thinking at all.
+    </in-scope>
+
+    <boundary name="Request serialization">
+      How the calculated budget or effort string is embedded into the
+      Anthropic API JSON request body is covered by the provider
+      serialization specification.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Thinking level">
+      <field name="level" type="enumeration" note="one of: MIN (0), LOW (1), MED (2), HIGH (3)" />
+    </contract>
+
+    <contract name="Budget-based output">
+      <field name="budget tokens" type="integer" note="token count for the thinking block; power of 2" />
+    </contract>
+
+    <contract name="Adaptive output">
+      <field name="effort" type="text or null" note="one of: null (omit), 'low', 'medium', 'high'" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <model-classification order="1">
+      Before any thinking parameters are computed, the model is classified
+      into one of three categories:
+
+      <thinking-unsupported order="1">
+        If the model identifier does not begin with the prefix `claude-`,
+        the model does not support thinking. No thinking parameters are
+        produced for any level.
+      </thinking-unsupported>
+
+      <adaptive-model order="2">
+        If the model identifier begins with `claude-opus-4-6` or
+        `claude-sonnet-4-6` (matched by prefix, so version suffixes are
+        tolerated), the model is classified as adaptive. Adaptive models
+        use effort strings rather than token budgets.
+
+        <notable reason="prefix matching allows version suffixes">
+          A model string such as `claude-opus-4-6-20250101` matches the
+          adaptive prefix and is treated as an adaptive model. This allows
+          date-stamped model identifiers to match their base model entry.
+        </notable>
+      </adaptive-model>
+
+      <budget-based-model order="3">
+        All other Claude models (those beginning with `claude-` but not
+        matching an adaptive prefix) use budget-based thinking.
+      </budget-based-model>
+    </model-classification>
+
+    <adaptive-thinking order="2">
+      For adaptive models, each thinking level maps to an effort string
+      that is passed directly to the API. The mapping is:
+
+      - MIN → null (thinking parameter is omitted entirely; thinking disabled)
+      - LOW → `"low"`
+      - MED → `"medium"`
+      - HIGH → `"high"`
+
+      When the effort string is null, no thinking configuration is included
+      in the request. When it is non-null, the API request includes both a
+      thinking type of `"adaptive"` and an effort field set to the string.
+    </adaptive-thinking>
+
+    <budget-based-thinking order="3">
+      For budget-based models, a token budget is computed from the thinking
+      level and the model's registered minimum and maximum budget limits.
+
+      <per-model-budget-limits order="1">
+        The minimum and maximum token budgets are defined per model:
+
+        - `claude-haiku-4-5`: minimum 1,024 tokens, maximum 32,768 tokens
+        - `claude-sonnet-4-5`: minimum 1,024 tokens, maximum 65,536 tokens
+        - `claude-opus-4-5`: minimum 1,024 tokens, maximum 65,536 tokens
+        - All other Claude models (unknown or future): minimum 1,024 tokens,
+          maximum 32,768 tokens (default limits applied)
+
+        <notable reason="unknown models get default limits">
+          If a Claude model identifier is not found in the budget table,
+          a default range of 1,024 to 32,768 tokens is applied rather than
+          failing. This means new Claude models silently receive the default
+          limits.
+        </notable>
+      </per-model-budget-limits>
+
+      <budget-calculation order="2">
+        Given a model's minimum budget `min` and maximum budget `max`, the
+        range is `max - min`. The four thinking levels produce:
+
+        - MIN → `min` exactly (the minimum budget)
+        - LOW → floor to nearest power of 2 of `min + range / 3`
+        - MED → floor to nearest power of 2 of `min + (2 × range) / 3`
+        - HIGH → `max` exactly (the maximum budget)
+
+        The floor-to-power-of-2 operation finds the largest power of 2
+        that does not exceed the input. For example, 22,000 floors to
+        16,384. For an input of zero or negative, the result is zero.
+
+        <notable reason="power-of-2 rounding reduces low and medium budgets">
+          The LOW and MED levels produce budgets that are the nearest power
+          of 2 below the arithmetic interpolation. For claude-haiku-4-5
+          (range 31,744), LOW yields floor_pow2(1024 + 10581) ≈
+          floor_pow2(11605) = 8,192, and MED yields
+          floor_pow2(1024 + 21162) ≈ floor_pow2(22186) = 16,384. The
+          actual budgets can be substantially lower than a simple linear
+          interpolation would suggest.
+        </notable>
+
+        <notable reason="integer division may cause asymmetry">
+          The range is divided using integer division. For ranges that are
+          not evenly divisible by 3, LOW and MED values are truncated toward
+          zero before the power-of-2 floor is applied.
+        </notable>
+      </budget-calculation>
+
+      <min-level-behavior order="3">
+        At the MIN thinking level, the minimum budget is returned regardless
+        of rounding. For all models with hardcoded limits, MIN always returns
+        1,024. This is distinct from disabling thinking — the budget is still
+        provided to the API, not omitted.
+
+        <notable reason="MIN does not disable thinking for budget models">
+          Unlike adaptive models where MIN omits the thinking parameter
+          entirely, budget-based models at MIN level include a
+          `budget_tokens` of 1,024 in the request. The API still performs
+          thinking, constrained to at most 1,024 tokens.
+        </notable>
+      </min-level-behavior>
+    </budget-based-thinking>
+
+    <max-tokens-adjustment order="4">
+      When thinking is enabled on a budget-based model with a positive
+      budget, and the configured maximum output tokens is less than or equal
+      to the thinking budget, the maximum output tokens is raised to
+      `budget + 4,096`. This ensures the response has capacity for both
+      the thinking block and the visible reply.
+
+      When thinking is disabled (MIN level on adaptive models, or the model
+      does not support thinking), no adjustment is made.
+    </max-tokens-adjustment>
+
+  </behavior>
+
+</specification>

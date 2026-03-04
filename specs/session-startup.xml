@@ -1,0 +1,200 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<specification topic="Session Startup">
+
+  <topic-statement>
+    The session startup sequence initializes all subsystems in a defined
+    order, establishes two independent memory roots for the application and
+    the logger, and installs handlers that enable cleanup on panic and
+    abort.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      The command-line argument processing, random seed initialization,
+      the two-root memory architecture, the ordered subsystem initialization
+      (paths, config, credentials, shared context, REPL), the panic and
+      abort handler installation, the main event loop invocation, and the
+      ordered cleanup and exit.
+    </in-scope>
+
+    <boundary name="Paths initialization">
+      What environment variables are required and how directories are
+      resolved is covered by the paths specification.
+    </boundary>
+
+    <boundary name="Config loading">
+      How configuration is read and parsed is covered by the configuration
+      specification.
+    </boundary>
+
+    <boundary name="Credential loading">
+      How credentials are sourced from file and environment is covered by
+      the credential loading specification.
+    </boundary>
+
+    <boundary name="REPL initialization">
+      What the REPL setup entails — database connection, agent restore,
+      terminal setup — is covered by the REPL initialization specification.
+    </boundary>
+
+    <boundary name="REPL event loop">
+      What happens during the main event loop is covered by the REPL event
+      loop specification.
+    </boundary>
+  </scope>
+
+  <behavior>
+
+    <argument-processing order="1">
+      The only recognized command-line argument is `--headless`. When this
+      flag is present, the application creates a virtual terminal context
+      that accepts input and produces output without requiring a real
+      terminal device. When the flag is absent, the application expects to
+      run attached to a real terminal.
+
+      All other arguments are silently ignored.
+    </argument-processing>
+
+    <random-seed-initialization order="2">
+      The random number generator is seeded with a value derived from the
+      current time combined with the process identifier. This reduces the
+      probability of UUID collisions when multiple instances start at the
+      same wall-clock second.
+    </random-seed-initialization>
+
+    <two-root-memory-architecture order="3">
+      Two independent talloc memory roots are created and managed separately
+      throughout the lifetime of the process:
+
+      <logger-root order="1">
+        The logger is allocated on its own root and initialized before any
+        other subsystem. The logger root outlives the application root —
+        it is freed last, after the session end event has been written. This
+        ensures logging remains available during and after all application
+        cleanup.
+
+        Immediately after creation, a global panic logging pointer is set to
+        the logger. This pointer allows crash handlers to write events even
+        when no talloc context is available.
+      </logger-root>
+
+      <application-root order="2">
+        All application state (paths, config, credentials, shared context,
+        REPL, agents) is allocated under a separate root. When the main
+        event loop completes, this root is freed first, releasing all
+        application resources before the logger is touched.
+      </application-root>
+
+      <notable reason="logger is intentionally the last thing freed">
+        The two-root design ensures that a crash during application cleanup
+        can still produce a log entry. Freeing the application root first
+        means the logger remains valid at the point where the final session
+        end event is written.
+      </notable>
+    </two-root-memory-architecture>
+
+    <subsystem-initialization-sequence order="4">
+      Subsystems are initialized in strict order. Each failure stops the
+      sequence, writes an error event to the log, frees both roots, and
+      exits with failure status.
+
+      <paths-init order="1">
+        The paths subsystem validates that four environment variables are
+        set and resolves the directories they name. Failure produces a
+        message on the standard error stream in addition to the log event.
+      </paths-init>
+
+      <config-load order="2">
+        The configuration is loaded using the resolved paths. Failure
+        produces a log event and exits.
+      </config-load>
+
+      <credentials-load order="3">
+        The credentials are loaded from the default path (derived from the
+        config directory). Failure produces a log event and exits.
+      </credentials-load>
+
+      <shared-context-init order="4">
+        The shared context is initialized with the config, credentials,
+        paths, logger, and (if `--headless` was specified) a virtual
+        terminal. Failure produces a log event and exits.
+      </shared-context-init>
+
+      <repl-init order="5">
+        The REPL is initialized. If this step fails, the terminal is
+        explicitly cleaned up before writing the log event and exiting. The
+        terminal pointer on the shared context is also cleared to prevent
+        a second cleanup during subsequent root teardown.
+
+        <notable reason="terminal cleanup is ordered before root teardown on REPL failure">
+          All other subsystem failures free the application root directly,
+          allowing talloc destructors to clean up in order. REPL init is the
+          only step that explicitly calls terminal cleanup first and clears the
+          pointer, because the terminal must restore the primary screen buffer
+          even if talloc destructors have not yet run.
+        </notable>
+      </repl-init>
+    </subsystem-initialization-sequence>
+
+    <panic-handler-installation order="5">
+      After the REPL is initialized, two crash handlers are installed:
+
+      <terminal-abort-handler order="1">
+        A global pointer to the terminal context is stored. If an unhandled
+        abort signal occurs, this pointer allows the abort handler to
+        restore the primary terminal screen buffer before the process
+        terminates, preventing the alternate screen from remaining visible
+        in the user's terminal.
+      </terminal-abort-handler>
+
+      <talloc-abort-handler order="2">
+        The talloc library's abort function is replaced with a custom handler.
+        This intercepts allocation failures that talloc would otherwise handle
+        by calling abort() directly, allowing the custom handler to write a
+        panic log event and restore the terminal before the process ends.
+      </talloc-abort-handler>
+    </panic-handler-installation>
+
+    <event-loop-execution order="6">
+      The REPL event loop runs until it returns. Both success and error
+      returns are handled: on success the exit code is zero; on error the
+      exit code is non-zero and an error event is written to the log before
+      cleanup begins.
+    </event-loop-execution>
+
+    <cleanup-and-exit order="7">
+      Cleanup proceeds in the following order:
+
+      1. The application root is freed, releasing all agent, REPL, shared
+         context, config, credential, and path state. This triggers talloc
+         destructors including terminal cleanup.
+      2. The exit code is determined (success or failure).
+      3. A session end event is written to the log with the exit code.
+      4. The global panic logger pointer is cleared to prevent any subsequent
+         crash from writing to a freed logger.
+      5. The logger root is freed.
+      6. The process exits with the determined exit code.
+
+      <notable reason="session end event is written before logger root is freed">
+        This ordering guarantees that the final log entry is durable before
+        the logger is torn down.
+      </notable>
+    </cleanup-and-exit>
+
+    <logging order="8">
+      The logger records a session start event (with the working directory)
+      at the beginning and a session end event (with the exit code) at the
+      end. Error events are written for each failed initialization step and
+      for any error from the REPL event loop. All events are written in JSONL
+      format.
+
+      <shared topic="Logger">
+        Log entries are written as JSON lines to a rotating log file. The
+        logger is a singleton with a global pointer used by panic handlers,
+        and a per-context pointer used by normal application code.
+      </shared>
+    </logging>
+
+  </behavior>
+
+</specification>

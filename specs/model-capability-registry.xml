@@ -1,0 +1,138 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<specification topic="Model Capability Registry">
+
+  <topic-statement>
+    The model capability registry maps each known model identifier to its
+    provider affiliation and thinking-capability metadata, and provides
+    lookup operations for inferring providers and querying thinking support.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      The hardcoded table of supported models with their thinking support
+      flags and budget values, the provider-inference operation that maps
+      model name prefixes to provider names, and the lookup operations for
+      querying thinking support and budget by model identifier.
+    </in-scope>
+
+    <boundary name="Provider factory">
+      How provider instances are created from a provider name and API
+      credential is out of scope; this specification covers only the
+      registry data and lookup behavior.
+    </boundary>
+
+    <boundary name="Thinking configuration">
+      How thinking levels are translated into per-provider API parameters
+      (budget tokens, effort strings, level strings) is covered by provider-
+      specific thinking specifications.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Model capability entry">
+      <field name="model identifier" type="text" note="exact string used in API requests" />
+      <field name="thinking supported" type="boolean" />
+      <field name="thinking budget" type="integer" note="maximum thinking token budget; 0 for effort-based or unsupported models" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <registry-contents order="1">
+      The registry contains exactly 29 model entries, organized by provider:
+
+      <anthropic-models order="1">
+        Five Claude models are registered, all with thinking support:
+
+        - `claude-haiku-4-5`: thinking supported, maximum budget 32,768 tokens
+        - `claude-sonnet-4-5`: thinking supported, maximum budget 65,536 tokens
+        - `claude-opus-4-5`: thinking supported, maximum budget 65,536 tokens
+        - `claude-sonnet-4-6`: thinking supported, maximum budget 65,536 tokens
+        - `claude-opus-4-6`: thinking supported, budget 0 (effort-based, not
+          budget-based; the 0 value signals that effort strings rather than
+          token counts are used to control thinking depth)
+      </anthropic-models>
+
+      <openai-models order="2">
+        Sixteen OpenAI models are registered across two groups:
+
+        Standard and GPT-5 models with thinking support (all effort-based,
+        budget 0):
+        - `gpt-5`, `gpt-5-mini`, `gpt-5-nano`, `gpt-5-pro`
+        - `gpt-5.1`, `gpt-5.1-chat-latest`, `gpt-5.1-codex`
+        - `gpt-5.2`, `gpt-5.2-chat-latest`, `gpt-5.2-codex`
+        - `o1`, `o1-mini`, `o1-preview`, `o3`, `o3-mini`
+
+        Legacy models without thinking support (budget 0):
+        - `gpt-4`, `gpt-4-turbo`, `gpt-4o`, `gpt-4o-mini`
+
+        <notable reason="budget value overloaded">
+          Budget 0 is used to signal two different situations: effort-based
+          thinking (not budget-based) for models that do support thinking,
+          and the absence of thinking support entirely for legacy models. The
+          thinking support boolean flag distinguishes these two cases.
+        </notable>
+      </openai-models>
+
+      <google-models order="3">
+        Eight Google Gemini models are registered across two groups:
+
+        Gemini 3 models with thinking support (all level-based, budget 0):
+        - `gemini-3-flash-preview`
+        - `gemini-3-pro-preview`
+        - `gemini-3.1-pro-preview`
+
+        Gemini 2.5 models with budget-based thinking:
+        - `gemini-2.5-pro`: maximum budget 32,768 tokens
+        - `gemini-2.5-flash`: maximum budget 24,576 tokens
+        - `gemini-2.5-flash-lite`: maximum budget 24,576 tokens
+
+        Legacy Gemini models without thinking support (budget 0):
+        - `gemini-flash-1.5`
+        - `gemini-pro-1.5`
+      </google-models>
+    </registry-contents>
+
+    <provider-inference order="2">
+      A provider name can be inferred from a model identifier by matching
+      the model name against a fixed set of prefixes. The lookup is
+      case-sensitive and uses prefix matching:
+
+      - Names beginning with `gpt-` → `openai`
+      - Names beginning with `o1`, `o1-` → `openai`
+      - Names beginning with `o3`, `o3-` → `openai`
+      - Names beginning with `o4`, `o4-` → `openai`
+      - Names beginning with `claude-` → `anthropic`
+      - Names beginning with `gemini-` → `google`
+
+      If no prefix matches, the inference returns nothing. This operation
+      is separate from the registry table lookup and does not require the
+      model to be present in the registry.
+
+      <notable reason="reasoning model prefixes checked individually">
+        The `o1`, `o3`, and `o4` prefixes are checked explicitly alongside
+        the longer `o1-`, `o3-`, and `o4-` prefixes, meaning both `o3` and
+        `o3-mini` correctly infer `openai` as their provider.
+      </notable>
+    </provider-inference>
+
+    <thinking-support-lookup order="3">
+      Given an exact model identifier string, the registry returns whether
+      that model supports thinking. Lookup is by exact string match; no
+      prefix or pattern matching is applied. If the model identifier is
+      absent from the registry, the operation returns an error rather than
+      a default value.
+    </thinking-support-lookup>
+
+    <thinking-budget-lookup order="4">
+      Given an exact model identifier string, the registry returns the
+      model's maximum thinking budget token count. For models that support
+      thinking via effort strings rather than budgets, this value is 0.
+      For models that do not support thinking, this value is also 0. Lookup
+      is by exact string match; if the identifier is absent, the operation
+      returns an error.
+    </thinking-budget-lookup>
+
+  </behavior>
+
+</specification>

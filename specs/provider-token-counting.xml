@@ -1,0 +1,176 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<specification topic="Provider Token Counting">
+
+  <topic-statement>
+    The provider token counting system estimates the token cost of a request
+    by making a synchronous API call to each provider's token counting
+    endpoint, falling back to a byte-based estimator on any failure.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      The token counting operation for each provider (Anthropic, OpenAI, and
+      Google), the synchronous HTTP call made by each, the fallback to
+      byte-based estimation, and the conditions that trigger each fallback.
+    </in-scope>
+
+    <boundary name="Token estimation">
+      The byte-based fallback estimator uses a fixed 4:1 bytes-to-tokens
+      ratio. This behavior is covered by the token estimation specification.
+
+      <shared topic="Token Estimation">
+        When the fallback is triggered, the byte count of a reference string
+        is divided by 4 to produce an estimated token count.
+      </shared>
+    </boundary>
+
+    <boundary name="HTTP multiplexer">
+      Token counting uses its own synchronous HTTP session (not the async
+      multiplexer used for LLM requests). The async HTTP infrastructure is
+      out of scope here.
+    </boundary>
+  </scope>
+
+  <behavior>
+
+    <shared-fallback-strategy order="1">
+      All three providers share the same fundamental fallback strategy: every
+      failure condition produces an estimated token count using the byte-based
+      estimator and returns a success result. Token counting never propagates
+      an error to the caller regardless of the failure.
+
+      The fallback activates on any of the following conditions:
+      - Request serialization fails
+      - HTTP session initialization fails
+      - Network error during the HTTP call
+      - HTTP response with status outside the 200–299 range
+      - JSON parse failure on the response body
+      - Missing or non-integer token count field in the response
+
+      The byte string used as input to the estimator varies by failure point
+      and provider, but is generally the serialized request JSON body.
+
+      <notable reason="caller always receives OK">
+        The token counting operation always returns a success result. A
+        caller cannot distinguish a successful API count from a silently
+        estimated count.
+      </notable>
+    </shared-fallback-strategy>
+
+    <anthropic-token-counting order="2">
+      The Anthropic token counting operation makes a synchronous HTTP POST
+      to the `/v1/messages/count_tokens` endpoint.
+
+      <request-format order="1">
+        The request body is the same as a standard Anthropic Messages API
+        request, but with the `max_tokens` and `stream` fields omitted. The
+        thinking configuration is included if present in the original request.
+        The required headers are `Content-Type: application/json`,
+        `anthropic-version: 2023-06-01`, and `x-api-key` set to the API key.
+        A 30-second timeout is applied.
+      </request-format>
+
+      <response-parsing order="2">
+        The response is expected to be a JSON object containing an
+        `input_tokens` field with an integer value. If the field is present
+        and non-negative, it is returned as the token count (truncated to a
+        32-bit integer).
+      </response-parsing>
+
+      <fallback-input order="3">
+        When the fallback activates after serialization succeeds, the
+        fallback input is the byte length of the serialized JSON body.
+        When the fallback activates because serialization failed, a
+        separate estimator is applied to only the text content of the system
+        prompt and text message blocks (other block types are not counted).
+
+        <notable reason="fallback input differs by failure point">
+          A serialization failure produces an estimate based on partial
+          text content only. A network failure after serialization produces
+          an estimate based on the full serialized body length. These can
+          differ substantially.
+        </notable>
+      </fallback-input>
+    </anthropic-token-counting>
+
+    <openai-token-counting order="3">
+      The OpenAI token counting operation makes a synchronous HTTP POST
+      to the `/v1/responses/input_tokens` endpoint.
+
+      <request-format order="1">
+        The request body is serialized in Responses API format regardless
+        of which API mode (Chat Completions or Responses) the model normally
+        uses. The serialization is performed with `stream` set to false.
+        Headers include `Authorization: Bearer {api_key}` and
+        `Content-Type: application/json`. A 30-second timeout is applied.
+        A separate synchronous curl session (not the async multi handle)
+        is used for this call.
+      </request-format>
+
+      <response-parsing order="2">
+        The response is expected to be a JSON object with the structure
+        `{"object": "response.input_tokens", "input_tokens": N}`. The
+        `input_tokens` field is extracted as an integer and returned.
+      </response-parsing>
+
+      <fallback-input order="3">
+        When the fallback activates, the byte length of the serialized
+        Responses API JSON body is used as the estimator input. If
+        serialization itself fails, the system prompt byte length is used
+        instead.
+      </fallback-input>
+
+      <notable reason="always uses responses api format for counting">
+        Even for models that normally use the Chat Completions API, token
+        counting always serializes in Responses API format and posts to the
+        Responses API counting endpoint. The Chat Completions API does not
+        provide a dedicated token counting endpoint.
+      </notable>
+    </openai-token-counting>
+
+    <google-token-counting order="4">
+      The Google token counting operation makes a synchronous HTTP POST
+      to the `{base_url}/models/{model}:countTokens?key={api_key}` endpoint.
+
+      <request-format order="1">
+        The request body wraps the standard `generateContent` request body
+        inside a `generateContentRequest` envelope object. The model field
+        is injected as `models/{model_name}` within this envelope.
+
+        Two cases arise:
+        - If the serialized `generateContent` body is 2 or fewer bytes (an
+          essentially empty body), the envelope contains only the model field:
+          `{"generateContentRequest": {"model": "models/X"}}`.
+        - Otherwise, the body JSON is stripped of its leading `{` character
+          and concatenated into the envelope with the model field, producing:
+          `{"generateContentRequest": {"model": "models/X", ...remaining...}}`.
+
+        The only header sent is `Content-Type: application/json`. No
+        authentication header is used; authentication is via the `key`
+        query parameter in the URL.
+      </request-format>
+
+      <response-parsing order="2">
+        The response is expected to be a JSON object containing a
+        `totalTokens` integer field. If the value exceeds the 32-bit integer
+        maximum, it is clamped to that maximum.
+      </response-parsing>
+
+      <fallback-input order="3">
+        When the fallback activates, the byte length of the envelope-wrapped
+        body (not the original `generateContent` body) is used as the
+        estimator input. If the `generateContent` serialization fails, a
+        byte count of 0 is used.
+      </fallback-input>
+
+      <notable reason="string concatenation used for envelope construction">
+        The body wrapping strips the leading `{` from the serialized JSON
+        and concatenates it into the envelope using a format string. This
+        is syntactically correct for valid JSON but does not parse and
+        rebuild the JSON structure.
+      </notable>
+    </google-token-counting>
+
+  </behavior>
+
+</specification>

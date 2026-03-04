@@ -1,0 +1,184 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<specification topic="Google Thinking Configuration">
+
+  <topic-statement>
+    The Google thinking configuration system classifies Gemini models into
+    series and translates an abstract thinking level into the API parameters
+    that control thinking depth for each series.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      The model series classification (Gemini 2.5 vs Gemini 3 vs other),
+      the budget-based thinking configuration for Gemini 2.5 models including
+      the per-model budget tables and power-of-2 calculation, the level-string
+      configuration for Gemini 3 models including per-model level tables and
+      fallback defaults, the can-disable-thinking determination, and the
+      validation rules for thinking levels per model.
+    </in-scope>
+
+    <boundary name="Request serialization">
+      How the computed thinking budget or level string is embedded into the
+      Google API JSON request body is covered by the provider serialization
+      specification.
+    </boundary>
+  </scope>
+
+  <behavior>
+
+    <model-series-classification order="1">
+      Each Gemini model is classified into one of three series by substring
+      search in the model identifier:
+
+      - If the identifier contains `gemini-3`: classified as Gemini 3
+      - If the identifier contains `gemini-2.5`: classified as Gemini 2.5
+      - Otherwise: classified as other (no thinking support)
+
+      Classification is performed by substring match, not prefix or exact
+      match. Order matters: `gemini-3` is checked before `gemini-2.5`.
+
+      <notable reason="substring match means embedded substrings match">
+        A hypothetical identifier like `my-gemini-3-custom` would be
+        classified as Gemini 3 because it contains the substring `gemini-3`.
+      </notable>
+    </model-series-classification>
+
+    <gemini-2-5-budget-thinking order="2">
+      Gemini 2.5 models use token budget thinking, similar to budget-based
+      Anthropic models.
+
+      <per-model-budget-limits order="1">
+        Token budget limits are defined per exact model identifier:
+
+        - `gemini-2.5-pro`: minimum 128 tokens, maximum 32,768 tokens.
+          This model cannot fully disable thinking (minimum budget > 0).
+        - `gemini-2.5-flash-lite`: minimum 512 tokens, maximum 24,576 tokens.
+          This model cannot fully disable thinking.
+        - `gemini-2.5-flash`: minimum 0 tokens, maximum 24,576 tokens.
+          This model can disable thinking (minimum budget is 0).
+
+        For Gemini 2.5 models whose identifier does not match any table entry,
+        the budget calculation returns -1 (unsupported).
+      </per-model-budget-limits>
+
+      <budget-calculation order="2">
+        Given a model's minimum budget `min` and maximum budget `max`, the
+        range is `max - min`. The four thinking levels produce:
+
+        - MIN → `min` exactly
+        - LOW → floor to nearest power of 2 of `min + range / 3`
+        - MED → floor to nearest power of 2 of `min + (2 × range) / 3`
+        - HIGH → `max` exactly
+
+        The power-of-2 floor finds the largest power of 2 not exceeding the
+        input. Integer division is used for range thirds.
+
+        <notable reason="gemini-2.5-pro and gemini-2.5-flash-lite have non-zero minimum">
+          At MIN thinking level, `gemini-2.5-pro` produces a budget of 128
+          and `gemini-2.5-flash-lite` produces 512. Thinking cannot be
+          disabled for these models via the MIN level; the API always receives
+          a positive budget.
+        </notable>
+
+        <notable reason="gemini-2.5-flash can disable thinking">
+          At MIN thinking level, `gemini-2.5-flash` produces a budget of 0,
+          which signals the API to disable thinking.
+        </notable>
+      </budget-calculation>
+
+      <can-disable-thinking order="3">
+        A Gemini 2.5 model can disable thinking if and only if its minimum
+        budget is exactly 0. Only `gemini-2.5-flash` satisfies this
+        condition among the registered models. Unknown Gemini 2.5 models
+        (not in the table) cannot disable thinking.
+
+        Gemini 3 models cannot disable thinking (they use level strings,
+        and MIN maps to the lowest available level, not silence).
+
+        Non-thinking models (series classified as other) are considered to
+        be unable to disable thinking, as they have no thinking to disable.
+      </can-disable-thinking>
+    </gemini-2-5-budget-thinking>
+
+    <gemini-3-level-thinking order="3">
+      Gemini 3 models use level strings rather than numeric budgets.
+
+      <per-model-level-mappings order="1">
+        Level strings are defined per exact model identifier:
+
+        - `gemini-3-flash-preview`:
+          MIN → `"minimal"`, LOW → `"low"`, MED → `"medium"`, HIGH → `"high"`
+        - `gemini-3-pro-preview`:
+          MIN → `"low"`, LOW → `"low"`, MED → `"high"`, HIGH → `"high"`
+          (MIN and LOW collapse to `"low"`; MED and HIGH collapse to `"high"`)
+        - `gemini-3.1-pro-preview`:
+          MIN → `"low"`, LOW → `"low"`, MED → `"medium"`, HIGH → `"high"`
+          (MIN and LOW both yield `"low"`)
+
+        <notable reason="gemini-3-pro-preview has only two distinct levels">
+          This model has only two observable outcomes: `"low"` for MIN and
+          LOW levels, and `"high"` for MED and HIGH levels.
+        </notable>
+      </per-model-level-mappings>
+
+      <unknown-gemini-3-model-fallback order="2">
+        For Gemini 3 models whose identifier does not match any entry in
+        the level table, a safe default mapping is applied:
+
+        - MIN → `"low"`
+        - LOW → `"low"`
+        - MED → `"high"`
+        - HIGH → `"high"`
+
+        This means unknown Gemini 3 models also have only two distinct
+        observable levels: `"low"` and `"high"`.
+      </unknown-gemini-3-model-fallback>
+    </gemini-3-level-thinking>
+
+    <thinking-validation order="4">
+      Before a request is built, a thinking level can be validated for a
+      given model:
+
+      - If the model identifier is null: validation fails with an error.
+      - For level MIN:
+        - If the model is Gemini 2.5 and cannot disable thinking (minimum
+          budget > 0): validation fails with an error describing that the
+          minimum budget is positive.
+        - Otherwise: validation succeeds.
+      - For levels LOW, MED, HIGH:
+        - If the model does not support thinking (series classified as other):
+          validation fails with an error naming the unsupported model.
+        - Otherwise: validation succeeds.
+
+      Validation is purely advisory; the runtime does not call it
+      automatically before every request. It is exposed for use by higher
+      layers that wish to report errors before attempting serialization.
+    </thinking-validation>
+
+    <thought-signature-handling order="5">
+      Gemini 3 models produce a thought signature in their responses — an
+      opaque value that must be injected into the first assistant message
+      of the next request. The implementation scans assistant messages in
+      reverse order to find the most recent stored thought signature.
+
+      If found, the signature is prepended as the first part of the first
+      assistant message's content array in the serialized request.
+
+      <notable reason="only gemini-3 models trigger signature lookup">
+        For non-Gemini-3 models, the thought signature lookup is skipped
+        entirely. Even if a thought signature was stored from a previous
+        Gemini 3 session, it is not included when the model is switched to
+        a non-Gemini-3 model.
+      </notable>
+
+      <notable reason="tool result serialization uses reverse message scan">
+        When serializing a tool result, the implementation scans backward
+        through previous messages to find the function name matching the
+        tool call ID. If no match is found, the tool call ID itself is
+        used as the function name in the serialized response.
+      </notable>
+    </thought-signature-handling>
+
+  </behavior>
+
+</specification>
