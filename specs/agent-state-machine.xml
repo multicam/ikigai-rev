@@ -1,0 +1,170 @@
+<specification topic="Agent State Machine">
+
+  <topic-statement>
+    The agent state machine manages transitions between the three processing states an agent occupies during its lifecycle.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      All state transitions between IDLE, WAITING_FOR_LLM, and EXECUTING_TOOL; preconditions enforced on each transition; visibility side effects applied at transition time; initialization state; interrupt signaling behavior; and state-dependent behaviors of consumers.
+    </in-scope>
+
+    <boundary name="LLM Stream Lifecycle">
+      When an interrupt is requested during WAITING_FOR_LLM, a cancellation signal is sent to the active stream. This topic documents that the signal is sent; the stream lifecycle itself is not part of this topic.
+    </boundary>
+
+    <boundary name="Tool Process Lifecycle">
+      When an interrupt is requested during EXECUTING_TOOL, the tool's child process group is signaled. This topic documents that signaling occurs; the tool execution lifecycle is not part of this topic.
+    </boundary>
+
+    <boundary name="Viewport Rendering">
+      The viewport rendering layer reads agent state on every rendered frame and re-evaluates spinner and input buffer visibility. This topic documents that behavior as it affects the observable output of state transitions; the rendering mechanism itself is not part of this topic.
+    </boundary>
+
+    <boundary name="State Completion Detection">
+      The main event loop polls for LLM and tool completion to determine when to drive state forward. The polling mechanism is not part of this topic.
+    </boundary>
+
+    <boundary name="Inter-agent Wait Protocol">
+      The wait command produces a direct IDLE-to-EXECUTING_TOOL transition. The synchronization protocol itself — what the spawned thread waits for, and what it produces — is not part of this topic.
+    </boundary>
+
+    <boundary name="External Control Interface">
+      External callers may poll until an agent reaches IDLE. The socket protocol is not part of this topic.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Agent State">
+      <field name="state" type="enumeration" note="One of: IDLE, WAITING_FOR_LLM, EXECUTING_TOOL. Stored as a C11 atomic value." />
+      <field name="spinner visible" type="boolean" note="Tracks whether the spinner is displayed. Set during some transitions; re-evaluated by viewport rendering on every frame." />
+      <field name="input buffer visible" type="boolean" note="Tracks whether the input buffer is displayed. Set during some transitions; re-evaluated by viewport rendering on every frame." />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <initialization order="1">
+      Every agent, whether newly created or restored from persistent storage, begins in the IDLE state. The spinner starts hidden and the input buffer starts visible.
+    </initialization>
+
+    <idle-to-waiting-for-llm order="2">
+      When an LLM request is submitted, the agent transitions from IDLE to WAITING_FOR_LLM. The transition acquires a mutex, asserts that the current state is exactly IDLE, stores the new state, and releases the mutex. If the precondition is not met, the process terminates immediately via assertion failure.
+
+      As part of this transition, the spinner is made visible and the input buffer is hidden. A timestamp marking the current monotonic time is recorded to enable time-based spinner animation.
+
+      <notable reason="visibility set twice per operation">
+        The visibility changes applied here are also re-applied on every rendered frame by the viewport layer, which independently sets spinner and input visibility based on current state. The transition-time assignment and the per-frame assignment produce identical results for all paths that use this transition function.
+      </notable>
+    </idle-to-waiting-for-llm>
+
+    <waiting-for-llm-to-executing-tool order="3">
+      When the LLM response includes a tool call and a tool thread has been spawned, the agent transitions from WAITING_FOR_LLM to EXECUTING_TOOL. The transition acquires a mutex, asserts that the current state is exactly WAITING_FOR_LLM, stores the new state, and releases the mutex. If the precondition is not met, the process terminates immediately via assertion failure.
+
+      No visibility changes occur during this transition. The spinner remains visible and the input buffer remains hidden.
+    </waiting-for-llm-to-executing-tool>
+
+    <executing-tool-to-waiting-for-llm order="4">
+      When a tool thread completes, the agent transitions from EXECUTING_TOOL back to WAITING_FOR_LLM. The transition acquires a mutex, asserts that the current state is exactly EXECUTING_TOOL, stores the new state, and releases the mutex. If the precondition is not met, the process terminates immediately via assertion failure.
+
+      No visibility changes occur during this transition.
+
+      After this transition, one of two things happens:
+      1. If there are more tool iterations to execute, a follow-up LLM request is submitted immediately, keeping the agent in WAITING_FOR_LLM.
+      2. If the tool loop is complete, the agent proceeds to the WAITING_FOR_LLM-to-IDLE transition immediately.
+
+      The agent never remains in WAITING_FOR_LLM for any observable duration at the end of a tool loop — the transition to IDLE follows synchronously.
+    </executing-tool-to-waiting-for-llm>
+
+    <waiting-for-llm-to-idle order="5">
+      When the LLM completes without producing a pending tool call — whether from a successful response or from an interrupted response — the agent transitions from WAITING_FOR_LLM to IDLE. The transition acquires a mutex, asserts that the current state is exactly WAITING_FOR_LLM, stores the new state, and releases the mutex. If the precondition is not met, the process terminates immediately via assertion failure.
+
+      As part of this transition, the spinner is hidden and the input buffer is made visible.
+    </waiting-for-llm-to-idle>
+
+    <direct-idle-to-executing-tool order="6">
+      The inter-agent wait command produces a transition directly from IDLE to EXECUTING_TOOL, bypassing WAITING_FOR_LLM. This transition acquires the same mutex, stores the new state atomically, and releases the mutex.
+
+      <notable reason="only transition without a precondition assertion">
+        This is the only transition in the system that does not assert the precondition before writing. All other transitions assert the expected source state and abort the process if the precondition fails. This transition stores the new state unconditionally, without verifying that the current state is IDLE. No error is reported if the current state is not IDLE.
+      </notable>
+
+      <notable reason="no visibility side effects">
+        Unlike the IDLE-to-WAITING_FOR_LLM transition, this transition applies no visibility changes. The spinner is not explicitly shown and the input buffer is not explicitly hidden. Because the viewport rendering layer re-evaluates visibility from state on every rendered frame, the visual outcome is the same — spinner becomes visible and input buffer is hidden on the next frame — but the transition-time state of the visibility fields is not updated.
+      </notable>
+    </direct-idle-to-executing-tool>
+
+    <interrupt-request-handling order="7">
+      When the user requests an interrupt (ESC key), the current state is read atomically and the following behavior occurs based on that state:
+
+      <interrupt-while-idle order="1">
+        If the agent is in IDLE, the request is a no-op. No state change occurs.
+      </interrupt-while-idle>
+
+      <interrupt-while-waiting-for-llm order="2">
+        If the agent is in WAITING_FOR_LLM, an interrupt flag is set on the agent and a cancellation signal is sent to the active LLM stream. The state does not change immediately. The state transitions to IDLE later, when the main loop detects that the stream has completed, via the normal WAITING_FOR_LLM-to-IDLE transition.
+      </interrupt-while-waiting-for-llm>
+
+      <interrupt-while-executing-tool order="3">
+        If the agent is in EXECUTING_TOOL, an interrupt flag is set on the agent. Then, if the tool's child process identifier is set, SIGTERM is sent to the entire process group of the child.
+
+        After sending SIGTERM, the interrupt handler enters a blocking poll loop: it checks every 100 milliseconds whether the child process has terminated, for up to 2000 milliseconds total. If the child terminates within that window, the loop exits. If 2000 milliseconds elapse without termination, SIGKILL is sent to the process group.
+
+        <notable reason="blocks main event loop">
+          This polling loop runs in the main event loop thread. The entire application — rendering, input processing, and all other agents — is blocked for up to 2 seconds while waiting for the tool process to respond to SIGTERM.
+        </notable>
+
+        The state does not change during the interrupt request. The state transitions to IDLE later, when the main loop detects tool completion, via the EXECUTING_TOOL-to-WAITING_FOR_LLM-to-IDLE path.
+      </interrupt-while-executing-tool>
+    </interrupt-request-handling>
+
+    <thread-safety order="8">
+      All state writes — whether via named transition functions or the direct atomic store in the wait command — are performed inside a mutex. State reads use lockless atomic loads without acquiring the mutex.
+
+      The mutex protects compound operations: specifically, the pattern of reading the current state to validate a precondition and then writing a new state. Without the mutex, a concurrent write could change state between the read and the write.
+
+      Concurrent reads always observe a consistent atomic value. The observable result of concurrent access is: each read returns either the old state or the new state, never a partial or torn value.
+    </thread-safety>
+
+    <state-dependent-consumer-behaviors order="9">
+      The state value is read by several other systems to influence their behavior:
+
+      <event-loop-timeout order="1">
+        When any agent is in EXECUTING_TOOL, the main event loop uses a 50-millisecond polling timeout to detect tool completion promptly. When no agent is in EXECUTING_TOOL, this timeout does not apply.
+      </event-loop-timeout>
+
+      <model-switch-guard order="2">
+        A request to switch the LLM model is rejected while the agent is in WAITING_FOR_LLM. A warning is displayed and the switch does not proceed.
+
+        <notable reason="incomplete guard">
+          The model switch guard only checks for WAITING_FOR_LLM. It does not check for EXECUTING_TOOL. A model switch attempted while a tool is executing is not blocked.
+        </notable>
+      </model-switch-guard>
+
+      <external-idle-query order="3">
+        External callers may query whether the current agent is in IDLE. The response is derived directly from an atomic read of the state field.
+      </external-idle-query>
+
+      <viewport-visibility-override order="4">
+        On every rendered frame, the viewport layer reads the current state and applies the following visibility rules, unconditionally overriding whatever the transition functions may have set:
+
+        - If the agent is marked dead (regardless of state): spinner hidden, input buffer hidden.
+        - If the state is WAITING_FOR_LLM or EXECUTING_TOOL: spinner visible, input buffer hidden.
+        - If the state is IDLE: spinner hidden, input buffer visible (subject to layout constraints).
+
+        Because these overrides run on every frame, any mismatch between the transition-time visibility assignments and the state value is corrected on the next frame.
+      </viewport-visibility-override>
+    </state-dependent-consumer-behaviors>
+
+  </behavior>
+
+  <state-transitions>
+    <transition trigger="LLM request submitted">IDLE → WAITING_FOR_LLM</transition>
+    <transition trigger="LLM completes without tool call, or interrupted LLM stream completes">WAITING_FOR_LLM → IDLE</transition>
+    <transition trigger="LLM completes with tool call; tool thread spawned">WAITING_FOR_LLM → EXECUTING_TOOL</transition>
+    <transition trigger="Tool thread completes; more tool iterations remain">EXECUTING_TOOL → WAITING_FOR_LLM</transition>
+    <transition trigger="Tool thread completes; tool loop done (transitions immediately through WAITING_FOR_LLM → IDLE)">EXECUTING_TOOL → IDLE</transition>
+    <transition trigger="Inter-agent wait command issued (direct, no precondition assertion)">IDLE → EXECUTING_TOOL</transition>
+  </state-transitions>
+
+</specification>
