@@ -1,0 +1,242 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<specification topic="Scroll Detector">
+
+  <topic-statement>
+    The scroll detector classifies arrow-key events as either mouse-wheel
+    scroll events or keyboard arrow-key events using a timed state machine.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Detector creation, arrow-event classification, timeout computation,
+      timeout-triggered flushing, and immediate flushing.
+    </in-scope>
+
+    <boundary name="Event source">
+      The caller delivers arrow events (up or down) paired with millisecond
+      timestamps. The detector never reads the clock itself. The source of
+      timestamps — system clock, event loop, or test harness — is outside scope.
+    </boundary>
+
+    <boundary name="Event consumer">
+      The caller receives a classification result for each operation and
+      decides what to do with it. How scroll and arrow events are acted upon
+      is outside scope.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Arrow direction">
+      <field name="direction" type="enumeration" note="two values: up or down" />
+    </contract>
+
+    <contract name="Classification result">
+      <field name="result" type="enumeration" note="one of: none, absorbed, scroll-up, scroll-down, arrow-up, arrow-down" />
+    </contract>
+
+    <contract name="Timeout">
+      <field name="milliseconds" type="signed 64-bit integer" note="-1 means no timeout needed; 0 means already expired; positive means milliseconds until flush" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <detector-creation order="1">
+      A new detector is created. Its state is set to idle. The burst
+      threshold is set to 5 milliseconds. The internal timer is initialized
+      to zero. The pending direction is set to up as an arbitrary placeholder;
+      this value is meaningless while the detector is idle.
+
+      If the parent context is null, the process aborts before any allocation
+      is attempted. If memory allocation fails, the process aborts immediately.
+
+      <notable reason="comment contradicts implementation">
+        The struct field storing the burst threshold carries the comment
+        "Timer duration (20ms)," but the value assigned during creation is
+        5 milliseconds.
+      </notable>
+    </detector-creation>
+
+    <arrow-processing order="2">
+      An arrow direction and a millisecond timestamp are submitted. The
+      detector computes the elapsed time as the difference between the
+      provided timestamp and the timestamp recorded when the current timer
+      was last started.
+
+      The detector's response depends on its current state and the elapsed
+      time.
+
+      <from-idle order="1">
+        When idle, the detector records the arrow direction as the pending
+        direction, records the current timestamp as the timer start, transitions
+        to the waiting state, and returns none. The arrow is buffered; no
+        classification is emitted.
+      </from-idle>
+
+      <from-waiting order="2">
+        <second-arrow-within-threshold order="1">
+          When waiting and the elapsed time is less than or equal to 5
+          milliseconds, a mouse-wheel burst is detected. The detector emits
+          a scroll-up result if the pending direction (the first arrow's
+          direction) is up, or a scroll-down result if the pending direction
+          is down. The timer start is reset to the current timestamp. The
+          detector transitions to the absorbing state.
+
+          <notable reason="direction based on first arrow, not second">
+            The scroll direction is determined by the pending direction, which
+            is the direction of the first arrow in the burst. The direction of
+            the second arrow that triggered burst detection is not used and has
+            no effect on the emitted result.
+          </notable>
+        </second-arrow-within-threshold>
+
+        <timer-expired-new-arrow-arrives order="2">
+          When waiting and the elapsed time exceeds 5 milliseconds, the
+          pending arrow is treated as a keyboard arrow. The detector emits
+          an arrow-up result if the pending direction is up, or arrow-down
+          if the pending direction is down. The arriving arrow then replaces
+          the pending direction, and the timer start is reset to the current
+          timestamp. The detector remains in the waiting state.
+
+          <notable reason="state stays waiting, not idle">
+            The old pending event is flushed and the new arrow is immediately
+            buffered in a single operation. The state never transitions through
+            idle; it stays in waiting for the newly buffered arrow.
+          </notable>
+        </timer-expired-new-arrow-arrives>
+      </from-waiting>
+
+      <from-absorbing order="3">
+        <additional-arrow-within-threshold order="1">
+          When absorbing and the elapsed time is less than or equal to 5
+          milliseconds, the arriving arrow is part of the ongoing burst. The
+          timer start is reset to the current timestamp. The detector returns
+          absorbed and remains in the absorbing state.
+        </additional-arrow-within-threshold>
+
+        <timer-expired-new-arrow-arrives order="2">
+          When absorbing and the elapsed time exceeds 5 milliseconds, the
+          burst has ended. The arriving arrow is recorded as the new pending
+          direction. The timer start is reset to the current timestamp. The
+          detector transitions to the waiting state and returns none.
+        </timer-expired-new-arrow-arrives>
+      </from-absorbing>
+
+    </arrow-processing>
+
+    <timeout-checking order="3">
+      A millisecond timestamp is submitted. The detector checks whether a
+      buffered event has been waiting longer than the burst threshold.
+
+      <idle-check order="1">
+        When idle, none is returned immediately. No elapsed time is computed.
+      </idle-check>
+
+      <within-threshold order="2">
+        When waiting or absorbing, and the elapsed time is less than or equal
+        to 5 milliseconds, none is returned. The timer has not expired.
+      </within-threshold>
+
+      <expired-from-waiting order="3">
+        When waiting and the elapsed time exceeds 5 milliseconds, the single
+        buffered arrow is classified as a keyboard event. The detector emits
+        arrow-up if the pending direction is up, or arrow-down if the pending
+        direction is down. The detector transitions to idle.
+      </expired-from-waiting>
+
+      <expired-from-absorbing order="4">
+        When absorbing and the elapsed time exceeds 5 milliseconds, the burst
+        window has closed. The detector transitions to idle and returns none.
+        No event is emitted because the scroll event was already emitted when
+        the burst was first detected.
+      </expired-from-absorbing>
+    </timeout-checking>
+
+    <timeout-computation order="4">
+      A millisecond timestamp is submitted. The detector reports how many
+      milliseconds remain until a flush is required.
+
+      <idle-computation order="1">
+        When idle, -1 is returned. No timeout is needed.
+      </idle-computation>
+
+      <active-computation order="2">
+        When waiting or absorbing, the remaining time is computed as the
+        burst threshold minus the elapsed time.
+
+        If the remaining time is negative, 0 is returned to indicate that
+        the timer has already expired.
+
+        If the remaining time is zero or positive, that value is returned
+        as the number of milliseconds until the timeout fires.
+
+        <notable reason="inconsistency with threshold boundary">
+          When the elapsed time equals exactly 5 milliseconds, the remaining
+          time is zero, and this operation returns 0 (indicating already
+          expired). However, arrow-processing and timeout-checking both treat
+          an elapsed time of exactly 5 milliseconds as within the burst window
+          (their comparisons are inclusive). A caller that observes a return
+          value of 0 here and immediately invokes timeout-checking with the
+          same timestamp will receive none rather than a flushed event.
+        </notable>
+      </active-computation>
+    </timeout-computation>
+
+    <immediate-flush order="5">
+      The detector is instructed to flush any pending buffered event
+      immediately, regardless of the timer.
+
+      <flush-from-waiting order="1">
+        When waiting, the buffered pending arrow is emitted as a keyboard
+        event: arrow-up if the pending direction is up, arrow-down if the
+        pending direction is down. The detector transitions to idle.
+      </flush-from-waiting>
+
+      <flush-from-idle-or-absorbing order="2">
+        When idle or absorbing, none is returned. The detector transitions to
+        idle regardless of which of these two states it was in.
+
+        <notable reason="absorbing flush discards burst state silently">
+          When the detector is in the absorbing state, flushing transitions
+          it to idle and returns none, without any indication that an
+          in-progress burst was interrupted. The scroll event was already
+          emitted when the burst was first detected, so no additional event
+          is needed; however, any remaining arrows in the burst that have not
+          yet been absorbed will begin a new detection cycle.
+        </notable>
+      </flush-from-idle-or-absorbing>
+    </immediate-flush>
+
+  </behavior>
+
+  <state-transitions>
+    <transition trigger="arrow received while idle">
+      Idle → Waiting
+    </transition>
+    <transition trigger="second arrow within 5ms while waiting">
+      Waiting → Absorbing (emits scroll event)
+    </transition>
+    <transition trigger="arrow received after 5ms while waiting">
+      Waiting → Waiting (emits keyboard arrow for old pending; new arrow becomes pending)
+    </transition>
+    <transition trigger="timeout fires while waiting (check-timeout)">
+      Waiting → Idle (emits keyboard arrow)
+    </transition>
+    <transition trigger="flush called while waiting">
+      Waiting → Idle (emits keyboard arrow)
+    </transition>
+    <transition trigger="arrow received within 5ms while absorbing">
+      Absorbing → Absorbing (returns absorbed)
+    </transition>
+    <transition trigger="arrow received after 5ms while absorbing">
+      Absorbing → Waiting (new arrow becomes pending; returns none)
+    </transition>
+    <transition trigger="timeout fires while absorbing (check-timeout)">
+      Absorbing → Idle (returns none)
+    </transition>
+    <transition trigger="flush called while absorbing">
+      Absorbing → Idle (returns none)
+    </transition>
+  </state-transitions>
+
+</specification>
