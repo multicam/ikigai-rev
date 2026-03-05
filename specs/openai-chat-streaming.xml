@@ -1,0 +1,276 @@
+<specification topic="OpenAI Chat Completions Streaming">
+
+  <topic-statement>
+    The OpenAI Chat Completions streaming system processes server-sent events
+    from the Chat Completions API and emits normalized stream events in real time.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      SSE line parsing, JSON event dispatch, lazy START emission, text delta
+      forwarding, finish reason accumulation, usage extraction, DONE marker
+      handling, in-stream error detection, and final response assembly.
+    </in-scope>
+
+    <boundary name="HTTP Multiplexer">
+      Raw bytes arrive from the HTTP layer via a write callback. The callback
+      receives a chunk of bytes and a length. This topic processes those bytes.
+      The completion callback is invoked by the HTTP layer after the transfer ends.
+    </boundary>
+
+    <boundary name="SSE Parser">
+      This topic performs its own manual SSE line extraction rather than
+      delegating to the shared SSE parser. The shared SSE parser is used by
+      other providers.
+    </boundary>
+
+    <boundary name="OpenAI Responses Streaming">
+      When the model is routed to the Responses API, the write callback
+      delegates all processing to the Responses streaming system. This
+      specification covers only the Chat Completions path.
+    </boundary>
+
+    <boundary name="Stream Event Consumer">
+      Parsed events are delivered to an external callback. This topic does not
+      define what the consumer does with the events.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Streaming Context">
+      <field name="model" type="text" nullable="true" note="null until extracted from first event" />
+      <field name="finish reason" type="enum" note="default UNKNOWN; updated by each delta" />
+      <field name="started" type="boolean" note="false until first text delta triggers START" />
+      <field name="input tokens" type="integer" note="zero until usage chunk arrives" />
+      <field name="output tokens" type="integer" note="zero until usage chunk arrives" />
+      <field name="thinking tokens" type="integer" note="zero until usage chunk arrives" />
+      <field name="total tokens" type="integer" note="zero until usage chunk arrives" />
+    </contract>
+
+    <contract name="Built Response">
+      <field name="model" type="text" nullable="true" />
+      <field name="finish reason" type="enum" />
+      <field name="input tokens" type="integer" />
+      <field name="output tokens" type="integer" />
+      <field name="thinking tokens" type="integer" />
+      <field name="total tokens" type="integer" />
+      <field name="content blocks" type="array" nullable="true" note="null or single tool call block" />
+    </contract>
+
+    <contract name="Tool Call Content Block">
+      <field name="type" type="enum" note="TOOL_CALL" />
+      <field name="id" type="text" />
+      <field name="name" type="text" />
+      <field name="arguments" type="text" note='defaults to "{}" if accumulated args were null' />
+      <field name="thought signature" type="text" nullable="true" note="always null for Chat API" />
+    </contract>
+
+    <contract name="Finish Reason Mapping">
+      <field name="stop" type="text" note="maps to STOP" />
+      <field name="length" type="text" note="maps to LENGTH" />
+      <field name="tool_calls" type="text" note="maps to TOOL_USE" />
+      <field name="content_filter" type="text" note="maps to CONTENT_FILTER" />
+      <field name="error" type="text" note="maps to ERROR" />
+      <field name="null or unknown" type="text" note="maps to UNKNOWN" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <sse-line-parsing order="1">
+      When bytes arrive from the HTTP layer, they are appended to an internal
+      line buffer. The buffer is scanned for newline characters. Each complete
+      line (terminated by a newline) is examined. Lines beginning with the
+      prefix "data: " have the prefix stripped and the remainder is treated as
+      an SSE event payload. Lines without this prefix are ignored.
+
+      After extracting all complete lines, any remaining partial line (bytes
+      after the last newline) is preserved in the buffer for the next chunk.
+      When no partial line remains, the buffer is released entirely.
+
+      <notable reason="no-carriage-return-handling">
+        Only newline ('\n') is used as the line terminator. Carriage returns
+        are not stripped. If server sends '\r\n' line endings, the '\r' remains
+        in the extracted payload.
+      </notable>
+    </sse-line-parsing>
+
+    <event-dispatch order="2">
+      Each extracted SSE payload is dispatched to the event processor. The
+      processor first checks whether the payload is the literal string "[DONE]".
+      If so, the done-marker path executes. Otherwise, the payload is parsed as
+      JSON. If JSON parsing fails, the event is silently discarded and processing
+      continues with the next event.
+
+      For successfully parsed JSON, the processor checks in order:
+      1. Whether the root object contains an "error" field — if so, the error path executes.
+      2. Whether the model has been extracted yet — if not, it is extracted now.
+      3. Whether there is a choices array with at least one choice containing a delta.
+      4. Whether there is a usage object.
+
+      <malformed-json order="1">
+        If the SSE payload is not valid JSON, the event is silently dropped.
+        No error is emitted. Streaming continues with subsequent events.
+      </malformed-json>
+
+      <error-in-event order="2">
+        When the root JSON object contains an "error" field whose value is an
+        object, the error object is processed immediately. The message field
+        and type field are extracted from it. The type string is mapped to
+        an error category:
+        - "authentication" or "permission" → AUTH
+        - "rate_limit" → RATE_LIMIT
+        - "invalid_request" → INVALID_ARG
+        - "server" or "service" → SERVER
+        - All other values → UNKNOWN
+
+        An ERROR stream event is emitted with the category and message. After
+        the error event, processing of the current JSON document stops. No
+        further events from this document are emitted.
+
+        <notable reason="no-done-event-after-error">
+          When the stream delivers an error inside a JSON event, a DONE event
+          is never emitted for that stream. The HTTP transfer still completes
+          normally, and the completion callback is still invoked.
+        </notable>
+      </error-in-event>
+    </event-dispatch>
+
+    <model-extraction order="3">
+      The model identifier is extracted from the first event that contains a
+      non-null "model" field. Once set, the model is not updated by subsequent
+      events. The model is stored and later included in the START event and the
+      built response.
+
+      If the first event lacks a model field, the model remains null until a
+      later event provides it. If no event provides it, the model is null in
+      the final response.
+    </model-extraction>
+
+    <lazy-start-emission order="4">
+      The START stream event is not emitted at the beginning of the HTTP
+      transfer. Instead, it is deferred until the first text content delta
+      arrives. This is tracked by a boolean flag initialized to false at
+      context creation.
+
+      When a text delta is about to be emitted and the flag is false, the START
+      event is emitted first with the model identifier (which may be null if not
+      yet extracted). The flag is then set to true. All subsequent text deltas
+      emit only TEXT_DELTA events.
+
+      <notable reason="start-may-never-fire">
+        If the stream produces no text content deltas — for example, if the
+        stream consists only of an error event, or if the stream ends before
+        any content arrives — the START event is never emitted. Any consumer
+        that requires a START event before processing deltas must handle the
+        absence of START.
+      </notable>
+
+      <notable reason="tool-calls-do-not-trigger-start">
+        The Chat Completions API code paths for tool calls do not call the
+        lazy-start check. A stream that produces only tool call deltas and no
+        text content would never emit a START event. However, tool call paths
+        in Chat Completions streaming are excluded from active use, so this
+        path is not currently reachable.
+      </notable>
+    </lazy-start-emission>
+
+    <text-delta-processing order="5">
+      When a delta object in the choices array contains a "content" field with a
+      string value, the lazy-start check fires (emitting START if not yet emitted),
+      and then a TEXT_DELTA event is emitted with that string value.
+
+      If the content field is absent, null, or not a string, no TEXT_DELTA is
+      emitted for that delta. Processing continues normally.
+
+      The text pointer delivered in the TEXT_DELTA event points directly into the
+      parsed JSON document, which is valid only for the duration of the callback.
+
+      <notable reason="no-copy">
+        The text value is not copied before emission. If the consumer retains
+        the pointer after the callback returns, the behavior is undefined.
+      </notable>
+    </text-delta-processing>
+
+    <finish-reason-accumulation order="6">
+      Each delta object may contain a "finish_reason" field. If present and
+      non-null, its string value is mapped to an internal finish reason and
+      stored in the context, replacing any previously stored value. The mapping
+      is:
+      - "stop" → STOP
+      - "length" → LENGTH
+      - "tool_calls" → TOOL_USE
+      - "content_filter" → CONTENT_FILTER
+      - "error" → ERROR
+      - null or any other value → UNKNOWN
+
+      The stored finish reason is used when the DONE event is emitted.
+    </finish-reason-accumulation>
+
+    <done-marker-processing order="7">
+      When the SSE payload is the literal string "[DONE]", the done path executes.
+      Any in-progress tool call state is finalized. A DONE stream event is emitted
+      with the accumulated finish reason and usage counters. No further stream
+      events are emitted after the DONE event.
+
+      <notable reason="done-before-usage">
+        The [DONE] marker and the usage-carrying event typically arrive together
+        in the same HTTP chunk, but usage is extracted from the JSON chunk that
+        precedes [DONE]. If no usage event was delivered before [DONE], all
+        token counts are zero in the DONE event.
+      </notable>
+    </done-marker-processing>
+
+    <usage-extraction order="8">
+      When a JSON event contains a "usage" field that is an object, the
+      following fields are extracted and stored in the context, overwriting any
+      previously stored values:
+      - "prompt_tokens" → input token count
+      - "completion_tokens" → output token count
+      - "completion_tokens_details.reasoning_tokens" → thinking token count
+      - "total_tokens" → total token count
+
+      If any field is absent or is not a number, the corresponding counter
+      retains its previous value (zero by default).
+
+      If "completion_tokens_details" is absent, the thinking token count
+      remains zero.
+    </usage-extraction>
+
+    <completion-callback order="9">
+      After the HTTP transfer completes, the completion callback is invoked.
+      The callback assembles the final response from the accumulated streaming
+      context and delivers it to the caller.
+
+      The final response contains:
+      - The model identifier (may be null)
+      - The final accumulated finish reason
+      - The final accumulated usage counters
+      - A content blocks array: if a tool call was accumulated (both tool ID
+        and tool name are non-null), a single TOOL_CALL block is created with
+        the accumulated ID, name, arguments, and a null thought_signature.
+        If no tool call was accumulated, the content blocks array is null with
+        count zero.
+
+      If the accumulated arguments for a tool call are null, the arguments
+      field in the content block defaults to "{}".
+
+      <notable reason="chat-api-no-tool-calls">
+        The Chat Completions streaming path does not emit TOOL_CALL_START or
+        TOOL_CALL_DELTA events and does not accumulate tool call state. The
+        thought_signature in the response is always null. The content blocks
+        array in the response is always null with count zero for Chat API
+        responses in the current implementation.
+      </notable>
+
+      <notable reason="chat-api-no-thinking">
+        The Chat Completions streaming path does not emit THINKING_DELTA events.
+        Thinking content is not present in Chat Completions responses. The
+        thinking token count in usage is sourced from
+        completion_tokens_details.reasoning_tokens if present.
+      </notable>
+    </completion-callback>
+
+  </behavior>
+
+</specification>

@@ -1,0 +1,170 @@
+<specification topic="Google Streaming Response Builder">
+
+  <topic-statement>
+    The Google streaming response builder assembles the final response record
+    from state accumulated during a completed streaming session.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Final response assembly from streaming context, finish reason override for
+      tool calls, content block construction, thought signature inclusion, and
+      default argument substitution.
+    </in-scope>
+
+    <boundary name="Google Streaming Events">
+      How streaming events are processed and how context state is accumulated
+      (tool ID, name, arguments, thought signature, finish reason, usage) is
+      covered by the Google Streaming Events specification. This specification
+      covers only what happens after all streaming events have been processed.
+    </boundary>
+
+    <boundary name="HTTP Completion">
+      The HTTP layer detects transfer completion and invokes the completion
+      handler. HTTP status code to error category mapping occurs at that layer.
+      This specification covers the response assembly that occurs within the
+      success path of the completion handler.
+    </boundary>
+
+    <boundary name="Stream Event Consumer">
+      The response is delivered to the consumer via the completion callback.
+      This specification covers only how the response is built, not how it is
+      consumed.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Accumulated Streaming State">
+      <field name="model" type="text" nullable="true" note="null if not extracted during streaming" />
+      <field name="finish reason" type="enum" note="last value from stream; may be UNKNOWN" />
+      <field name="input tokens" type="integer" />
+      <field name="output tokens" type="integer" note="already excludes thinking tokens" />
+      <field name="thinking tokens" type="integer" />
+      <field name="total tokens" type="integer" />
+      <field name="current tool id" type="text" nullable="true" note="non-null if tool call was opened" />
+      <field name="current tool name" type="text" nullable="true" note="non-null if tool call was opened" />
+      <field name="current tool args" type="text" nullable="true" note="accumulated argument string" />
+      <field name="current tool thought signature" type="text" nullable="true" note="last stored signature; prior signatures are discarded" />
+    </contract>
+
+    <contract name="Response">
+      <field name="model" type="text" nullable="true" />
+      <field name="finish reason" type="enum" />
+      <field name="input tokens" type="integer" />
+      <field name="output tokens" type="integer" />
+      <field name="thinking tokens" type="integer" />
+      <field name="total tokens" type="integer" />
+      <field name="content blocks" type="array" nullable="true" note="null or single element" />
+      <field name="content count" type="integer" note="0 or 1" />
+    </contract>
+
+    <contract name="Tool Call Content Block">
+      <field name="type" type="enum" note="TOOL_CALL" />
+      <field name="id" type="text" />
+      <field name="name" type="text" />
+      <field name="arguments" type="text" note='default "{}" when accumulated args are null' />
+      <field name="thought signature" type="text" nullable="true" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <thought-signature-single-slot order="1">
+      During streaming, when a content part carries both a thoughtSignature
+      field and a functionCall field, the thought signature is stored in a
+      single context slot. If a subsequent part also carries a thoughtSignature
+      with a functionCall, the new value replaces the previously stored value.
+      No history of prior signatures is kept. The final value in the slot at
+      stream completion is the one included in the response.
+
+      <notable reason="replacement-not-append">
+        Thought signatures are not concatenated or accumulated. Each new
+        signature entirely replaces the previous. If multiple function call
+        parts appear with different thought signatures, only the last one
+        survives into the response.
+      </notable>
+
+      <notable reason="signature-lost-without-tool-call">
+        If a part carries a thought signature but is not a function call part,
+        the thought signature is not stored. Only signatures adjacent to
+        function calls are retained.
+      </notable>
+    </thought-signature-single-slot>
+
+    <response-assembly order="2">
+      The response is allocated and populated from accumulated streaming state:
+
+      <model-copy order="1">
+        The model value from the streaming context is copied into the response.
+        If the streaming context has no model (it was never received), the
+        response model is null.
+      </model-copy>
+
+      <finish-reason-default order="2">
+        The accumulated finish reason is copied into the response as the default.
+        This value may then be overridden in the tool-call path (see below).
+      </finish-reason-default>
+
+      <usage-copy order="3">
+        The accumulated usage counters (input tokens, output tokens, thinking
+        tokens, total tokens) are copied into the response without modification.
+      </usage-copy>
+
+      <tool-call-detection order="4">
+        The presence of a tool call is determined by checking whether both
+        the tool ID and the tool name in the accumulated state are non-null.
+        If either is null, no tool call block is produced.
+      </tool-call-detection>
+
+      <tool-call-content-block order="5">
+        When a tool call is detected, the finish reason in the response is
+        overridden to TOOL_USE, regardless of the finish reason that was
+        accumulated from the stream. The content block array is allocated with
+        one element.
+
+        The tool call content block is populated:
+        - Type: TOOL_CALL
+        - ID: copied from accumulated tool ID
+        - Name: copied from accumulated tool name
+        - Arguments: copied from accumulated tool arguments string. If the
+          accumulated arguments are null, the arguments field is set to "{}".
+        - Thought signature: copied from the accumulated thought signature slot.
+          If the slot is null, the thought signature field is null.
+
+        <notable reason="finish-reason-override">
+          Even if the Google API returned a "STOP" finish reason in the stream,
+          the response finish reason is unconditionally set to TOOL_USE when a
+          tool call is present in the accumulated state. The streamed finish
+          reason is discarded.
+        </notable>
+      </tool-call-content-block>
+
+      <no-tool-call-path order="6">
+        When no tool call is detected (either tool ID or tool name is null),
+        the content blocks field is set to null and the content count is set
+        to zero. The finish reason retains the value accumulated from the stream.
+      </no-tool-call-path>
+
+    </response-assembly>
+
+    <non-streaming-thought-signature-extraction order="3">
+      A separate extraction operation exists for non-streaming responses. It
+      searches a complete JSON response for a thought signature in two locations:
+      first at the root level, then within the first candidate object. If a
+      non-empty string is found in either location, it is serialized as a JSON
+      object with a "thought_signature" key and returned as a string. If not
+      found in either location, or if the value is an empty string, null is
+      returned.
+
+      This extraction is only invoked for models in the Gemini 3 series.
+
+      <notable reason="different-from-streaming">
+        This extraction path operates on a complete response document, not on
+        streaming context. It is a distinct operation from the per-part
+        signature storage that occurs during streaming.
+      </notable>
+    </non-streaming-thought-signature-extraction>
+
+  </behavior>
+
+</specification>
