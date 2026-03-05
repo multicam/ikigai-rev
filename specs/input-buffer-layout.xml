@@ -1,0 +1,98 @@
+<specification topic="Input Buffer Layout">
+
+  <topic-statement>
+    The input buffer layout system calculates and caches the number of physical
+    terminal rows occupied by the input buffer's text content.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Computing physical line count from logical text lines and terminal width,
+      with dirty-flag-based caching; display width calculation for UTF-8 text with
+      ANSI escape sequence exclusion; layout invalidation.
+    </in-scope>
+
+    <boundary name="Input Buffer Text">
+      This topic reads the current text content and byte length from the input buffer.
+      It does not modify the text.
+    </boundary>
+
+    <boundary name="ANSI Escape Sequence Skipping">
+      This topic delegates ANSI CSI escape sequence detection to the ANSI parsing
+      system to obtain a byte skip count for each sequence encountered.
+    </boundary>
+  </scope>
+
+  <behavior>
+
+    <invalidate-layout order="1">
+      The layout cache is marked dirty. Any subsequent call to ensure layout will
+      trigger a full recalculation regardless of whether the terminal width has changed.
+    </invalidate-layout>
+
+    <ensure-layout order="2">
+      The cached physical line count is updated to reflect the current text content
+      and terminal width.
+
+      <cache-check order="1">
+        If the layout is not dirty and the cached terminal width equals the supplied
+        terminal width, the operation returns immediately without recalculation.
+      </cache-check>
+
+      <empty-buffer order="2">
+        If the text is empty (null or zero length), the physical line count is set
+        to zero. The cached width is updated and the dirty flag is cleared.
+      </empty-buffer>
+
+      <line-scan order="3">
+        The text is scanned one byte at a time. At each newline character or at the
+        end of the text, the display width of the preceding segment (from the previous
+        boundary to the current position) is computed, and the number of physical
+        rows that segment occupies is added to a running total.
+
+        <display-width-calculation order="1">
+          Display width is calculated by iterating through the segment:
+
+          - ANSI CSI escape sequences are detected and skipped entirely; they
+            contribute zero width.
+          - Each remaining UTF-8 codepoint is decoded. Invalid UTF-8 bytes are
+            treated as one column each, and decoding advances by one byte.
+          - Valid codepoints contribute their Unicode display width (as defined
+            by the Unicode standard for terminal display), which may be 0, 1, or 2.
+
+          The total display width of the segment is the sum of all column widths.
+        </display-width-calculation>
+
+        <physical-lines-per-segment order="2">
+          Given a segment's display width and the terminal width:
+
+          - A segment with zero byte length (an empty line, i.e. consecutive
+            newlines or a leading newline) contributes exactly 1 physical row.
+          - A segment with zero display width (contains only zero-width characters)
+            contributes exactly 1 physical row.
+          - Otherwise, the number of physical rows is the ceiling of
+            (display_width / terminal_width), computed as integer division with
+            rounding up: (display_width + terminal_width - 1) / terminal_width.
+
+          <unreachable reason="terminal_width is always positive in all callers">
+            If terminal_width is zero or negative, the segment contributes exactly
+            1 physical row.
+          </unreachable>
+        </physical-lines-per-segment>
+      </line-scan>
+
+      <cache-update order="4">
+        After all segments are processed, the total physical line count is stored
+        in the cache. The cached terminal width is updated to the supplied width,
+        and the dirty flag is cleared.
+      </cache-update>
+    </ensure-layout>
+
+    <get-physical-lines order="3">
+      Returns the cached physical line count. The returned value reflects the last
+      completed call to ensure layout; no recalculation is performed.
+    </get-physical-lines>
+
+  </behavior>
+
+</specification>

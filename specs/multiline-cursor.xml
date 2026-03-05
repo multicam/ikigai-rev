@@ -1,0 +1,202 @@
+<specification topic="Multiline Cursor Navigation">
+
+  <topic-statement>
+    The multiline cursor navigation system moves the cursor vertically between lines
+    and to line boundaries within the input buffer's text.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Cursor movement up one line, down one line, to the start of the current line,
+      to the end of the current line; deletion of text from cursor to end of line;
+      deletion of an entire line. Sticky target column behavior across vertical moves.
+    </in-scope>
+
+    <boundary name="Input Buffer Text">
+      This topic reads and modifies the text content and byte length of the input buffer.
+    </boundary>
+
+    <boundary name="Cursor Position">
+      This topic updates the cursor's byte offset and screen position by delegating
+      to the cursor positioning system. It reads the current byte offset from the cursor.
+    </boundary>
+
+    <boundary name="Layout Cache">
+      After text-modifying operations, this topic signals that the layout cache is
+      invalid.
+    </boundary>
+
+    <boundary name="Byte Array Deletion">
+      This topic deletes individual bytes from the input buffer's backing byte array
+      by index.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Input Buffer State">
+      <field name="cursor byte offset" type="size_t" note="current position in text, in bytes" />
+      <field name="target column" type="size_t" note="saved grapheme column for sticky vertical movement; 0 means not set or column 0" />
+      <field name="physical lines" type="size_t" note="cached layout value; modified by layout invalidation" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <grapheme-unit-counting order="1">
+      Several operations within this topic count grapheme units within a byte range
+      to determine column positions.
+
+      Each UTF-8 byte sequence — whether ASCII (1 byte), two-byte, three-byte, or
+      four-byte — is counted as exactly one grapheme unit.
+
+      <notable reason="no grapheme cluster joining">
+        Multi-codepoint grapheme clusters (such as emoji with modifiers or combining
+        characters) are counted as multiple grapheme units, one per codepoint. The
+        system does not join codepoints into clusters.
+      </notable>
+
+      <notable reason="no ANSI escape exclusion">
+        ANSI escape sequences are not detected or excluded during grapheme counting.
+        If ANSI sequences are present in the text, the column positions calculated
+        by vertical navigation operations will not correspond to visual columns.
+        (The layout system's display-width calculation does exclude ANSI sequences,
+        but this topic's grapheme counting does not.)
+      </notable>
+
+      If an invalid UTF-8 byte is encountered (a byte that does not match the leading
+      byte pattern of any valid UTF-8 sequence), the process terminates immediately
+      with a diagnostic message.
+    </grapheme-unit-counting>
+
+    <cursor-up order="2">
+      The cursor moves to the previous line at the same grapheme column, if possible.
+
+      <no-op-conditions order="1">
+        If the input buffer is empty, the operation is a no-op. If the cursor is on
+        the first line (no newline exists before the cursor position), the operation
+        is a no-op.
+      </no-op-conditions>
+
+      <column-and-target-save order="2">
+        The current column position is counted as the number of grapheme units from
+        the start of the current line to the cursor. If the target column has not
+        yet been saved (the stored value is zero), it is set to the current column.
+
+        <notable reason="column-zero ambiguity">
+          The stored target column uses zero for both "not yet saved" and "column
+          zero." When the cursor is at the first grapheme position of a line, the
+          saved value is zero, which is indistinguishable from the initial unset
+          state. On subsequent vertical moves, the system behaves as if the target
+          column has not been saved, which causes it to use the current column
+          each time. The observable effect is correct — the cursor remains at
+          column zero — but the target-column memory does not persist across moves
+          when the cursor is at the start of a line.
+        </notable>
+      </column-and-target-save>
+
+      <previous-line-location order="3">
+        The previous line is bounded by its own start (position after the newline
+        preceding it, or position zero) and the newline character that terminates it
+        (the byte immediately before the start of the current line). The length of
+        the previous line in grapheme units is counted.
+      </previous-line-location>
+
+      <column-clamping order="4">
+        The desired column is the saved target column if it is greater than zero,
+        otherwise the current column. If the previous line is shorter than the
+        desired column, the cursor is placed at the end of the previous line. Otherwise,
+        it is placed at the desired column.
+      </column-clamping>
+
+      <cursor-update order="5">
+        The cursor byte offset and cursor screen position are updated to the new position.
+      </cursor-update>
+    </cursor-up>
+
+    <cursor-down order="3">
+      The cursor moves to the next line at the same grapheme column, if possible.
+
+      <no-op-conditions order="1">
+        If the input buffer is empty, the operation is a no-op. If the cursor is on
+        the last line (no newline exists at or after the cursor's current line end),
+        the operation is a no-op.
+      </no-op-conditions>
+
+      <column-and-target-save order="2">
+        Column saving follows the same rules as cursor-up, including the column-zero
+        ambiguity.
+      </column-and-target-save>
+
+      <next-line-location order="3">
+        The next line begins at the byte immediately after the newline that ends the
+        current line. The end of the next line is the position of its terminating
+        newline, or the end of text if there is none. The length of the next line in
+        grapheme units is counted.
+      </next-line-location>
+
+      <column-clamping order="4">
+        Column clamping follows the same rules as cursor-up.
+      </column-clamping>
+
+      <cursor-update order="5">
+        The cursor byte offset and cursor screen position are updated.
+      </cursor-update>
+    </cursor-down>
+
+    <cursor-to-line-start order="4">
+      The cursor moves to the first byte of the current line.
+
+      If the input buffer is empty, the operation is a no-op. If the cursor is
+      already at the line start, the operation is a no-op.
+
+      Otherwise, the cursor is moved to the position immediately after the most recent
+      newline before the cursor (or to position zero if no such newline exists). The
+      target column is reset to zero.
+    </cursor-to-line-start>
+
+    <cursor-to-line-end order="5">
+      The cursor moves to the position of the newline that terminates the current line,
+      or to the end of the text if the current line is the last line.
+
+      If the input buffer is empty, the operation is a no-op. If the cursor is already
+      at the line end, the operation is a no-op.
+
+      Otherwise, the cursor is moved to the line end position. The target column is
+      reset to zero.
+    </cursor-to-line-end>
+
+    <kill-to-line-end order="6">
+      All text from the cursor position to the end of the current line is deleted,
+      not including the newline character itself.
+
+      If the input buffer is empty, the operation is a no-op. If the cursor is already
+      at or past the line end position, the operation is a no-op.
+
+      Otherwise, each byte from the cursor position up to (but not including) the
+      newline character is deleted from the byte array one at a time, starting at
+      the cursor position on each iteration. After deletion, the cursor is synchronized
+      to the (now-modified) text at the same byte offset. The target column is reset
+      to zero. The layout cache is invalidated.
+    </kill-to-line-end>
+
+    <kill-line order="7">
+      The entire current line is deleted, including its terminating newline if present.
+
+      If the input buffer is empty, the operation is a no-op.
+
+      Otherwise, the current line's start and end positions are found. If a newline
+      follows the line end, it is included in the deletion range. Each byte in the
+      range (from line start to the byte after the newline, or to line end if no
+      newline follows) is deleted from the byte array one at a time, starting at the
+      line start position on each iteration.
+
+      After deletion, the cursor is placed at the position where the deleted line
+      began (which is now the beginning of what was the following line, or the end
+      of the buffer if the deleted line was the last). If this position exceeds the
+      new text length, the cursor is clamped to the text length. The target column
+      is reset to zero. The layout cache is invalidated.
+    </kill-line>
+
+  </behavior>
+
+</specification>

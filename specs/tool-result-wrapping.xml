@@ -1,0 +1,78 @@
+<specification topic="Tool Result Wrapping">
+
+  <topic-statement>
+    The tool result wrapping system encodes tool execution outcomes in a standard
+    JSON envelope that conveys success or failure.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Constructing a success envelope that embeds the original tool output JSON,
+      and constructing a failure envelope that carries an error message and error code.
+    </in-scope>
+
+    <boundary name="JSON Serialization">
+      This topic constructs JSON documents using the JSON library and serializes them
+      to strings. All allocations use a talloc-backed allocator tied to the caller's
+      context.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Success Envelope">
+      <field name="tool_success" type="boolean" note="always true" />
+      <field name="result" type="object" note="the original tool output JSON, copied verbatim" />
+    </contract>
+
+    <contract name="Failure Envelope">
+      <field name="tool_success" type="boolean" note="always false" />
+      <field name="error" type="string" note="human-readable error description" />
+      <field name="error_code" type="string" note="machine-readable error identifier" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <wrap-success order="1">
+      A tool result JSON string is received. It is parsed as a JSON value.
+
+      <invalid-json-fallback order="1">
+        If the tool result string is not valid JSON, the wrapping system produces
+        a failure envelope instead of a success envelope. The failure envelope carries
+        the error message "Tool returned invalid JSON" and the error code
+        "INVALID_OUTPUT".
+
+        <notable reason="null free on failed parse">
+          When JSON parsing fails, the parse result (which is null) is passed to the
+          memory release routine. Releasing a null pointer is a no-op in the memory
+          management system, so no harm results.
+        </notable>
+      </invalid-json-fallback>
+
+      <envelope-construction order="2">
+        A new JSON object is constructed as the root of a new document. A boolean
+        field named "tool_success" is set to true. The parsed tool result value is
+        copied into the new document and added under the key "result". The JSON
+        object is serialized to a string.
+      </envelope-construction>
+
+      <string-ownership order="3">
+        The serialized JSON string produced by the JSON library is owned by the
+        library and is copied into the caller's allocation context. The library
+        string and the parsed tool result document are then released. The copied
+        string is returned.
+      </string-ownership>
+    </wrap-success>
+
+    <wrap-failure order="2">
+      An error message string and an error code string are received. A JSON object is
+      constructed as the root of a new document. A boolean field named "tool_success"
+      is set to false. A string field named "error" is set to a copy of the error
+      message. A string field named "error_code" is set to a copy of the error code.
+      The object is serialized to a string, copied into the caller's allocation context,
+      and returned. The library string is released before returning.
+    </wrap-failure>
+
+  </behavior>
+
+</specification>

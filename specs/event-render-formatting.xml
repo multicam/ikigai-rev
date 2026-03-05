@@ -1,0 +1,142 @@
+<specification topic="Event Render Formatting">
+
+  <topic-statement>
+    The event render formatting system transforms stored tool call and tool result
+    records into display-ready strings.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Formatting tool call records and tool result records for display, including
+      prefix detection, JSON extraction, fallback to raw content, and null output handling.
+    </in-scope>
+
+    <boundary name="Tool Call Formatting">
+      This topic submits a tool call structure (id, name, arguments) and receives
+      a formatted, truncated display string. The format and truncation rules are
+      defined by the tool call formatting system.
+    </boundary>
+
+    <boundary name="Tool Result Formatting">
+      This topic submits a tool name and output string and receives a formatted,
+      truncated display string. The format and truncation rules are defined by the
+      tool result formatting system.
+    </boundary>
+
+    <boundary name="Format Buffer">
+      This topic creates a format buffer, appends text to it, and retrieves the
+      resulting string. Truncation is applied during append.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Tool Call Data JSON">
+      <field name="tool_call_id" type="string" note="required; if absent or not a string, falls back to raw content" />
+      <field name="tool_name" type="string" note="required; if absent or not a string, falls back to raw content" />
+      <field name="tool_args" type="string" note="required; if absent or not a string, falls back to raw content" />
+    </contract>
+
+    <contract name="Tool Result Data JSON">
+      <field name="name" type="string" note="required; if absent or not a string, falls back to raw formatter" />
+      <field name="output" type="string" required="false" nullable="true" note="if absent or not a string, null is passed to result formatter" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <format-tool-call order="1">
+      A stored tool call content string and its associated data JSON string are
+      submitted for display formatting.
+
+      <prefix-check order="1">
+        If the content string is non-null and begins with the tool request prefix,
+        the content string is returned as-is without further processing.
+      </prefix-check>
+
+      <null-data-fallback order="2">
+        If the data JSON string is null, the content string is returned as-is.
+      </null-data-fallback>
+
+      <json-parse order="3">
+        The data JSON string is parsed. If parsing fails, the content string is
+        returned as-is.
+      </json-parse>
+
+      <field-extraction order="4">
+        The parsed object is checked for string fields named "tool_call_id",
+        "tool_name", and "tool_args". If any of these fields is absent or is not
+        a string value, the JSON document is released and the content string is
+        returned as-is.
+      </field-extraction>
+
+      <formatting order="5">
+        The three string values are copied into the allocation context. A tool call
+        structure is assembled from the copied strings and submitted to the tool call
+        formatting system. The formatted, truncated result is returned. The JSON
+        document is released before returning.
+      </formatting>
+    </format-tool-call>
+
+    <format-tool-result order="2">
+      A stored tool result content string and its associated data JSON string are
+      submitted for display formatting.
+
+      <prefix-check order="1">
+        If the content string is non-null and begins with the tool response prefix,
+        the content string is returned as-is without further processing.
+      </prefix-check>
+
+      <null-data-fallback order="2">
+        If the data JSON string is null, the raw tool result formatter is applied
+        to the content string and its output is returned.
+      </null-data-fallback>
+
+      <json-parse order="3">
+        The data JSON string is parsed. If parsing fails, the raw tool result
+        formatter is applied to the content string and its output is returned.
+      </json-parse>
+
+      <field-extraction order="4">
+        The parsed object is checked for a string field named "name". If the field
+        is absent or is not a string value, the JSON document is released and the
+        raw tool result formatter is applied to the content string.
+
+        A field named "output" is also checked. If it is present and is a string
+        value, it is used as the output passed to the tool result formatter. If it
+        is absent or not a string, null is passed instead.
+
+        <notable reason="content parameter ignored when data_json is valid">
+          When the data JSON parses successfully and contains a valid "name" field,
+          the original content parameter is not used. The display output is derived
+          entirely from the "name" and "output" fields of the data JSON, even if the
+          original content string differs from those values.
+        </notable>
+      </field-extraction>
+
+      <formatting order="5">
+        The tool name and output (or null) are submitted to the tool result formatting
+        system. The formatted, truncated result is returned. The JSON document is
+        released before returning.
+      </formatting>
+    </format-tool-result>
+
+    <format-tool-result-raw order="3">
+      A raw content string is formatted with the tool response prefix applied and
+      the content truncated. This path is taken when no data JSON is available or
+      parseable for a tool result.
+
+      <prefix order="1">
+        The tool response prefix followed by a space is appended to a new format buffer.
+      </prefix>
+
+      <content order="2">
+        If the content string is null, the literal text "(no output)" is appended.
+        Otherwise, the content string is truncated and appended.
+      </content>
+
+      The resulting string from the format buffer is returned.
+    </format-tool-result-raw>
+
+  </behavior>
+
+</specification>
