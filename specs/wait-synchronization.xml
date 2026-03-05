@@ -88,10 +88,15 @@
            message and a null sender.
         3. A file descriptor watch is set on the database connection socket with
            a timeout capped at 50 milliseconds. If the watch returns a socket
-           error (other than an interrupted system call), the loop exits.
+           error other than an interrupted system call, the loop exits with the
+           result message set to "Select failed" and the sender set to null.
+           An interrupted system call causes the iteration to restart.
         4. Pending database notifications are consumed from the connection.
         5. The mailbox is checked. If a message is present, it is consumed, the
            sender identifier and message body are recorded, and the loop exits.
+           The consumed message is then deleted from the mailbox; if the deletion
+           fails, the failure is silently ignored and the message remains in the
+           inbox.
 
         <notable reason="mailbox is polled regardless of notification">
           The mailbox is checked after every socket event and after every 50
@@ -124,7 +129,19 @@
         and with name "undefined". A batch lookup of target agent display names
         is attempted; if successful, the "undefined" placeholders are replaced.
         If the name lookup fails for any reason, the "undefined" values are
-        retained without error.
+        retained without error. When the batch lookup succeeds but an individual
+        entry's name is null, the "undefined" placeholder for that target is also
+        retained.
+
+        <notable reason="target channel LISTEN errors silently ignored">
+          The notification channel registration for each target agent is performed
+          without checking the result. If a LISTEN fails for one or more targets,
+          the system continues with those channels unregistered. Notifications
+          from those targets will never wake the socket watch; the wait will rely
+          on the 50-millisecond polling interval to detect their state changes.
+          All channels, including those that were never successfully registered,
+          are submitted to UNLISTEN on teardown.
+        </notable>
       </setup>
 
       <poll-loop order="2">
@@ -141,14 +158,18 @@
              check is idempotent once resolved).
            - The calling agent's mailbox is checked for a message from this
              specific target. If found, the message is consumed, the entry status
-             is set to "received", and the message body is stored.
+             is set to "received", and the message body is stored. The consumed
+             message is then deleted; if the deletion fails, the failure is
+             silently ignored.
            - If no message was found, the target agent's record is retrieved. If
              the agent's status is "dead", the entry status is set to "dead". If
              the agent is idle, the entry status is set to "idle".
         4. If all entries have a status other than "running", the loop exits.
         5. A file descriptor watch is set on the database connection socket with
-           a timeout capped at 50 milliseconds. If an unrecoverable socket error
-           occurs, the loop exits.
+           a timeout capped at 50 milliseconds. If the watch returns a socket
+           error other than an interrupted system call, the loop exits with entries
+           in their current state and no result message set. An interrupted system
+           call causes the iteration to restart.
         6. Pending database notifications are consumed.
 
         <notable reason="50ms timeout minimum">
