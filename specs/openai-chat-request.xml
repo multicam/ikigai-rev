@@ -1,0 +1,178 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<specification topic="OpenAI Chat Request">
+
+  <topic-statement>
+    The OpenAI Chat Completions request builder serializes a canonical LLM
+    request into the Chat Completions API JSON format, applying schema
+    transformations required for strict mode compatibility.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      The structural layout of the Chat Completions request body, the tool
+      schema transformations applied for strict mode, tool choice mapping,
+      message assembly order, streaming configuration, and URL and header
+      construction.
+    </in-scope>
+
+    <boundary name="Message serialization">
+      How individual canonical messages are transformed into the Chat
+      Completions message object format is covered by the OpenAI message
+      serialization specification.
+    </boundary>
+
+    <boundary name="API routing">
+      The decision of whether to use the Chat Completions endpoint versus the
+      Responses endpoint is covered by the OpenAI API routing specification.
+    </boundary>
+
+    <boundary name="Reasoning effort">
+      The Chat Completions API does not carry a reasoning configuration object.
+      Reasoning effort for Chat Completions models is not part of this
+      serializer.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Tool definition">
+      <field name="name" type="text" note="function name as sent to the API" />
+      <field name="description" type="text" note="human-readable purpose of the tool" />
+      <field name="parameters" type="JSON text" note="JSON Schema string describing the function's parameters" />
+    </contract>
+
+    <contract name="Chat Completions request body">
+      <field name="model" type="text" note="provider-specific model identifier; required" />
+      <field name="messages" type="array" note="ordered list of message objects; begins with system message if present" />
+      <field name="max_completion_tokens" type="integer" note="present only when a positive token limit is set" />
+      <field name="stream" type="boolean" note="present and true only for streaming requests" />
+      <field name="stream_options" type="object" note="present only for streaming requests; contains include_usage: true" />
+      <field name="tools" type="array" note="present only when one or more tools are defined" />
+      <field name="tool_choice" type="text" note="present only when tools are defined" />
+      <field name="parallel_tool_calls" type="boolean" note="present only when tools are defined; always true" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <schema-transformation order="1">
+      Before any tool definition is included in the request, its parameter
+      schema is transformed to satisfy the requirements of OpenAI strict mode.
+      The transformations are applied in order:
+
+      First, all "format" fields are removed from the schema recursively.
+      Format validators such as "uri" are valid JSON Schema but are rejected
+      by the OpenAI API in strict mode. The removal traverses the full schema
+      graph: the top-level schema object, every property value within a
+      "properties" object, the "items" object for array types, and every
+      element of "oneOf", "anyOf", and "allOf" arrays. Nesting is handled
+      recursively at each level encountered during traversal.
+
+      Second, the "required" array is replaced wholesale with a new array
+      that contains the name of every key present in the "properties" object.
+      Any previously existing "required" array is discarded. If the schema
+      has no "properties" object the required array is left unchanged.
+
+      Third, "additionalProperties": false is appended to the parameter
+      schema object.
+
+      <notable reason="required array is rebuilt, not extended">
+        The existing "required" array, if any, is discarded and rebuilt from
+        scratch using the current set of property keys. Properties that were
+        not previously required become required. No attempt is made to merge
+        the old and new lists.
+      </notable>
+
+      <notable reason="format removal is schema-graph-wide">
+        The "format" key is removed from every object node visited in the
+        recursive traversal, not only from leaf nodes or top-level property
+        definitions. A schema with nested combinators receives format removal
+        at every depth.
+      </notable>
+    </schema-transformation>
+
+    <tool-serialization order="2">
+      Each tool definition is serialized as an object with two fields: "type"
+      set to the string "function", and "function" containing a nested object.
+      The nested function object contains the tool name, the tool description,
+      the transformed parameter schema under the key "parameters", and
+      "strict": true.
+
+      <notable reason="strict is on the function object, not the parameter schema">
+        The "strict": true field is placed on the function object alongside
+        "name", "description", and "parameters". It is not placed inside the
+        parameter schema itself.
+      </notable>
+    </tool-serialization>
+
+    <tool-choice-mapping order="3">
+      The canonical tool choice mode is mapped to a string for the
+      "tool_choice" field:
+
+      - Mode 0 (auto): "auto"
+      - Mode 1 (none): "none"
+      - Mode 2 (required): "required"
+      - Any unrecognized mode: "auto"
+
+      The "tool_choice" field is only included in the request when at least
+      one tool is present. When no tools are defined, "tool_choice" is omitted
+      entirely.
+    </tool-choice-mapping>
+
+    <message-assembly order="4">
+      The messages array is assembled as follows:
+
+      If the system prompt is non-null and non-empty, a message object with
+      role "system" and content set to the system prompt string is prepended
+      as the first element of the messages array.
+
+      The canonical conversation messages follow in their original order. Each
+      is serialized according to the message serialization rules for the Chat
+      Completions format.
+
+      <notable reason="system prompt is a message, not a top-level field">
+        Unlike the Responses API, the Chat Completions API embeds the system
+        prompt as the first element of the messages array with role "system".
+        There is no separate top-level field for it.
+      </notable>
+    </message-assembly>
+
+    <streaming-configuration order="5">
+      For streaming requests, two additional fields are added to the request
+      body: "stream": true, and a "stream_options" object containing
+      "include_usage": true. The "include_usage" flag causes the API to
+      include token usage counts in the final streaming chunk, enabling
+      accurate usage reporting at stream completion.
+
+      For non-streaming requests, neither "stream" nor "stream_options" is
+      included.
+    </streaming-configuration>
+
+    <parallel-tool-calls order="6">
+      When at least one tool is defined, "parallel_tool_calls": true is
+      included in the request body. This field is always set to true and is
+      never conditionally disabled. It is omitted entirely when no tools are
+      present.
+    </parallel-tool-calls>
+
+    <max-tokens-field order="7">
+      When a positive maximum output token count is set on the canonical
+      request, it is written to the field "max_completion_tokens". This field
+      name is specific to the Chat Completions API. When no limit is set the
+      field is omitted.
+    </max-tokens-field>
+
+    <url-construction order="8">
+      The endpoint URL is formed by appending "/v1/chat/completions" to the
+      configured base URL.
+    </url-construction>
+
+    <header-construction order="9">
+      Two HTTP headers are produced: "Content-Type: application/json" and
+      "Authorization: Bearer {api_key}" where {api_key} is the configured
+      credential. The headers are returned as a null-terminated array of
+      strings.
+    </header-construction>
+
+  </behavior>
+
+</specification>

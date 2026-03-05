@@ -1,0 +1,181 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<specification topic="OpenAI Message Serialization">
+
+  <topic-statement>
+    The OpenAI message serializer transforms canonical conversation messages
+    into the format required by the Chat Completions API or the Responses API,
+    producing distinct output structures for each API endpoint.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Role mapping from canonical roles to OpenAI role strings, the Chat
+      Completions message object format for tool results, tool calls, and
+      plain text messages, the Responses API item format for each content
+      block type, and the text block concatenation rule shared by both APIs.
+    </in-scope>
+
+    <boundary name="Chat request assembly">
+      The Chat Completions request builder calls the Chat message serializer
+      for each canonical message and places the result in the messages array.
+      The request-level assembly is covered by the OpenAI chat request
+      specification.
+    </boundary>
+
+    <boundary name="Responses request assembly">
+      The Responses API request builder calls the Responses message serializer
+      for each canonical message and accumulates items into the input array.
+      The request-level assembly is covered by the OpenAI responses request
+      specification.
+    </boundary>
+
+    <boundary name="Tool schema serialization">
+      Serialization of tool definitions (name, description, parameter schema)
+      is part of request building, not message serialization, and is covered
+      by the respective request builder specifications.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Canonical message">
+      <field name="role" type="enumeration" note="one of: user, assistant, tool" />
+      <field name="content blocks" type="ordered array" note="zero or more blocks of type text, tool_call, or tool_result" />
+    </contract>
+
+    <contract name="Canonical text block">
+      <field name="text" type="text" note="the plain text content" />
+    </contract>
+
+    <contract name="Canonical tool call block">
+      <field name="id" type="text" note="unique identifier for this tool call" />
+      <field name="name" type="text" note="name of the function being called" />
+      <field name="arguments" type="text" note="JSON-encoded argument object as a string" />
+    </contract>
+
+    <contract name="Canonical tool result block">
+      <field name="tool_call_id" type="text" note="identifier of the tool call this result responds to" />
+      <field name="content" type="text" note="the result text returned by the tool" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <role-mapping order="1">
+      Canonical roles map to OpenAI role strings as follows:
+
+      - user role: "user"
+      - assistant role: "assistant"
+      - tool role: "tool"
+
+      The role string appears in the "role" field of every Chat Completions
+      message object, and in the "role" field of text items in the Responses
+      API input array. Tool call and tool result items in the Responses API
+      format do not carry a "role" field.
+
+      <notable reason="panic on unknown role">
+        An unrecognized canonical role value causes an immediate abnormal
+        termination. There is no fallback or default mapping for unknown roles.
+      </notable>
+    </role-mapping>
+
+    <chat-completions-format order="2">
+      A Chat Completions message object is constructed as a single JSON object.
+      The content of that object depends on the message role and the types of
+      content blocks present:
+
+      <tool-result-message order="1">
+        When the message role is tool, the object contains four fields: "role"
+        set to "tool", "tool_call_id" taken from the first content block's
+        tool result identifier, and "content" taken from that block's result
+        text. The role is set before the tool-specific fields.
+
+        <notable reason="only the first block is used">
+          Only the first content block is examined for a tool result message.
+          If the block type is not a tool result, neither "tool_call_id" nor
+          "content" is added to the message object.
+        </notable>
+      </tool-result-message>
+
+      <tool-call-message order="2">
+        When the message contains at least one tool call content block
+        (regardless of role), the object contains "role" set to "assistant",
+        "content" set to null, and a "tool_calls" array. The "tool_calls"
+        array contains one entry per tool call content block in the message,
+        in their original order. Non-tool-call blocks are skipped. Each
+        entry in the array contains: "id" with the tool call identifier,
+        "type" set to "function", and a nested "function" object containing
+        "name" and "arguments" (the arguments JSON string passed through
+        verbatim as a string, not parsed).
+
+        <notable reason="content is null for tool call messages">
+          Tool call messages set "content" explicitly to null rather than
+          omitting the field. This is a required structure for the Chat
+          Completions API.
+        </notable>
+      </tool-call-message>
+
+      <text-message order="3">
+        For all other messages, the object contains "role" and "content". The
+        content is formed by concatenating all text blocks in the message with
+        "\n\n" as the separator between consecutive blocks. If there are no
+        text blocks, "content" is set to an empty string.
+      </text-message>
+
+      <notable reason="tool-result check takes precedence over tool-call check">
+        The role is inspected first. A message with role tool is treated as a
+        tool result message unconditionally. Only messages with other roles
+        are examined for tool call blocks.
+      </notable>
+    </chat-completions-format>
+
+    <responses-api-format order="3">
+      The Responses API serializer expands a single canonical message into
+      zero or more input array items. Each content block in the message is
+      translated individually into a separate item. Blocks are processed in
+      their original order. Content block types not recognized by the
+      serializer are silently skipped and produce no output item.
+
+      <text-block-item order="1">
+        A text block produces an object with two fields: "role" set to the
+        message's mapped role string, and "content" set to the text block's
+        text value. Each text block becomes its own item; blocks are not
+        concatenated across the array form.
+
+        <notable reason="no concatenation in array form">
+          In the Responses API array format, each text block becomes a
+          separate item with its own "role" and "content". The "\n\n"
+          concatenation rule applies only when a single user message with
+          text-only content triggers the string input path; it does not apply
+          to array-format serialization.
+        </notable>
+      </text-block-item>
+
+      <tool-call-block-item order="2">
+        A tool call block produces an object with four fields: "type" set to
+        "function_call", "call_id" set to the tool call identifier, "name"
+        set to the tool function name, and "arguments" set to the arguments
+        JSON string verbatim. No "role" field is present.
+      </tool-call-block-item>
+
+      <tool-result-block-item order="3">
+        A tool result block produces an object with three fields: "type" set
+        to "function_call_output", "call_id" set to the tool call identifier
+        this result responds to, and "output" set to the result content text.
+        No "role" field is present.
+      </tool-result-block-item>
+    </responses-api-format>
+
+    <text-concatenation-rule order="4">
+      Wherever the Chat Completions format assembles a text content string
+      from a message, and wherever the Responses API string input path
+      assembles its single string value, text blocks are joined using "\n\n"
+      as the separator. The separator is inserted only between consecutive
+      text blocks; it is not prepended before the first block or appended
+      after the last. Non-text blocks (tool calls, tool results) are excluded
+      from the concatenation entirely, neither contributing text nor affecting
+      separator placement.
+    </text-concatenation-rule>
+
+  </behavior>
+
+</specification>

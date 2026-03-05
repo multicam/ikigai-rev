@@ -1,0 +1,74 @@
+<specification topic="agent-message-management">
+  <topic-statement>The agent message management system maintains an array of conversation messages for an agent, supporting addition, clearing, and deep cloning.</topic-statement>
+
+  <scope>
+    <in-scope>Adding messages to an agent's in-memory array with capacity growth</in-scope>
+    <in-scope>Clearing all messages from an agent</in-scope>
+    <in-scope>Deep-cloning the full message array from one agent to another</in-scope>
+    <boundary name="persistence">Message persistence to the database is outside this system; these operations are in-memory only.</boundary>
+    <boundary name="message-construction">Construction of message and content block structs is outside this system.</boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="message">
+      <field name="role" type="string" />
+      <field name="kind" type="string" />
+      <field name="content" type="string" />
+      <field name="provider_metadata" type="string or null" />
+      <field name="interrupted" type="bool" />
+      <field name="content_blocks" type="array of content-block" />
+    </contract>
+    <contract name="content-block">
+      <field name="type" type="enum: TEXT | TOOL_CALL | TOOL_RESULT | THINKING | REDACTED_THINKING" />
+      <field name="text" type="string (TEXT, THINKING)" />
+      <field name="id" type="string (TOOL_CALL)" />
+      <field name="name" type="string (TOOL_CALL)" />
+      <field name="arguments" type="string (TOOL_CALL)" />
+      <field name="tool_call_id" type="string (TOOL_RESULT)" />
+      <field name="content" type="string (TOOL_RESULT)" />
+      <field name="is_error" type="bool (TOOL_RESULT)" />
+      <field name="signature" type="string or null (THINKING)" />
+      <field name="data" type="string (REDACTED_THINKING)" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+    <add-message order="1">
+      A message is appended to the agent's in-memory conversation array. The initial array capacity is 16 entries. When the current count reaches the capacity, the capacity doubles (16 to 32, 32 to 64, and so on). Memory ownership of the added message is transferred to the agent context, so the agent owns the message for the remainder of its lifetime.
+    </add-message>
+
+    <clear-messages order="2">
+      All messages held by the agent are freed at once by releasing the message array allocation, which also releases all child allocations (the messages themselves and their content). After clearing, the array pointer is set to null and the count is reset to zero. The agent holds no messages after this operation.
+    </clear-messages>
+
+    <clone-messages order="3">
+      All messages from a source agent are deep-copied into a destination agent. For each source message, a new message is constructed on the destination agent with deep copies of: role, kind, and content (text) strings; the provider_metadata string (only if non-null); and the interrupted flag.
+    </clone-messages>
+
+    <clone-content-blocks order="4">
+      For each cloned message, the content blocks array is allocated at the exact count of blocks in the source (no extra capacity). Each block is deep-copied according to its type:
+      - TEXT: copies the text string.
+      - TOOL_CALL: copies the id, name, and arguments strings.
+      - TOOL_RESULT: copies the tool_call_id and content strings, and copies the is_error flag.
+      - THINKING: copies the text string; the signature string is copied only if non-null.
+      - REDACTED_THINKING: copies the data string.
+      All string copies are deep (owned by the destination agent). Any out-of-memory condition during string duplication is fatal.
+    </clone-content-blocks>
+
+    <clone-insertion order="5">
+      After its content is deep-copied, each cloned message is added to the destination agent via the standard message-addition path, which means the destination array undergoes the same capacity-doubling growth as in normal additions.
+    </clone-insertion>
+  </behavior>
+
+  <notable reason="content-block-array-allocation-is-exact">
+    When cloning, the content block array for each message is allocated at the precise count of blocks, not at the doubled-capacity used for the top-level message array. This means cloned messages have no spare capacity in their content block arrays.
+  </notable>
+
+  <notable reason="provider-metadata-is-conditionally-copied">
+    The provider_metadata field is only deep-copied when it is non-null in the source message. A null provider_metadata remains null in the clone.
+  </notable>
+
+  <notable reason="signature-is-conditionally-copied">
+    For THINKING content blocks, the signature string is only deep-copied when it is non-null in the source. A null signature remains null in the clone.
+  </notable>
+</specification>

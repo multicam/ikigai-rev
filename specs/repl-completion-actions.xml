@@ -1,0 +1,176 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<specification topic="REPL Completion Actions">
+
+  <topic-statement>
+    The REPL completion action system manages tab completion lifecycle including
+    activation from character input, candidate selection via Tab, space-key
+    commit, and dismissal.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Completion activation and rebuild on character input, dismissal, Tab key
+      selection and immediate dismissal, space-key commit with trailing space,
+      input buffer text construction for command and argument completion contexts,
+      and original-input preservation across a completion session.
+    </in-scope>
+
+    <boundary name="Candidate generation">
+      How command and argument candidate lists are built and fuzzy-filtered from
+      the command registry and agent state is handled by the completion
+      subsystem and is out of scope here.
+    </boundary>
+
+    <boundary name="Input buffer">
+      How the input buffer stores text and manages cursor position is out of
+      scope here; this subsystem only calls into it to read the current text
+      and to replace it wholesale.
+    </boundary>
+
+    <boundary name="Completion panel rendering">
+      How the completion candidate list is displayed on screen is out of scope
+      here.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Completion context">
+      <field name="candidates" type="ordered list of text strings"
+             note="filtered and scored candidate entries" />
+      <field name="current index" type="non-negative integer"
+             note="zero-based position of the currently selected candidate" />
+      <field name="prefix" type="text"
+             note="the input text that was used to generate the candidate list" />
+      <field name="original input" type="text or null"
+             note="the full input buffer text captured before the first Tab press in this session; used to revert on Escape; null until first Tab" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <dismissal order="1">
+      Dismissing the completion context frees all associated memory and sets
+      the agent's completion pointer to null. If no completion context is
+      active at the time of dismissal, the operation is a no-op.
+    </dismissal>
+
+    <activation-on-character-input order="2">
+      After each character is inserted into the input buffer, the completion
+      context is rebuilt from the current buffer text.
+
+      If the buffer text begins with the character `/`, a new candidate list is
+      generated for the current text as a prefix. Before the existing completion
+      context is replaced, the original-input value is read from it if present
+      and preserved in a temporary allocation.
+
+      The existing completion context is then dismissed. If the new candidate
+      generation produces a non-null context, it is installed as the active
+      completion context. If the original-input value was preserved, it is
+      written into the new context's original-input field. If the new candidate
+      generation produces no context (no matches), original-input is freed and
+      no context is installed.
+
+      If the buffer text does not begin with `/`, the existing completion
+      context is dismissed and no new context is created.
+
+      <notable reason="original-input survives a context rebuild">
+        When the user continues typing while a completion context is active,
+        the context is rebuilt with the updated prefix. The original-input —
+        the text present before Tab was ever pressed in this session — is
+        carried forward into the rebuilt context. This ensures that Escape
+        can always revert to the pre-Tab state regardless of how much
+        additional typing occurred after the first Tab.
+      </notable>
+    </activation-on-character-input>
+
+    <tab-key-handling order="3">
+      Tab key behavior differs depending on whether a completion context is
+      currently active.
+
+      <tab-with-active-context order="1">
+        When a completion context is active at the time of the Tab keypress,
+        the following steps occur in order:
+
+        1. If the context's original-input field is null, the current input
+           buffer text is captured and stored as the original input. This
+           records the exact text present before any Tab-driven selection
+           modifies the buffer.
+
+        2. The current candidate index is advanced to the next candidate.
+
+        3. The input buffer is replaced with the text corresponding to the
+           newly selected candidate (see input text construction below).
+
+        4. The completion context is dismissed.
+      </tab-with-active-context>
+
+      <tab-without-active-context order="2">
+        When no completion context is active at the time of the Tab keypress,
+        one is created from the current input buffer text and the current
+        input is stored as original-input. The first candidate is selected
+        and the input buffer is replaced. The completion context is then
+        dismissed.
+
+        If the buffer is empty or does not begin with `/`, Tab has no effect.
+
+        If candidate generation produces no matches, Tab has no effect.
+      </tab-without-active-context>
+
+      <notable reason="completion is dismissed immediately after each Tab press">
+        Every Tab press results in the completion context being dismissed after
+        the input buffer is updated. The completion panel disappears after Tab.
+        If Tab is pressed again, a new context is created from the updated
+        buffer text. Because the buffer was just set to a complete candidate
+        name, the next context's candidates will be filtered against that name.
+      </notable>
+
+      <notable reason="no multi-step cycling through a persistent context">
+        There is no mechanism by which multiple Tab presses cycle through
+        candidates within a single persistent context. Each Tab press creates,
+        uses, and immediately discards a context.
+      </notable>
+    </tab-key-handling>
+
+    <space-key-commit order="4">
+      When the Space key is pressed while a completion context is active, the
+      selected candidate is committed and a trailing space is appended to the
+      replacement text.
+
+      The input buffer is replaced with the committed text (see input text
+      construction below, with a space as suffix). The completion context is
+      dismissed before the input buffer is updated.
+
+      After replacement, the cursor is moved to the end of the input line.
+    </space-key-commit>
+
+    <input-text-construction order="5">
+      When a candidate is to be placed into the input buffer, the replacement
+      text is constructed from the original-input (or the prefix field if
+      original-input is null) and the currently selected candidate.
+
+      The construction rule depends on whether the original text contains a
+      space character:
+
+      <argument-completion-text order="1">
+        If the original text contains a space, the completion is for a command
+        argument. The replacement text is formed by taking all characters from
+        the beginning of the original text up to and including the first space,
+        then appending the selected candidate text, then appending any suffix
+        (such as a trailing space for space-commit). The command name and the
+        space following it are preserved verbatim.
+      </argument-completion-text>
+
+      <command-completion-text order="2">
+        If the original text contains no space, the completion is for a command
+        name. The replacement text is formed by a literal `/` character followed
+        by the selected candidate text, then any suffix. The leading slash is
+        always present regardless of the original text.
+      </command-completion-text>
+
+      After construction, the input buffer is set to the replacement text and
+      the cursor is moved to the end of the line.
+    </input-text-construction>
+
+  </behavior>
+
+</specification>

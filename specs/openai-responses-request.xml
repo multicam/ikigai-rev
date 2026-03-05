@@ -1,0 +1,178 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<specification topic="OpenAI Responses Request">
+
+  <topic-statement>
+    The OpenAI Responses API request builder serializes a canonical LLM
+    request into the Responses API JSON format, selecting between a string
+    and an array representation for the input field based on conversation
+    structure.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      The structural layout of the Responses API request body, the input
+      field selection logic, system prompt placement as the "instructions"
+      field, reasoning configuration for reasoning models, tool schema
+      transformations for strict mode, tool choice mapping, and URL
+      construction.
+    </in-scope>
+
+    <boundary name="Message serialization">
+      How individual canonical messages are transformed into Responses API
+      input array items is covered by the OpenAI message serialization
+      specification.
+    </boundary>
+
+    <boundary name="API routing">
+      The decision of whether to use the Responses endpoint versus the Chat
+      Completions endpoint is covered by the OpenAI API routing specification.
+    </boundary>
+
+    <boundary name="Reasoning effort lookup">
+      The mapping from model identifier and thinking level to a specific
+      effort string is covered by the OpenAI API routing specification.
+    </boundary>
+
+    <boundary name="Header construction">
+      HTTP headers are identical for both OpenAI API endpoints; the Chat
+      request specification describes their construction.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Responses API request body">
+      <field name="model" type="text" note="provider-specific model identifier; required" />
+      <field name="instructions" type="text" note="system prompt; present only when non-null and non-empty" />
+      <field name="input" type="text or array" note="conversation input; string when single-user-text, array otherwise" />
+      <field name="max_output_tokens" type="integer" note="present only when a positive token limit is set" />
+      <field name="stream" type="boolean" note="present and true only for streaming requests" />
+      <field name="reasoning" type="object" note="present only for reasoning models that have a known effort string" />
+      <field name="tools" type="array" note="present only when one or more tools are defined" />
+      <field name="tool_choice" type="text" note="present only when tools are defined" />
+    </contract>
+
+    <contract name="Reasoning configuration object">
+      <field name="effort" type="text" note="model-specific effort string (e.g. 'low', 'medium', 'high', 'xhigh', 'minimal', 'none')" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <schema-transformation order="1">
+      The same three-step strict mode transformation applied by the Chat
+      Completions request builder is applied here identically: recursive
+      removal of all "format" fields from the schema graph, replacement of
+      the "required" array with a complete enumeration of all property keys,
+      and addition of "additionalProperties": false.
+
+      See the OpenAI Chat request specification for the full description of
+      this transformation.
+    </schema-transformation>
+
+    <tool-serialization order="2">
+      Tool definitions for the Responses API are serialized in a flat
+      structure, unlike the Chat Completions format which nests tool details
+      inside a "function" wrapper object. Each tool is an object with the
+      following fields at the top level: "type" set to "function", "name",
+      "description", "parameters" (the transformed schema), and "strict": true.
+
+      <notable reason="no function wrapper object">
+        The Responses API tool format places all fields directly on the tool
+        object. The "name", "description", "parameters", and "strict" fields
+        are siblings of "type", not children of a nested "function" object.
+        This is distinct from the Chat Completions format.
+      </notable>
+
+      <notable reason="parallel_tool_calls is absent">
+        Unlike the Chat Completions request builder, the Responses API builder
+        does not include a "parallel_tool_calls" field regardless of how many
+        tools are defined.
+      </notable>
+    </tool-serialization>
+
+    <tool-choice-mapping order="3">
+      Tool choice mode mapping is identical to the Chat Completions builder:
+      mode 0 produces "auto", mode 1 produces "none", mode 2 produces
+      "required", and any unrecognized mode produces "auto". The "tool_choice"
+      field is only included when at least one tool is present.
+    </tool-choice-mapping>
+
+    <system-prompt-placement order="4">
+      When the system prompt is non-null and non-empty, it is placed in a
+      top-level "instructions" field, not embedded in the input array. When
+      the system prompt is absent or empty, "instructions" is omitted from
+      the request body.
+
+      <notable reason="instructions is not a message">
+        The Responses API separates the system prompt from conversation
+        history entirely. It appears as its own top-level field rather than
+        as a role "system" element in the input array.
+      </notable>
+    </system-prompt-placement>
+
+    <input-field-selection order="5">
+      The "input" field takes one of two forms depending on the shape of the
+      canonical message list:
+
+      When the canonical request contains exactly one message, that message
+      has role "user", and it has at least one content block, the input is
+      serialized as a plain string. All text blocks from that single message
+      are concatenated with "\n\n" as the separator and the result becomes the
+      "input" string value. If no text blocks are present, the input is set to
+      an empty string.
+
+      In all other cases — multiple messages, a non-user role on the single
+      message, or an absent content block count — the input is serialized as
+      an array. Each message in the canonical list is expanded into one or
+      more array items according to the Responses API message serialization
+      rules.
+
+      <notable reason="only text blocks contribute to string input">
+        When constructing the string input from a single user message, only
+        content blocks of text type are included. Tool call and tool result
+        blocks within that message are silently ignored, and the concatenation
+        proceeds over text blocks only.
+      </notable>
+    </input-field-selection>
+
+    <reasoning-configuration order="6">
+      A "reasoning" object is added to the request body only when the model
+      is designated as a reasoning model and the reasoning effort lookup
+      returns a non-null effort string for that model and thinking level.
+
+      The reasoning object contains a single field, "effort", set to the
+      effort string returned by the lookup.
+
+      When the model is not a reasoning model, or when the effort lookup
+      returns null for the given model, the "reasoning" field is omitted
+      entirely.
+
+      <notable reason="effort string may be 'none'">
+        For certain models and thinking levels, the effort string is
+        "none", which explicitly disables reasoning. This is distinct from
+        the field being absent — "none" is transmitted to the API as a
+        deliberate instruction to suppress thinking output.
+      </notable>
+    </reasoning-configuration>
+
+    <max-tokens-field order="7">
+      When a positive maximum output token count is set on the canonical
+      request, it is written to the field "max_output_tokens". This field
+      name differs from the Chat Completions API, which uses
+      "max_completion_tokens". When no limit is set the field is omitted.
+    </max-tokens-field>
+
+    <streaming-configuration order="8">
+      For streaming requests, "stream": true is added to the request body.
+      Unlike the Chat Completions API, no "stream_options" object is included.
+      For non-streaming requests, the "stream" field is omitted.
+    </streaming-configuration>
+
+    <url-construction order="9">
+      The endpoint URL is formed by appending "/v1/responses" to the
+      configured base URL.
+    </url-construction>
+
+  </behavior>
+
+</specification>

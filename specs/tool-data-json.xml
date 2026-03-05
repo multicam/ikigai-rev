@@ -1,0 +1,93 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<specification topic="Tool Data JSON">
+
+  <topic-statement>
+    The tool data JSON builder constructs the structured JSON string stored in the
+    data_json column of tool call and tool result database records.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Construction of tool call data records including thinking and redacted-thinking
+      fields; construction of tool result data records including success derivation
+      from the tool output string.
+    </in-scope>
+
+    <boundary name="Database persistence">
+      The caller is responsible for supplying the produced JSON string to the database
+      layer. How and when the record is persisted is out of scope.
+    </boundary>
+
+    <boundary name="Tool call execution">
+      The tool call and tool result inputs to the builder — identifiers, names,
+      arguments, output strings, and thinking content — are produced by the tool
+      execution pipeline. Their origin and meaning are out of scope.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Tool call record fields">
+      <field name="tool_call_id" type="string" note="tool call identifier; always present" />
+      <field name="tool_name" type="string" note="name of the invoked tool; always present" />
+      <field name="tool_args" type="string" note="tool argument JSON as a string value (not a nested object); always present" />
+      <field name="thinking" type="object" note="optional; present only when thinking text is non-null; contains 'text' (string, always present when object is included) and optionally 'signature' (string, present only when thinking signature is non-null)" />
+      <field name="redacted_thinking" type="object" note="optional; present only when redacted thinking data is non-null; contains 'data' (string)" />
+    </contract>
+
+    <contract name="Tool result record fields">
+      <field name="tool_call_id" type="string" note="tool call identifier this result answers" />
+      <field name="name" type="string" note="tool name" />
+      <field name="output" type="string" note="the raw tool output string, stored verbatim" />
+      <field name="success" type="boolean" note="derived by parsing the output string as JSON and extracting the 'tool_success' boolean field; defaults to false if the output is not valid JSON, if parsing fails, or if the field is absent" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <tool-call-data-construction order="1">
+      A JSON object is built from the provided tool call record. The three required
+      fields — tool call identifier, tool name, and tool arguments — are always
+      present as string values.
+
+      When thinking text is provided (non-null), a nested "thinking" object is appended
+      to the root object. This nested object always contains the "text" field. If a
+      thinking signature is also provided (non-null), a "signature" field is added to
+      the nested object. If the signature is null, the "signature" field is omitted
+      entirely.
+
+      When redacted thinking data is provided (non-null), a separate nested
+      "redacted_thinking" object is appended to the root object, containing a single
+      "data" field with the redacted content.
+
+      Neither "thinking" nor "redacted_thinking" appears in the output object when their
+      respective inputs are null. Both may be present simultaneously, one, or neither,
+      depending on what is supplied.
+
+      The result is serialized to a compact JSON string, copied into a talloc-allocated
+      buffer owned by the provided talloc context, and returned. Any failure to allocate
+      memory causes an immediate panic.
+    </tool-call-data-construction>
+
+    <tool-result-data-construction order="2">
+      A JSON object is built from the provided tool result inputs. The tool call
+      identifier, tool name, and raw output string are always written as string fields.
+
+      The "success" boolean is derived by parsing the raw output string as JSON and
+      looking up a top-level "tool_success" boolean field. If parsing fails (the string
+      is not valid JSON), if the parsed document has no "tool_success" field, or if any
+      other error occurs during extraction, the success value defaults to false. The
+      success value is appended to the object after the output field.
+
+      The result is serialized, copied into a talloc-allocated buffer, and returned.
+      Any allocation failure causes an immediate panic.
+
+      <notable reason="success is derived from the output string, not passed directly">
+        The caller does not supply a success flag. Success is always inferred by
+        re-parsing the tool output. A tool output that is not valid JSON always produces
+        success = false, regardless of the execution outcome.
+      </notable>
+    </tool-result-data-construction>
+
+  </behavior>
+
+</specification>

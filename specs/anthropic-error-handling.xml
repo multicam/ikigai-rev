@@ -1,0 +1,102 @@
+<specification topic="Anthropic Error Handler">
+
+  <topic-statement>
+    The Anthropic error handler maps HTTP status codes to standardized error
+    categories for non-streaming Anthropic error responses, using the response
+    body only for structural validation.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      HTTP status code to error category mapping for non-streaming responses,
+      JSON body parsing for structural validation, and the contract that
+      category is determined solely by status code regardless of body content.
+    </in-scope>
+
+    <boundary name="Provider Error Categorization">
+      The full set of error categories and their definitions, along with error
+      categorization for Google and OpenAI providers, is covered by the provider
+      error categorization specification.
+    </boundary>
+
+    <boundary name="Anthropic Streaming Event Processor">
+      Error categorization for errors delivered as in-stream SSE events uses
+      a different mechanism — mapping the error "type" string rather than the
+      HTTP status code — and is covered by the Anthropic streaming event
+      processor specification.
+    </boundary>
+
+    <boundary name="LLM Response Handling">
+      How error categories are used downstream to decide whether to retry or
+      abort a request is covered by the LLM response handling specification.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Error Handler Inputs">
+      <field name="status" type="int32" note="HTTP response status code" />
+      <field name="body" type="string" note="raw response body; must not be null" />
+    </contract>
+
+    <contract name="Error Handler Output">
+      <field name="category" type="enum" note="mapped error category written to out-parameter on success" />
+      <field name="result" type="res_t" note="OK on success; ERR(PARSE) if JSON body cannot be parsed" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <status-code-mapping order="1">
+      The HTTP status code is mapped to an error category according to the
+      following rules, applied in order:
+
+      - 401, 403 → AUTH
+      - 429 → RATE_LIMIT
+      - 400 → INVALID_ARG
+      - 404 → NOT_FOUND
+      - 500, 529 → SERVER (529 is the Anthropic-specific overloaded status)
+      - All other codes → UNKNOWN
+
+      The category is written to the output parameter immediately after this
+      mapping, before any body parsing occurs.
+
+      <notable reason="529-is-anthropic-specific">
+        HTTP 529 is not a standard status code. Anthropic uses it to signal
+        service overload, equivalent in meaning to a server-side error.
+      </notable>
+    </status-code-mapping>
+
+    <body-parsing order="2">
+      After the category is determined, the response body is parsed as JSON.
+      If parsing fails, a parse error is returned. On success, the root value
+      is used to locate an "error" object. If the "error" object is present,
+      its "type" and "message" fields are accessed but their values are
+      discarded — they are used only to confirm the expected structure exists.
+
+      <notable reason="category-never-overridden-by-body">
+        The error body JSON is parsed for structural validation only. The "type"
+        and "message" string values within the error object are explicitly
+        ignored for categorization purposes. The category assigned by the HTTP
+        status code mapping is never modified by any field in the response body.
+        This is the inverse of how Google and OpenAI error handling works, where
+        body fields can refine or override the initial HTTP-based category.
+      </notable>
+
+      <notable reason="json-failure-is-a-hard-error">
+        If the JSON body cannot be parsed at all, the handler returns a parse
+        error rather than falling back silently. The category output parameter
+        will have been set by the time this failure occurs, but the caller
+        receives an error result indicating the body was malformed.
+      </notable>
+    </body-parsing>
+
+    <success-return order="3">
+      When the body is valid JSON, the handler returns a success result. The
+      category output parameter holds the value determined by the status code
+      mapping and is ready for use by the caller regardless of whether the
+      error object or its fields were present in the body.
+    </success-return>
+
+  </behavior>
+
+</specification>

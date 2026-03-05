@@ -1,0 +1,70 @@
+<specification topic="agent-provider-management">
+  <topic-statement>The agent provider management system handles lazy instantiation and caching of a provider instance for an agent, and restoration of provider configuration from database records.</topic-statement>
+
+  <scope>
+    <in-scope>Restoring provider and model configuration from a database row</in-scope>
+    <in-scope>Lazy creation and caching of a provider instance on first access</in-scope>
+    <in-scope>Invalidating and releasing a cached provider instance</in-scope>
+    <boundary name="provider-implementation">The internal mechanics of provider instances (request formatting, streaming, etc.) are outside this system.</boundary>
+    <boundary name="credential-storage">How API keys and base URLs are stored or retrieved from the environment is outside this system.</boundary>
+    <boundary name="model-capability">Validation of model names or capabilities is outside this system.</boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="agent-provider-state">
+      <field name="provider" type="string or null" />
+      <field name="model" type="string or null" />
+      <field name="thinking_level" type="enum: MIN | LOW | MED | HIGH" />
+      <field name="provider_instance" type="opaque handle or null" />
+    </contract>
+    <contract name="database-row">
+      <field name="provider" type="string or null" />
+      <field name="model" type="string or null" />
+      <field name="thinking_level" type="string or null" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+    <restore-from-database order="1">
+      When restoring an agent from a database row, the provider and model strings are deep-copied onto the agent if they are non-null in the row. A null value in the row leaves the corresponding agent field unchanged. Any out-of-memory condition during string duplication is fatal.
+    </restore-from-database>
+
+    <thinking-level-parsing order="2">
+      The thinking_level field in the database row is a string that is parsed into an enumerated level. The mapping is:
+      - "min" or "none" → MIN
+      - "low" → LOW
+      - "med" or "medium" → MED
+      - "high" → HIGH
+      - Any unrecognized string → MIN (default)
+      If the row's thinking_level string is null, no parsing occurs and the agent's thinking_level is not modified during restore.
+    </thinking-level-parsing>
+
+    <deferred-instance-after-restore order="3">
+      After restoring from a database row, the provider instance is left as null. No provider is instantiated eagerly; instantiation is deferred until the instance is first requested.
+    </deferred-instance-after-restore>
+
+    <lazy-provider-instantiation order="4">
+      When the provider instance is requested, the cached instance is returned immediately if one already exists. If no instance is cached and the agent's provider string is empty or null, an error indicating missing credentials is returned and no instance is created. Otherwise, a new provider instance is created using the agent's current provider string, API key, and base URL configuration. On success, the instance is stored on the agent and returned. On failure, an error is returned with a message of the form "No credentials for provider: {provider_name}"; no instance is cached in this case.
+    </lazy-provider-instantiation>
+
+    <provider-invalidation order="5">
+      The cached provider instance can be invalidated at any time. Invalidation frees the instance and sets the cached pointer to null. Calling invalidation when no instance is cached is safe and has no effect. After invalidation, the next request for the provider instance will trigger lazy instantiation again.
+    </provider-invalidation>
+  </behavior>
+
+  <notable reason="unrecognized-thinking-level-defaults-to-min">
+    Any thinking_level string that does not match a known value is silently mapped to MIN rather than producing an error or leaving the field unmodified. This means database rows with unexpected values always result in a valid thinking level.
+  </notable>
+
+  <notable reason="none-maps-to-min-not-a-distinct-level">
+    The string "none" is treated as a synonym for MIN rather than a separate off-state. There is no distinct disabled level in the enumeration.
+  </notable>
+
+  <notable reason="empty-provider-string-is-an-error">
+    An empty string for the provider is treated the same as null when the provider instance is requested: both result in a missing-credentials error rather than attempting instantiation.
+  </notable>
+
+  <notable reason="invalidation-is-idempotent">
+    Freeing a null provider instance is safe, so invalidation may be called any number of times without side effects.
+  </notable>
+</specification>

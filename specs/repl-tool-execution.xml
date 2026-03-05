@@ -1,0 +1,195 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<specification topic="REPL Tool Execution">
+
+  <topic-statement>
+    The REPL tool execution system runs tool calls requested by the REPL
+    (synchronously) or by the LLM (asynchronously on a worker thread), persisting
+    both the tool call and its result to the conversation history and scrollback.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Synchronous REPL-driven tool execution, asynchronous LLM-driven tool
+      execution (thread start, worker logic, and completion harvest), thinking
+      block preservation in tool call messages, the on-complete hook lifecycle,
+      and thread state cleanup.
+    </in-scope>
+
+    <boundary name="Tool dispatch and result wrapping">
+      How the tool registry is consulted, how an external tool is forked and
+      executed, and how the raw result is wrapped in a standard envelope are
+      handled by the tool execution and tool wrapper subsystems and are out of
+      scope here.
+    </boundary>
+
+    <boundary name="Agent state machine">
+      The transitions between idle, waiting-for-LLM, and executing-tool states
+      are handled by the agent state machine and are out of scope here.
+    </boundary>
+
+    <boundary name="LLM response handling">
+      How the LLM streaming response is parsed to detect a tool call and how
+      thinking blocks are accumulated during streaming are out of scope here.
+    </boundary>
+
+    <boundary name="Tool loop continuation">
+      How the conversation is resubmitted to the LLM after a tool result is
+      recorded is out of scope here.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Pending tool call">
+      <field name="id" type="text" note="provider-assigned tool call identifier" />
+      <field name="name" type="text" note="the tool's callable name" />
+      <field name="arguments" type="text" note="JSON-encoded argument object" />
+    </contract>
+
+    <contract name="Tool thread context">
+      <field name="tool name" type="text"
+             note="deep-copied from pending tool call at thread start; owned by the thread context" />
+      <field name="arguments" type="text"
+             note="deep-copied from pending tool call at thread start; owned by the thread context" />
+      <field name="agent reference" type="pointer"
+             note="live pointer to the agent context; used by internal tool handlers" />
+      <field name="registry reference" type="pointer"
+             note="live pointer to the shared tool registry" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <synchronous-execution order="1">
+      When the REPL itself drives a tool call (as opposed to an LLM response),
+      execution is performed synchronously on the main thread without spawning
+      a worker.
+
+      The pending tool call is retrieved from the agent. The tool is dispatched
+      directly to the external execution path (no registry lookup for internal
+      tools occurs in this path). The result is returned immediately.
+
+      A tool call message is created from the pending call's identifier, name,
+      and arguments, with no thinking blocks. The message is appended to the
+      conversation.
+
+      A tool result message is created from the identifier and the result
+      output. It is appended to the conversation.
+
+      Both messages are rendered to the scrollback buffer and persisted to the
+      database. The data payload stored alongside the tool call record contains
+      no thinking blocks.
+
+      The pending tool call is freed and cleared after persistence.
+
+      <notable reason="no thinking blocks in synchronous path">
+        The synchronous path always creates the tool call message without
+        thinking or redacted-thinking blocks. Thinking accumulation only occurs
+        during LLM streaming, which does not apply to REPL-driven tool calls.
+      </notable>
+    </synchronous-execution>
+
+    <async-start order="2">
+      When an LLM response requests a tool call, asynchronous execution is
+      initiated on the current agent.
+
+      Before the thread is created, the on-complete hook for the requested tool
+      is looked up in the registry and stored on the agent. If the tool is not
+      found in the registry or the registry is absent, the on-complete hook is
+      set to null.
+
+      A thread-owned allocation context is created. Within it, the tool name
+      and arguments are deep-copied from the pending tool call so that the
+      worker thread has stable, immutable access to its inputs for its entire
+      lifetime.
+
+      The completion flag is set to false and the running flag is set to true
+      under the mutex before the thread is spawned. The agent is then
+      transitioned to the executing-tool state.
+
+      If thread creation fails, the running flag is cleared under the mutex and
+      the application panics.
+
+      <notable reason="on-complete hook is stashed before thread creation">
+        The hook lookup happens once at thread start, not at completion time.
+        This ensures the hook stored on the agent matches the tool that was
+        actually launched, even if the registry were modified concurrently.
+      </notable>
+    </async-start>
+
+    <worker-thread order="3">
+      The worker thread runs concurrently with the main event loop.
+
+      The tool name is looked up in the registry. If an internal tool is found,
+      its handler is called directly with the thread-owned allocation context,
+      the agent context, and the argument string. The handler must return a
+      non-null JSON result string; if it returns null, a failure envelope is
+      produced instead.
+
+      If no internal tool is found, the tool name is dispatched to the external
+      execution path, which forks and execs the tool process.
+
+      After the result is obtained by either path, it is stored in a shared
+      field on the agent. The completion flag is then set to true under the
+      mutex, signaling the main loop.
+
+      <notable reason="result is stored in a shared agent field">
+        The worker thread writes the result pointer directly to a field on the
+        agent context. Ownership of this allocation is transferred to the main
+        thread when the thread is joined during the completion phase.
+      </notable>
+    </worker-thread>
+
+    <async-complete order="4">
+      Completion is performed on the main thread after the main loop detects
+      that the worker thread's completion flag is set.
+
+      The worker thread is joined. The result stored in the shared agent field
+      is moved into a locally owned allocation before any further processing.
+
+      A tool call message is created that includes any thinking content
+      accumulated during the LLM streaming phase: the thinking text, the
+      thinking signature, the redacted-thinking data, and the tool-call-specific
+      thought signature are all incorporated into the message. After the message
+      is created, each of these thinking fields on the agent is freed and cleared.
+
+      The tool call and tool result messages are persisted to the database
+      before being appended to the in-memory conversation array. Both messages
+      are then rendered to the scrollback buffer.
+
+      After persistence and rendering, the pending tool call is freed and
+      cleared.
+
+      The thread-owned allocation context is freed and cleared unless an
+      on-complete hook is set. If a hook is set, the thread context is left
+      intact because the hook may reference data allocated within it (such as a
+      newly created child agent object). The hook is responsible for managing
+      the lifetime of that data.
+
+      Thread state fields on the agent (running flag, completion flag, result
+      pointer, child process identifier) are all cleared under the mutex. The
+      agent is then transitioned out of the executing-tool state.
+
+      <notable reason="thinking blocks are preserved in the async tool call message">
+        The tool call message for an LLM-driven tool includes the full thinking
+        content from the preceding LLM response turn. This preserves the
+        provider's thinking trace in the conversation record so it can be
+        replayed and resubmitted on future turns.
+      </notable>
+
+      <notable reason="persistence precedes conversation append">
+        Database persistence of both the tool call and tool result messages
+        occurs before the messages are added to the in-memory conversation
+        array. This ordering ensures the database record exists even if the
+        in-memory append were to fail.
+      </notable>
+
+      <notable reason="thread context is not freed when an on-complete hook is registered">
+        Freeing the thread context while the hook still holds references into
+        it would produce dangling pointers. The thread context survives until
+        after the hook has finished executing.
+      </notable>
+    </async-complete>
+
+  </behavior>
+
+</specification>

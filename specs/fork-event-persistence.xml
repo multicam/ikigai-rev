@@ -1,0 +1,87 @@
+<specification topic="fork-event-persistence">
+  <topic-statement>The fork event persistence system builds and inserts database records for both sides of a fork operation, capturing a snapshot of the child agent's pinned documents and toolset configuration.</topic-statement>
+
+  <scope>
+    <in-scope>Mapping of thinking level enum values to their canonical string representations</in-scope>
+    <in-scope>Construction of a human-readable fork feedback message</in-scope>
+    <in-scope>Insertion of paired parent and child fork event records into the database</in-scope>
+    <in-scope>Snapshot of pinned document paths and toolset filter at the moment of forking</in-scope>
+    <boundary name="agent-creation">Spawning the child agent process or initializing its state is out of scope.</boundary>
+    <boundary name="fork-command-parsing">Parsing the user's fork command arguments is covered separately.</boundary>
+    <boundary name="pin-document-lifecycle">Managing pinned documents beyond snapshotting them at fork time is out of scope.</boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="thinking-level-strings">
+      <field name="MIN" type="string" notes="maps to &quot;min&quot;" />
+      <field name="LOW" type="string" notes="maps to &quot;low&quot;" />
+      <field name="MED" type="string" notes="maps to &quot;medium&quot;" />
+      <field name="HIGH" type="string" notes="maps to &quot;high&quot;" />
+    </contract>
+
+    <contract name="parent-fork-event-data">
+      <field name="child_uuid" type="string" notes="UUID of the newly created child agent" />
+      <field name="fork_message_id" type="integer" notes="ID of the message that triggered the fork" />
+      <field name="role" type="string" notes="fixed value &quot;parent&quot;" />
+    </contract>
+
+    <contract name="child-fork-event-data">
+      <field name="parent_uuid" type="string" notes="UUID of the parent agent" />
+      <field name="fork_message_id" type="integer" notes="ID of the message that triggered the fork" />
+      <field name="role" type="string" notes="fixed value &quot;child&quot;" />
+      <field name="pinned_paths" type="JSON array of strings" notes="paths of all currently pinned documents on the child agent at fork time" />
+      <field name="toolset_filter" type="JSON array of strings" notes="names of all tools in the child agent's toolset filter; empty array when no filter is set" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+    <thinking-level-mapping order="1">
+      Four thinking level values are mapped to strings for use in human-readable output
+      and database records: the minimum level maps to "min", low maps to "low", medium
+      maps to "medium", and high maps to "high".
+    </thinking-level-mapping>
+
+    <fork-feedback-message order="2">
+      After a fork completes, a human-readable feedback string is produced describing
+      the newly created child. The string takes the form:
+      "Forked child {uuid} ({provider}/{model}/{thinking_level_string})"
+      where the thinking level is rendered using the four-value mapping above.
+    </fork-feedback-message>
+
+    <parent-event-insertion order="3">
+      A fork event record is inserted into the database on behalf of the parent agent.
+      The record's kind is "fork" and its agent field identifies the parent. The
+      auxiliary JSON data encodes the child's UUID, the ID of the message that
+      triggered the fork, and the role string "parent".
+    </parent-event-insertion>
+
+    <child-event-insertion order="4">
+      A second fork event record is inserted into the database on behalf of the child
+      agent. The record's kind is "fork" and its agent field identifies the child. The
+      auxiliary JSON data encodes the parent's UUID, the same triggering message ID,
+      and the role string "child". It also includes two snapshot arrays captured from
+      the child agent's state at the moment of forking.
+    </child-event-insertion>
+
+    <pinned-paths-snapshot order="5">
+      The child event record includes a JSON array named "pinned_paths" containing one
+      string entry per currently pinned document on the child agent. Each entry is the
+      path of that pinned document. The array preserves all pinned paths as they exist
+      at fork time and serves as a durable record of the child's initial document
+      context.
+    </pinned-paths-snapshot>
+
+    <toolset-filter-snapshot order="6">
+      The child event record includes a JSON array named "toolset_filter" containing
+      one string entry per tool name present in the child agent's toolset filter. When
+      no toolset filter has been configured, the array is empty. This snapshot captures
+      the tool restrictions active on the child at the moment of forking.
+    </toolset-filter-snapshot>
+
+    <insertion-result order="7">
+      The operation returns success if both event records are inserted without error,
+      or an error if either insertion fails. No partial-success state is defined; a
+      failure on either record propagates as the return value.
+    </insertion-result>
+  </behavior>
+</specification>

@@ -1,0 +1,258 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<specification topic="Google Gemini Request Serialization">
+
+  <topic-statement>
+    The Google Gemini request serializer transforms a canonical LLM request into
+    the Gemini API JSON format, assembling system instructions, message contents,
+    tool definitions, tool configuration, and generation configuration, and also
+    produces the URL and HTTP headers needed to deliver the request.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      System instruction serialization, message contents serialization, tool
+      definition serialization including parameter schema cleanup, tool
+      configuration serialization, generation configuration serialization
+      including thinking configuration for Gemini 2.5 and Gemini 3, URL
+      construction for streaming and non-streaming modes, and HTTP header
+      construction.
+    </in-scope>
+
+    <boundary name="Content block serialization">
+      How individual message content blocks (text, thinking, tool call, tool
+      result) are transformed into Gemini parts format is covered by the Google
+      content serialization specification.
+    </boundary>
+
+    <boundary name="Thinking configuration">
+      How thinking levels are translated into budgets or level strings per model
+      is covered by the Google thinking configuration specification.
+    </boundary>
+
+    <boundary name="Streaming event processing">
+      How the Gemini API response is parsed back into normalized stream events
+      is covered by the Google streaming event processing specification.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Canonical request inputs consumed">
+      <field name="system_prompt" type="text or null" note="serialized as systemInstruction; skipped when null or empty string" />
+      <field name="messages" type="ordered array" note="serialized as contents array; each message contributes one content object" />
+      <field name="model" type="text" note="used for series classification (Gemini 2.5 vs Gemini 3) and thinking support checks" />
+      <field name="tool_count" type="integer" note="when zero, both tools and toolConfig sections are omitted entirely" />
+      <field name="tools" type="array of tool definitions" note="each has name, description, and parameters JSON string" />
+      <field name="tool_choice_mode" type="integer enumeration" note="0=AUTO, 1=NONE, 2=ANY; controls functionCallingConfig mode string" />
+      <field name="max_output_tokens" type="integer" note="when greater than zero, emitted as maxOutputTokens in generationConfig" />
+      <field name="thinking.level" type="enumeration" note="MIN/LOW/MED/HIGH; drives thinking configuration inclusion and value" />
+    </contract>
+
+    <contract name="Serialized JSON structure">
+      <field name="systemInstruction" type="object" note="present only when system prompt is non-null and non-empty; contains parts array with a single text part" />
+      <field name="contents" type="array" note="always present; one object per message with role and parts" />
+      <field name="tools" type="array" note="present only when tool_count > 0; wraps functionDeclarations array inside a single object" />
+      <field name="toolConfig" type="object" note="present only when tool_count > 0; contains functionCallingConfig with mode string" />
+      <field name="generationConfig" type="object" note="present only when maxOutputTokens > 0 or thinking config is needed; contains maxOutputTokens and optionally thinkingConfig" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <system-instruction-serialization order="1">
+      When the system prompt is null or an empty string, no system instruction
+      is added to the document and serialization continues normally.
+
+      When the system prompt is non-null and non-empty, a "systemInstruction"
+      key is added to the root object. Its value is an object with a single
+      "parts" key whose value is an array containing one object. That object
+      has a single "text" key set to the system prompt string.
+
+      <notable reason="empty string skipped as well as null">
+        Both a null system prompt and a zero-length system prompt string result
+        in the systemInstruction key being absent from the output. Callers that
+        pass an empty string get the same output as callers that pass null.
+      </notable>
+    </system-instruction-serialization>
+
+    <contents-serialization order="2">
+      All messages are serialized in order into a "contents" array on the root
+      object. Each message produces one content object with a "role" string and
+      a "parts" array. Role mapping and parts assembly are delegated to the
+      content block serializer, which is invoked once per message.
+
+      Before iterating messages, the thought signature for Gemini 3 models is
+      located by scanning assistant messages in reverse order. If found, the
+      signature string is preserved for injection into the first assistant
+      message during parts serialization.
+
+      The thought signature is resolved once before iteration begins and is
+      passed unchanged to each message's parts serialization. Injection into
+      the message body is determined by the content block serializer when it
+      encounters the first assistant-role message.
+
+      <notable reason="thought signature scoped to Gemini 3 only">
+        The thought signature lookup is skipped entirely for non-Gemini-3
+        models. The signature value passed to the content serializer is null
+        when the model is not Gemini 3 or when no assistant message with a
+        stored signature is found.
+      </notable>
+    </contents-serialization>
+
+    <tool-definitions-serialization order="3">
+      When tool_count is zero, no "tools" key is added to the root object.
+
+      When tools are present, a "tools" array is added to the root object. The
+      array contains a single object with a "functionDeclarations" key. The
+      value of "functionDeclarations" is an array with one entry per tool.
+
+      Each function declaration object contains:
+      - "name": the tool name string
+      - "description": the tool description string
+      - "parameters": the parsed parameter schema as a JSON object
+
+      The tool parameters are stored in canonical form as a JSON string. They
+      are parsed into a live JSON object during serialization, then the
+      "additionalProperties" key is removed from the top-level parameters
+      object before embedding it in the declaration.
+
+      <notable reason="additionalProperties removal is top-level only">
+        The removal of "additionalProperties" is applied only to the top-level
+        parameters object, not recursively to nested schema objects. Nested
+        schemas that contain "additionalProperties" are left unchanged.
+      </notable>
+
+      <notable reason="single wrapper object in tools array">
+        All function declarations are collected into one object containing
+        "functionDeclarations". The "tools" array always contains exactly one
+        such wrapper object, regardless of how many tools are present.
+      </notable>
+    </tool-definitions-serialization>
+
+    <tool-configuration-serialization order="4">
+      When tool_count is zero, no "toolConfig" key is added to the root object.
+
+      When tools are present, a "toolConfig" object is added to the root
+      object. It contains a "functionCallingConfig" object with a "mode" string
+      mapped from the canonical tool choice mode:
+
+      - 0 (auto) → "AUTO"
+      - 1 (none) → "NONE"
+      - 2 (required/any) → "ANY"
+      - Any other value → "AUTO" (default fallback)
+
+      <notable reason="toolConfig always accompanies tools">
+        Tool configuration is absent if and only if tool_count is zero. It is
+        never absent when tools are present, even if the mode is the default
+        AUTO value.
+      </notable>
+    </tool-configuration-serialization>
+
+    <generation-config-serialization order="5">
+      A "generationConfig" object is added to the root object only when at
+      least one of the following is true:
+      - max_output_tokens is greater than zero
+      - Thinking configuration must be included
+
+      If neither condition holds, the generationConfig key is absent entirely.
+
+      When present, the generationConfig object contains:
+
+      <max-output-tokens order="1">
+        When max_output_tokens is greater than zero, a "maxOutputTokens" integer
+        field is added with that value. When max_output_tokens is zero or
+        absent, the field is omitted.
+      </max-output-tokens>
+
+      <thinking-config order="2">
+        Whether thinking configuration is included depends on model series:
+
+        For Gemini 3 models: thinkingConfig is always included, regardless of
+        thinking level, because Gemini 3 has no concept of "no thinking" — the
+        lowest level is still an active thinking mode.
+
+        For Gemini 2.5 models: thinkingConfig is included only when the
+        thinking level is not MIN and the model supports thinking. At MIN level,
+        no thinkingConfig is emitted (unless Gemini 3 logic applies).
+
+        For all other models: thinkingConfig is never included.
+
+        When thinkingConfig is included, the object always contains:
+        - "includeThoughts": true (boolean, always present when thinkingConfig
+          is emitted)
+
+        Additionally:
+        - For Gemini 2.5: a "thinkingBudget" integer field is added with the
+          computed token budget for the given model and level. The budget value
+          is omitted if the computed budget is negative (indicating the model
+          is not in the table), though in practice Gemini 2.5 models in the
+          table always return a non-negative budget.
+        - For Gemini 3: a "thinkingLevel" string field is added with the
+          level string for the given model and level.
+
+        <notable reason="Gemini 3 always emits thinkingConfig regardless of level">
+          Even when the user selects the lowest thinking level on a Gemini 3
+          model, thinkingConfig with "includeThoughts": true and a thinkingLevel
+          string is always emitted. The Gemini 3 API does not support omitting
+          the thinking config entirely.
+        </notable>
+
+        <notable reason="includeThoughts always true when thinkingConfig present">
+          The "includeThoughts" field is set to true unconditionally whenever
+          thinkingConfig is included. There is no path that emits thinkingConfig
+          with "includeThoughts": false.
+        </notable>
+      </thinking-config>
+    </generation-config-serialization>
+
+    <serialization-order order="6">
+      The five components are assembled in a fixed order onto the root object:
+      1. systemInstruction
+      2. contents
+      3. tools
+      4. toolConfig
+      5. generationConfig
+
+      Each component is serialized and added independently. Failure in any
+      component aborts serialization and returns a parse error result. On
+      failure the partially built document is discarded.
+    </serialization-order>
+
+    <url-construction order="7">
+      The endpoint URL is constructed from four inputs: base URL, model
+      identifier, API key, and streaming flag.
+
+      The URL format is:
+
+        {base_url}/models/{model}:{method}?key={api_key}{alt_param}
+
+      Where:
+      - method is "streamGenerateContent" when streaming, "generateContent"
+        when non-streaming
+      - alt_param is "&amp;alt=sse" when streaming, empty string when
+        non-streaming
+
+      <notable reason="alt=sse appended after key parameter">
+        The streaming alt parameter is appended after the API key query
+        parameter with an ampersand separator, not as a separate query
+        parameter with a question mark.
+      </notable>
+    </url-construction>
+
+    <header-construction order="8">
+      HTTP headers are constructed based on the streaming flag.
+
+      For streaming requests, two headers are produced:
+      - "Content-Type: application/json"
+      - "Accept: text/event-stream"
+
+      For non-streaming requests, one header is produced:
+      - "Content-Type: application/json"
+
+      The header array is null-terminated in both cases. The array length
+      (excluding the null terminator) is 2 for streaming and 1 for
+      non-streaming.
+    </header-construction>
+
+  </behavior>
+
+</specification>

@@ -1,0 +1,270 @@
+<specification topic="OpenAI Response Parsing">
+
+  <topic-statement>
+    The OpenAI response parser extracts model, usage, finish reason, and content
+    blocks from complete (non-streaming) API responses for both the Chat
+    Completions and Responses API response formats, and maps HTTP error responses
+    to categorized error results.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Parsing of complete (non-streaming) Chat Completions response bodies,
+      parsing of complete Responses API response bodies, finish reason mapping
+      for both response formats, usage extraction common to both formats, error
+      detection from inline JSON error objects, and HTTP error categorization
+      with JSON body refinement.
+    </in-scope>
+
+    <boundary name="Streaming">
+      Incremental streaming event handling for both Chat Completions and
+      Responses API formats is covered by the OpenAI Chat Streaming and OpenAI
+      Responses Streaming specifications. This specification covers only
+      complete, buffered response parsing.
+    </boundary>
+
+    <boundary name="Finish Reason Mapping">
+      The string-to-enum mapping rules for finish reasons are documented in the
+      Finish Reason Mapping specification. This specification documents when and
+      how those mappings are applied during response parsing.
+    </boundary>
+
+    <boundary name="Provider Error Categorization">
+      The retry eligibility classification of error categories is documented in
+      the Provider Error Categorization specification. This specification
+      documents the HTTP-to-category and code-refinement logic that feeds that
+      system.
+    </boundary>
+
+    <boundary name="Request Construction">
+      How requests are built and dispatched to the OpenAI APIs is out of scope.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+
+    <contract name="Parsed Response">
+      <field name="model" type="string|null" note="exact model identifier string from the response; null if absent" />
+      <field name="finish_reason" type="enum" note="internal finish reason (STOP, LENGTH, TOOL_USE, CONTENT_FILTER, ERROR, UNKNOWN)" />
+      <field name="usage.input_tokens" type="int32" note="prompt token count; 0 if usage absent" />
+      <field name="usage.output_tokens" type="int32" note="completion token count; 0 if usage absent" />
+      <field name="usage.total_tokens" type="int32" note="total token count; 0 if usage absent" />
+      <field name="usage.thinking_tokens" type="int32" note="reasoning token count from nested details; 0 if absent" />
+      <field name="content_blocks" type="array|null" note="ordered content blocks; null if none present" />
+      <field name="content_count" type="size_t" note="number of valid blocks in the array; 0 when content_blocks is null" />
+    </contract>
+
+    <contract name="Content Block — Text">
+      <field name="type" type="enum" value="TEXT" />
+      <field name="text" type="string" note="the text content; never empty (Chat API) or absent only when text or refusal field missing (Responses API)" />
+    </contract>
+
+    <contract name="Content Block — Tool Call">
+      <field name="type" type="enum" value="TOOL_CALL" />
+      <field name="id" type="string" note="tool call identifier" />
+      <field name="name" type="string" note="function name" />
+      <field name="arguments" type="string" note="raw JSON string exactly as received; not parsed or validated" />
+    </contract>
+
+  </data-contracts>
+
+  <behavior>
+
+    <chat-response-parsing order="1">
+      A Chat Completions response body is parsed as a JSON object. The parser
+      checks for a top-level "error" object first; if present, parsing is aborted
+      and a PROVIDER-category error is returned containing only the value of the
+      error object's "message" field (defaulting to "Unknown error" if the field
+      is absent or not a string).
+
+      When no top-level error object is present, the parser extracts:
+
+      - Model: the top-level "model" string field. If absent or not a string, the
+        model field of the response is left null.
+
+      - Usage: from the top-level "usage" object. "prompt_tokens" maps to input
+        tokens, "completion_tokens" to output tokens, "total_tokens" to total
+        tokens. Reasoning tokens are read from the nested
+        "completion_tokens_details.reasoning_tokens" field. Any absent or
+        non-integer field is left as zero.
+
+      - Finish reason: from "choices[0].finish_reason". The Chat Completions
+        finish reason string-to-enum table is applied. A null or absent value
+        maps to UNKNOWN.
+
+      - Content: from "choices[0].message". A non-null, non-empty string
+        "content" field produces one TEXT block. A "tool_calls" array produces
+        one TOOL_CALL block per element. Text blocks are placed before tool call
+        blocks in the output array. Each tool call block requires "id" (string),
+        "function.name" (string), and "function.arguments" (string); a missing
+        or non-string value for any of these fields causes the parser to return a
+        PARSE error.
+
+      When the "choices" array is absent, empty, or "choices[0].message" is
+      absent, the response is returned with null content and a count of zero, but
+      the already-extracted model, usage, and finish reason fields are preserved.
+      When neither "content" nor any "tool_calls" elements are present, the same
+      null/zero outcome applies.
+
+      <notable reason="arguments-stored-as-raw-string">
+        The "function.arguments" field in a Chat Completions tool call is a JSON
+        string (not a JSON object). The parser stores this value verbatim without
+        parsing, re-encoding, or validating it. Callers receive a JSON-encoded
+        string that they must decode themselves.
+      </notable>
+
+      <notable reason="empty-content-excluded">
+        A "content" field that is present but empty (zero-length string) is
+        treated the same as a null or absent field. No TEXT block is produced for
+        empty content.
+      </notable>
+    </chat-response-parsing>
+
+    <responses-api-response-parsing order="2">
+      A Responses API response body is parsed as a JSON object. The same
+      top-level "error" object check applies: if present, a PROVIDER error is
+      returned with the "message" field value.
+
+      When no error is present, the parser extracts:
+
+      - Model: the top-level "model" string field. If absent or not a string,
+        the model field of the response is left null.
+
+      - Usage: identical field mapping as Chat Completions (prompt_tokens,
+        completion_tokens, total_tokens, completion_tokens_details.reasoning_tokens).
+
+      - Finish reason: from the top-level "status" field, consulted together with
+        "incomplete_details.reason" when status is "incomplete". The Responses
+        API status-to-enum table is applied. A null or absent status maps to
+        UNKNOWN.
+
+      - Content: from the top-level "output" array. Each item in the array has a
+        "type" field. Items of unknown or absent type are silently skipped.
+
+        Items of type "message" have a "content" array. Each element of the
+        content array has its own "type" field:
+        - "output_text": a TEXT block is produced from the item's "text" string
+          field. If the "text" field is absent or not a string, the item is
+          silently skipped.
+        - "refusal": a TEXT block is produced from the item's "refusal" string
+          field. If the "refusal" field is absent or not a string, the item is
+          silently skipped.
+        Content items of any other type are silently skipped.
+
+        Items of type "function_call" produce one TOOL_CALL block. The
+        identifier is taken from the "call_id" string field if present;
+        otherwise from the "id" string field. If neither is present, the parser
+        returns a PARSE error. "name" and "arguments" are required string fields;
+        a missing or non-string value for either causes a PARSE error.
+
+      The parser pre-counts the expected number of content blocks from the output
+      array before allocating, then fills them in a second pass. The final
+      content count reflects only the blocks actually added; if any items are
+      skipped during the second pass, the recorded count is lower than the
+      pre-counted estimate.
+
+      <notable reason="call_id-preferred-over-id">
+        For Responses API function call items, the "call_id" field takes
+        precedence over the "id" field as the tool call identifier. If both are
+        present, "call_id" is used and "id" is ignored. This differs from Chat
+        Completions, where only the "id" field exists.
+      </notable>
+
+      <notable reason="refusal-as-text">
+        A "refusal" content item is surfaced as a TEXT block, not as a distinct
+        block type. The refusal text is treated identically to regular output
+        text from the caller's perspective.
+      </notable>
+
+      <notable reason="count-adjusted-downward">
+        Because skippable items (unknown content types, missing text/refusal
+        fields) are only detected during the fill pass, the reported content
+        count may be smaller than the number of slots allocated. Callers should
+        rely on the reported count, not the allocation size.
+      </notable>
+    </responses-api-response-parsing>
+
+    <usage-extraction order="3">
+      Both Chat Completions and Responses API parsers apply the same usage
+      extraction logic from a "usage" object:
+
+      - "prompt_tokens" (integer) → input token count
+      - "completion_tokens" (integer) → output token count
+      - "total_tokens" (integer) → total token count
+      - "completion_tokens_details.reasoning_tokens" (integer, in a nested
+        object) → thinking token count
+
+      Each field is independently optional. Missing, null, or non-integer values
+      result in a count of zero for that field. The absence of the entire "usage"
+      object results in all counts being zero.
+    </usage-extraction>
+
+    <error-response-parsing order="4">
+      HTTP error responses (non-2xx) are processed separately from successful
+      response bodies. The HTTP status code is mapped to an initial error
+      category:
+
+      - 400 → INVALID_ARG
+      - 401, 403 → AUTH
+      - 404 → NOT_FOUND
+      - 429 → RATE_LIMIT
+      - 500, 502, 503 → SERVER
+      - All other codes → UNKNOWN
+
+      The response body is then parsed as JSON to attempt category refinement and
+      message extraction. If the body cannot be parsed as valid JSON or the root
+      is not an object, the parser silently falls back to the HTTP-derived
+      category with a message of "HTTP {status}".
+
+      When a valid JSON error object is found at the "error" key, the "type",
+      "code", and "message" string fields are extracted. Category refinement
+      proceeds in this order:
+
+      1. Content filter detection: if the "type" or "code" field contains the
+         substring "content_filter" anywhere, the category is overridden to
+         CONTENT_FILTER, regardless of the HTTP status. This check takes
+         priority over all other refinements.
+
+      2. Code-based refinement (applied only when content filter was not
+         detected): if "code" is one of the following known values, the category
+         is overridden:
+         - "invalid_api_key" or "invalid_org" → AUTH
+         - "rate_limit_exceeded" or "quota_exceeded" → RATE_LIMIT
+         - "model_not_found" → NOT_FOUND
+
+      The error message is formatted from the extracted fields according to which
+      are present:
+      - type, code, and message all present: "{type} ({code}): {message}"
+      - type and message present, code absent: "{type}: {message}"
+      - message present, type absent: message string used directly
+      - type present, message absent: type string used directly
+      - none present: "HTTP {status}"
+
+      <notable reason="content-filter-is-substring-match">
+        Content filter detection uses substring matching, not exact equality. Any
+        "type" or "code" value that contains "content_filter" anywhere within it
+        triggers the CONTENT_FILTER override. This means a value like
+        "request_content_filter_error" would match.
+      </notable>
+
+      <notable reason="silent-json-parse-fallback">
+        When the error response body cannot be parsed as JSON, the parser does
+        not surface a parse error to the caller. It returns success with the
+        HTTP-derived category and a plain "HTTP {status}" message string. Parse
+        failures are not propagated.
+      </notable>
+
+      <notable reason="error-extraction-on-success-body">
+        The success-path parsers (Chat Completions and Responses API) also check
+        for a top-level "error" object in otherwise valid JSON. This path is
+        distinct from the HTTP error path: it fires when the HTTP status is
+        nominally successful but the body contains an error object, and it
+        returns a PROVIDER-category error (not a categorized HTTP error) with
+        only the "message" field. The type and code fields are not consulted on
+        this path.
+      </notable>
+    </error-response-parsing>
+
+  </behavior>
+
+</specification>

@@ -1,0 +1,253 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<specification topic="Google Gemini Content Block Serialization">
+
+  <topic-statement>
+    The Google content block serializer transforms canonical message content
+    blocks into the parts format required by the Gemini API, including role
+    mapping per model series and per-type part construction for text, thinking,
+    tool call, tool result, and redacted thinking blocks.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Role string mapping for user, assistant, and tool roles, content block
+      serialization for all canonical block types (text, thinking, tool call,
+      tool result, redacted thinking), tool result name lookup by backward scan,
+      thought signature injection as a leading part for the first assistant
+      message, and thought signature retrieval from assistant message metadata.
+    </in-scope>
+
+    <boundary name="Request serialization">
+      How the parts produced here are assembled into the full Gemini request
+      JSON body (systemInstruction, contents array, tools, toolConfig,
+      generationConfig) is covered by the Google request serialization
+      specification.
+    </boundary>
+
+    <boundary name="Thought signature storage">
+      How thought signatures are extracted from streaming responses and stored
+      in message metadata is covered by the Google streaming event processing
+      specification.
+    </boundary>
+
+    <boundary name="Thinking level computation">
+      How abstract thinking levels are translated into numeric budgets or level
+      strings is covered by the Google thinking configuration specification.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Role mapping">
+      <field name="user role" type="text" note="always maps to the string 'user'" />
+      <field name="assistant role" type="text" note="always maps to the string 'model'" />
+      <field name="tool role" type="text" note="maps to 'user' for Gemini 3 models; maps to 'function' for all other models" />
+    </contract>
+
+    <contract name="Text part">
+      <field name="text" type="string" note="the text content of the block" />
+    </contract>
+
+    <contract name="Thinking part">
+      <field name="text" type="string" note="the thinking text content" />
+      <field name="thought" type="boolean" note="always true; marks the part as a thinking part" />
+    </contract>
+
+    <contract name="Tool call part">
+      <field name="functionCall" type="object" note="nested object containing name and args" />
+      <field name="functionCall.name" type="string" note="the tool name" />
+      <field name="functionCall.args" type="object" note="the tool arguments as a parsed JSON object, not a string" />
+    </contract>
+
+    <contract name="Tool result part">
+      <field name="functionResponse" type="object" note="nested object containing name and response" />
+      <field name="functionResponse.name" type="string" note="the function name looked up from prior messages, or the tool call ID as fallback" />
+      <field name="functionResponse.response" type="object" note="wrapper object with a 'content' field" />
+      <field name="functionResponse.response.content" type="string" note="the result content string" />
+    </contract>
+
+    <contract name="Thought signature part">
+      <field name="thoughtSignature" type="string" note="the opaque thought signature string; injected as a standalone part object" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <role-mapping order="1">
+      Each message has a canonical role that is mapped to a Gemini role string
+      before serialization. The mapping is:
+
+      - User role → "user"
+      - Assistant role → "model"
+      - Tool role → "user" when the model is Gemini 3; "function" for all
+        other models (including Gemini 2.5, other Gemini models, and null model)
+
+      Role determination for the tool role performs a model series check.
+      When the model identifier is null, the tool role maps to "function"
+      (the non-Gemini-3 path).
+
+      <notable reason="tool role differs by Gemini series">
+        Gemini 3 introduced a requirement that tool result messages use the
+        "user" role rather than the older "function" role. Sending "function"
+        role to a Gemini 3 endpoint is incorrect. The serializer branches on
+        model series to emit the appropriate role string.
+      </notable>
+    </role-mapping>
+
+    <parts-assembly order="2">
+      Each message's content is serialized into a "parts" array. The parts
+      array is constructed in two phases:
+
+      Phase 1 — Thought signature injection: If a thought signature is
+      available and the current message is the first assistant-role message
+      encountered during iteration, a standalone thought signature part is
+      prepended as the first element of the parts array. This part is an
+      object with a single "thoughtSignature" key set to the signature string.
+
+      Phase 2 — Content block parts: Each content block in the message is
+      serialized in order and appended to the parts array.
+
+      <notable reason="thought signature injected only into first assistant message">
+        The thought signature is injected at most once per request, into the
+        first assistant message in the conversation. Subsequent assistant
+        messages receive no injected signature part, even if a signature is
+        available.
+      </notable>
+
+      <notable reason="thought signature only on Gemini 3">
+        The thought signature value passed during serialization is null for
+        non-Gemini-3 models. Phase 1 is a no-op when the signature is null,
+        so no thoughtSignature part is ever injected for non-Gemini-3 models.
+      </notable>
+    </parts-assembly>
+
+    <text-block-serialization order="3">
+      A text content block produces a single part object with one field:
+      - "text": the text string from the block
+
+      No additional fields are added.
+    </text-block-serialization>
+
+    <thinking-block-serialization order="4">
+      A thinking content block produces a single part object with two fields:
+      - "text": the thinking text from the block
+      - "thought": true (boolean)
+
+      The "thought" field distinguishes this part from a regular text part
+      when the Gemini API returns or receives it. Both fields are always
+      present together.
+    </thinking-block-serialization>
+
+    <redacted-thinking-block-serialization order="5">
+      A redacted thinking content block produces no output. The block is
+      silently skipped and no part object is added to the parts array.
+
+      <notable reason="redacted thinking blocks are dropped entirely">
+        Unlike Anthropic serialization which re-emits redacted thinking blocks
+        with their opaque data, the Google serializer discards them. Gemini
+        does not have an equivalent concept for redacted thinking.
+      </notable>
+    </redacted-thinking-block-serialization>
+
+    <tool-call-block-serialization order="6">
+      A tool call content block produces a single part object with one field:
+      - "functionCall": an object containing "name" and "args"
+
+      The "name" field is the tool name string. The "args" field is the tool
+      arguments parsed from their stored JSON string representation into a live
+      JSON object. The arguments are embedded as a JSON object, not a string.
+
+      <notable reason="args are parsed to object, not passed as string">
+        Tool call arguments in canonical form are stored as a JSON string.
+        During serialization the string is parsed into a JSON object before
+        embedding. The Gemini API requires args as a structured object, unlike
+        the OpenAI Chat Completions API which accepts a string.
+      </notable>
+    </tool-call-block-serialization>
+
+    <tool-result-block-serialization order="7">
+      A tool result content block produces a single part object with one field:
+      - "functionResponse": an object containing "name" and "response"
+
+      The "name" field is resolved by scanning prior messages (see tool result
+      name lookup). The "response" field is an object with a single "content"
+      key set to the result content string.
+
+      <notable reason="response is wrapped in an object">
+        The result content string is not placed directly under "functionResponse".
+        It is nested one level deeper inside a "response" object with the key
+        "content". This nesting is required by the Gemini API format.
+      </notable>
+    </tool-result-block-serialization>
+
+    <tool-result-name-lookup order="8">
+      A tool result block carries a tool call ID that refers to a prior tool
+      call. To serialize the result, the corresponding tool name must be found.
+      The name is not stored directly in the tool result block; it must be
+      retrieved by scanning the message history.
+
+      The lookup scans all messages before the current message index, in
+      forward order (oldest first). For each message, all content blocks are
+      checked. When a tool call block is found whose ID matches the tool result's
+      tool call ID, the tool name from that block is returned immediately.
+
+      If no matching tool call block is found after scanning all prior messages,
+      the tool call ID itself is used as the function name.
+
+      <notable reason="fallback uses tool call ID as name">
+        If the matching tool call is not found in prior messages — for example
+        because it was truncated from the context window — the tool call ID
+        string is used verbatim as the function name in the serialized
+        functionResponse. This produces a syntactically valid but semantically
+        incorrect response; the Gemini API may reject it or treat it as an
+        unknown function.
+      </notable>
+
+      <notable reason="forward scan stops before current message">
+        The scan covers only messages at indices strictly less than the current
+        message index. The current message and any later messages are not
+        examined. This ensures only causally prior tool calls are candidates.
+      </notable>
+    </tool-result-name-lookup>
+
+    <thought-signature-retrieval order="9">
+      Before request serialization begins, the most recent thought signature is
+      retrieved from the message history for Gemini 3 models.
+
+      The retrieval scans messages in reverse order (newest first). Only
+      assistant-role messages are examined. For each candidate assistant
+      message, the message metadata field is inspected. If the metadata is
+      non-null, non-empty, and parseable as JSON, the "thought_signature" key
+      is extracted. If the key is present, is a string, and is non-empty, its
+      value is returned as the thought signature.
+
+      Scanning stops at the first assistant message that yields a valid
+      signature. If no such message is found, the result is null.
+
+      The retrieved signature is copied into owned storage before the parsed
+      metadata document is released, ensuring the signature string remains
+      valid for the duration of serialization.
+
+      <notable reason="only assistant messages are scanned">
+        User messages, tool messages, and system messages are skipped entirely
+        during the reverse scan. Only messages with the assistant role can
+        carry a thought signature in their metadata.
+      </notable>
+
+      <notable reason="malformed metadata JSON is silently skipped">
+        If an assistant message's metadata field contains malformed JSON or
+        a JSON structure that does not have "thought_signature" as a non-empty
+        string, that message is skipped and the scan continues to the next
+        older assistant message. No error is reported.
+      </notable>
+
+      <notable reason="retrieval is skipped for non-Gemini-3 models">
+        The entire reverse scan is short-circuited when the model is not
+        classified as Gemini 3. The returned signature is null unconditionally
+        for non-Gemini-3 models, even if thought signatures happen to be stored
+        in the message metadata.
+      </notable>
+    </thought-signature-retrieval>
+
+  </behavior>
+
+</specification>

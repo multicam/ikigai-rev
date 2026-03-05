@@ -1,0 +1,282 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<specification topic="Provider HTTP Lifecycle">
+
+  <topic-statement>
+    The provider HTTP lifecycle system manages the asynchronous HTTP request pipeline
+    for streaming and non-streaming LLM API calls across all three providers, including
+    socket readiness queries, transfer progress, timeout retrieval, completion detection,
+    and request cancellation.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      The vtable operations common to all three providers — socket file-descriptor set
+      population, transfer progress driving, timeout retrieval, completed-transfer
+      processing, streaming request initiation, non-streaming request initiation, and
+      cancellation. Provider construction, including base URL resolution and API key
+      handling. The distinction between providers that handle completion locally versus
+      those that delegate entirely to the HTTP multi layer.
+    </in-scope>
+
+    <boundary name="HTTP multi handle internals">
+      The underlying multi-handle that manages actual socket I/O, transfer state, and
+      completion callbacks is an opaque subsystem. This specification covers only how
+      providers interact with it through its public interface, not how it operates
+      internally.
+    </boundary>
+
+    <boundary name="SSE parsing">
+      Raw bytes arriving over the wire are fed into an SSE parser. The parser's framing
+      and event-extraction logic is out of scope; this specification covers only that the
+      write callback feeds data to the parser and processes the resulting events.
+    </boundary>
+
+    <boundary name="Request serialization">
+      The construction of request JSON bodies and URL paths is performed by
+      provider-specific serialization modules. This specification records that
+      serialization occurs as a step of streaming and non-streaming initiation, not how
+      the body is constructed.
+    </boundary>
+
+    <boundary name="Response building">
+      Assembling a final LLM response from accumulated streaming state is delegated to
+      per-provider response modules and is out of scope here.
+    </boundary>
+
+    <boundary name="Stream event processing">
+      Provider-specific stream event handlers that interpret SSE event types and data
+      payloads into typed stream events are out of scope.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Provider construction inputs">
+      <field name="API key" type="string" note="copied into provider context; OpenAI additionally validates non-empty at construction time and returns an error if empty; Anthropic and Google do not validate emptiness at construction" />
+      <field name="base URL" type="string" note="read from an environment variable at construction time; falls back to a hardcoded default if the variable is absent; Anthropic default is https://api.anthropic.com; OpenAI default is the hardcoded OpenAI endpoint constant; Google default is https://generativelanguage.googleapis.com/v1beta" />
+      <field name="use_responses_api flag (OpenAI only)" type="boolean" note="when true, forces use of the Responses API regardless of model; OpenAI exposes a simple constructor that sets this to false and an extended constructor that accepts it explicitly" />
+    </contract>
+
+    <contract name="Active stream context">
+      <field name="SSE parser" type="opaque handle" note="created at stream start; receives raw bytes from the write callback" />
+      <field name="stream context" type="opaque handle" note="created at stream start; holds per-provider accumulated streaming state passed to event handlers" />
+      <field name="completion callback" type="function pointer" note="invoked exactly once when the transfer completes; carries success flag, HTTP status, response, error category, and error message" />
+      <field name="completion flag" type="boolean" note="set to true by the HTTP-level completion callback when the transfer ends; read by info_read to trigger response building and callback invocation" />
+      <field name="HTTP status code" type="integer" note="recorded by the HTTP-level completion callback; used in info_read to determine success and map error category" />
+    </contract>
+
+    <contract name="Provider completion record">
+      <field name="success" type="boolean" note="true when HTTP status is 200–299" />
+      <field name="http_status" type="integer" note="raw HTTP status code from the completed transfer" />
+      <field name="response" type="optional object" note="non-null only on success; built from accumulated streaming context; null when stream context is absent" />
+      <field name="error_category" type="enumeration" note="AUTH for 401/403; RATE_LIMIT for 429; SERVER for 500+; UNKNOWN for all other non-success statuses; always UNKNOWN on success" />
+      <field name="error_message" type="optional string" note="formatted as 'HTTP N' where N is the status code; null on success; allocated transiently and freed immediately after the callback returns" />
+      <field name="retry_after_ms" type="integer" note="always -1 at this layer; retry-after header parsing is not performed here" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <provider-construction order="1">
+      Each provider is instantiated by supplying a talloc parent context and an API key.
+      Construction allocates a provider structure and an implementation context as a
+      talloc child of that structure, copies the API key, resolves the base URL from the
+      environment with a hardcoded fallback, and creates an HTTP multi-handle as a child
+      of the implementation context.
+
+      OpenAI construction validates that the API key is non-empty before allocating
+      anything; an empty key causes an immediate error return. OpenAI also exposes a
+      second constructor variant that accepts a boolean flag selecting between the Chat
+      API and the Responses API.
+
+      Anthropic and Google do not validate key emptiness at construction time.
+
+      Google passes the API key in the request URL rather than in a header; this is
+      reflected in request construction but not in the provider context layout.
+
+      All three providers set the active stream slot to null at construction time.
+      The active stream slot holds at most one in-flight streaming context at any moment.
+    </provider-construction>
+
+    <fdset order="2">
+      The fdset operation populates read, write, and exception file-descriptor sets from
+      the HTTP multi-handle and updates the caller's maximum file-descriptor value. All
+      three providers implement this identically by delegating unconditionally to the
+      multi-handle.
+    </fdset>
+
+    <perform order="3">
+      The perform operation drives the HTTP multi-handle to make progress on all active
+      transfers, updating the count of still-running handles. All three providers
+      implement this identically by delegating unconditionally to the multi-handle.
+    </perform>
+
+    <timeout order="4">
+      The timeout operation retrieves the multi-handle's recommended select timeout in
+      milliseconds. All three providers implement this identically by delegating
+      unconditionally to the multi-handle.
+    </timeout>
+
+    <info-read order="5">
+      The info_read operation polls for completed transfers and processes any that have
+      finished. Providers differ in whether they handle completion locally or delegate
+      entirely to the multi-handle.
+
+      <anthropic-info-read order="1">
+        Anthropic calls the multi-handle's info_read through a mockable internal wrapper,
+        then separately inspects the active stream slot. If the active stream exists and
+        its completion flag is set, Anthropic performs local completion handling:
+
+        1. A completion record is assembled. If the HTTP status is 200–299, success is
+           true and the response is built from the accumulated streaming context (or null
+           if no streaming context exists). If the status is outside 200–299, success is
+           false, the response is null, the error category is mapped from the status code
+           (401/403 → AUTH; 429 → RATE_LIMIT; 500+ → SERVER; else → UNKNOWN), and an
+           error message is formatted as "HTTP N".
+
+        2. The completion callback is invoked with the assembled record.
+
+        3. The error message string, if allocated, is freed immediately after the
+           callback returns.
+
+        4. The active stream is freed and the active stream slot is set to null.
+      </anthropic-info-read>
+
+      <google-info-read order="2">
+        Google follows an identical pattern to Anthropic: it calls the multi-handle's
+        info_read directly (not through the mockable wrapper), then inspects the active
+        stream slot, performs the same HTTP-status-to-error-category mapping, invokes
+        the completion callback, frees the error message if present, frees the active
+        stream, and clears the active stream slot.
+      </google-info-read>
+
+      <openai-info-read order="3">
+        OpenAI delegates entirely to the multi-handle's info_read and performs no local
+        completion handling. There is no active stream slot and no post-call inspection.
+        Completion callbacks are registered directly with the multi-handle at request
+        submission time and are invoked by the multi-handle itself when transfers complete.
+
+        <notable reason="OpenAI completion is fully handled by the multi-handle">
+          Because OpenAI registers its completion handlers with the multi-handle at
+          request submission time, the multi-handle dispatches them directly without
+          any provider-level interception. This differs from Anthropic and Google, which
+          use a two-phase approach: the HTTP-level callback records the status and sets
+          a completion flag, and the provider-level info_read then builds the response
+          and invokes the application-level callback.
+        </notable>
+      </openai-info-read>
+
+      <notable reason="HTTP status to error category mapping is uniform across Anthropic and Google">
+        Both Anthropic and Google apply the same mapping: 401 or 403 → AUTH; 429 →
+        RATE_LIMIT; 500 or above → SERVER; any other non-success status → UNKNOWN. This
+        mapping is not applied for OpenAI at this layer.
+      </notable>
+    </info-read>
+
+    <write-callback order="6">
+      When streaming is active, the HTTP layer delivers incoming bytes to a write
+      callback registered at stream start. The callback feeds the raw bytes into the SSE
+      parser, then drains all complete events from the parser in a loop. For each event,
+      the event type and data fields are extracted (defaulting to empty strings if
+      absent) and passed to the provider's stream event processor. The event is freed
+      after processing. The callback always reports that it consumed all bytes, even if
+      the stream context or parser is absent.
+
+      Google does not use the event type field; only the data field is passed to its
+      stream event processor.
+
+      The HTTP-level completion callback is separate from the write callback. It records
+      the HTTP status code and sets the completion flag on the active stream when the
+      transfer ends.
+    </write-callback>
+
+    <start-stream order="7">
+      Initiating a streaming request follows this sequence:
+
+      1. An active stream context is allocated as a talloc child of the provider
+         implementation context.
+
+      2. A provider-specific streaming context (holding accumulated event state) is
+         created as a child of the active stream.
+
+      3. An SSE parser is created as a child of the active stream.
+
+      4. The completion callback, completion context, and HTTP status/completion fields
+         are initialized on the active stream.
+
+      5. The request URL is constructed from the base URL. For Google, the model name
+         and API key are embedded as URL parameters. For Anthropic, the path is
+         `/v1/messages`. For OpenAI, the path depends on the API mode (Chat or
+         Responses) as determined by a per-model routing check.
+
+      6. The request body JSON is serialized with streaming enabled.
+
+      7. Request headers are assembled. Anthropic includes `Content-Type: application/json`,
+         `anthropic-version: 2023-06-01`, an `x-api-key` header carrying the API key, and
+         `Accept: text/event-stream`. Google includes only `Content-Type: application/json`
+         and `Accept: text/event-stream` (no authorization header; the API key is in the
+         URL). OpenAI headers are assembled by a shared header builder.
+
+      8. The active stream is stored in the provider context.
+
+      9. The HTTP request is submitted to the multi-handle with the write callback and
+         HTTP-level completion callback both pointing to the active stream context.
+
+      If URL construction or body serialization fails, the active stream is freed and the
+      slot is cleared before returning the error.
+
+      <notable reason="active stream lifetime spans from start_stream through info_read">
+        The active stream is created during stream initiation and freed during
+        info_read after the completion callback returns. It is not freed in the
+        write callback or completion callback themselves.
+      </notable>
+    </start-stream>
+
+    <start-request order="8">
+      Non-streaming request initiation follows the same URL construction, body
+      serialization, and header assembly steps as streaming initiation, but no write
+      callback is registered with the multi-handle. The response body is received
+      atomically rather than incrementally.
+
+      For Anthropic and Google, non-streaming initiation is fully delegated to
+      provider-specific request modules. For OpenAI, the request context is created
+      inline, the API mode is selected, and the request is submitted with a completion
+      handler that is called by the multi-handle upon transfer completion.
+
+      <notable reason="OpenAI non-streaming uses the same completion delegation model as streaming">
+        Both streaming and non-streaming OpenAI requests register their completion
+        handlers directly with the multi-handle. The provider-level info_read is a
+        pure delegation in both cases.
+      </notable>
+    </start-request>
+
+    <cancel order="9">
+      Cancellation removes all active requests from the multi-handle. For Anthropic and
+      Google, cancellation additionally sets the active stream's completion flag to true
+      if an active stream exists. This causes the next info_read call to process the
+      stream as completed and invoke the completion callback with whatever partial state
+      was accumulated.
+
+      For OpenAI, cancellation only removes requests from the multi-handle. There is no
+      active stream slot and no additional flag to set.
+
+      <notable reason="cancel does not immediately free the active stream">
+        After cancellation, the active stream for Anthropic and Google is not freed
+        immediately. It persists until the next info_read call observes the completed
+        flag and performs normal completion processing.
+      </notable>
+    </cancel>
+
+    <internal-wrapping order="10">
+      OpenAI exposes a set of internal wrapper functions for request serialization, URL
+      construction, and header building. In debug builds, these wrappers are thin
+      pass-throughs to the real implementations; in release builds, the real functions
+      are called directly. This dual-build pattern allows tests to substitute mock
+      implementations for the internal wrappers without affecting production behavior.
+
+      Anthropic similarly wraps the multi-handle info_read call through a mockable
+      internal seam, distinct from the non-wrapped version used by OpenAI and Google.
+    </internal-wrapping>
+
+  </behavior>
+
+</specification>

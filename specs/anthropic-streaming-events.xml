@@ -1,0 +1,261 @@
+<specification topic="Anthropic Streaming Event Processor">
+
+  <topic-statement>
+    The Anthropic streaming event processor dispatches SSE events to accumulate
+    text deltas, thinking blocks, tool call arguments, and usage metadata into
+    a streaming context, emitting normalized stream events to the caller at each
+    significant boundary.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Per-event dispatch logic for all Anthropic SSE event types; model and
+      usage extraction; content block type identification and initialization;
+      sub-handler routing for delta types; tool state accumulation; event
+      emission for start, text delta, thinking delta, tool call start, tool
+      call delta, tool call done, done, and error; error type to category
+      mapping for in-stream errors; and malformed JSON handling.
+    </in-scope>
+
+    <boundary name="Anthropic Response Builder">
+      How the accumulated streaming context (model, usage, tool state, thinking
+      text, signature) is assembled into the final in-memory response structure
+      is covered by the Anthropic response builder specification.
+    </boundary>
+
+    <boundary name="Finish Reason Mapping">
+      Translation of Anthropic stop_reason strings to the internal finish
+      reason enumeration is covered by the finish reason mapping specification.
+    </boundary>
+
+    <boundary name="SSE Parser">
+      Splitting the raw HTTP body into individual event-type and data-string
+      pairs is covered by the SSE parser specification. This processor receives
+      already-separated event name and data strings.
+    </boundary>
+
+    <boundary name="Provider Error Categorization">
+      HTTP-level error handling for non-streaming Anthropic error responses
+      is covered by the provider error categorization specification. This
+      specification covers only in-stream error events.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Streaming Context">
+      <field name="model" type="string|null" note="populated on message_start; null until then" />
+      <field name="finish_reason" type="enum" note="populated on message_delta; UNKNOWN until then" />
+      <field name="usage.input_tokens" type="int32" note="populated on message_start" />
+      <field name="usage.output_tokens" type="int32" note="populated on message_delta" />
+      <field name="usage.thinking_tokens" type="int32" note="populated on message_delta if present" />
+      <field name="usage.total_tokens" type="int32" note="computed on message_delta as input + output + thinking" />
+      <field name="current_block_index" type="int32" note="index of the active content block; -1 between blocks" />
+      <field name="current_block_type" type="enum" note="type of the active content block" />
+      <field name="current_tool_id" type="string|null" note="id extracted from tool_use content_block_start" />
+      <field name="current_tool_name" type="string|null" note="name extracted from tool_use content_block_start" />
+      <field name="current_tool_args" type="string|null" note="accumulated argument JSON fragments; null if no delta arrived" />
+      <field name="current_thinking_text" type="string|null" note="accumulated thinking deltas; null if no delta arrived" />
+      <field name="current_thinking_signature" type="string|null" note="last-received signature; null if no signature delta arrived" />
+      <field name="current_redacted_data" type="string|null" note="data field from redacted_thinking block start" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <ping-handling order="1">
+      Ping events are silently discarded without parsing or emitting any event.
+      All other event types proceed to JSON parsing.
+    </ping-handling>
+
+    <malformed-json-handling order="2">
+      Before dispatching any event, the data string is parsed as JSON. If
+      parsing fails (invalid JSON), an ERROR event is emitted immediately with
+      category UNKNOWN and a fixed message indicating invalid JSON. If parsing
+      succeeds but the root value is not a JSON object, an ERROR event is
+      emitted with category UNKNOWN and a fixed message indicating the data is
+      not a JSON object. In both cases no further processing of the event occurs.
+
+      <notable reason="no-silent-ignore">
+        Malformed or structurally invalid SSE data is always surfaced as an
+        ERROR event. The processor does not silently skip events with unparseable
+        data.
+      </notable>
+    </malformed-json-handling>
+
+    <unknown-event-handling order="3">
+      Event type strings not recognized by the processor are silently ignored
+      after successful JSON parsing. No error is emitted for unknown event types.
+    </unknown-event-handling>
+
+    <message-start-processing order="4">
+      On receiving a message_start event, the processor extracts data from the
+      nested "message" object:
+
+      - The "model" string is extracted and stored in the streaming context.
+        If the message object or the model field is absent, the model remains
+        null.
+
+      - The "input_tokens" integer is extracted from the nested "usage" object
+        within the message and stored as the input token count. If the usage
+        object or the field is absent, the count remains zero.
+
+      After extraction, a START event is emitted carrying the model string
+      (which may be null if it was not present in the event).
+    </message-start-processing>
+
+    <content-block-start-processing order="5">
+      On receiving a content_block_start event, the processor reads the "index"
+      integer and the "content_block" object. If the content_block object is
+      absent or not an object, or if the "type" string field is absent, the
+      event is silently ignored.
+
+      Block type dispatch:
+
+      - "text": the current block type is set to text. No event is emitted.
+
+      - "thinking": the current block type is set to thinking. No event is
+        emitted.
+
+      - "redacted_thinking": the current block type is set to redacted thinking.
+        The "data" string field from the content_block object is extracted and
+        stored in the streaming context. No event is emitted.
+
+      - "tool_use": the current block type is set to tool call. Any previously
+        accumulated tool arguments buffer is freed and reset to null. The "id"
+        and "name" string fields are extracted from the content_block object and
+        stored. A TOOL_CALL_START event is emitted immediately, carrying the
+        index and the id and name values as they stand at the time of emission
+        (either or both may be null if the fields were absent in the event).
+
+      <notable reason="tool-start-emitted-before-both-fields-confirmed">
+        TOOL_CALL_START is emitted as soon as a tool_use block begins,
+        regardless of whether both id and name were successfully extracted.
+        The event may carry null id or null name if either field was missing
+        from the content_block_start payload.
+      </notable>
+
+      <notable reason="tool-args-reset-on-new-block">
+        When a tool_use block starts, any tool argument buffer from a prior
+        block is discarded. This allows sequential tool calls to accumulate
+        independently, though only the most recent tool state is retained.
+      </notable>
+    </content-block-start-processing>
+
+    <content-block-delta-processing order="6">
+      On receiving a content_block_delta event, the processor reads the "index"
+      integer (defaulting to 0 if absent) and the "delta" object. If the delta
+      object is absent or not an object, or if the "type" string field within
+      it is absent, the event is silently ignored.
+
+      Delta type dispatch:
+
+      - "text_delta": the "text" string from the delta object is extracted and
+        a TEXT_DELTA event is emitted carrying the index and the text pointer.
+        No accumulation into the streaming context occurs.
+
+      - "thinking_delta": the "thinking" string from the delta object is
+        extracted and appended to the accumulated thinking text buffer. A
+        THINKING_DELTA event is then emitted carrying the index and the
+        delta string pointer.
+
+      - "signature_delta": the "signature" string from the delta object is
+        extracted. The existing thinking signature value in the streaming
+        context is freed and replaced with the new value. No event is emitted.
+
+      - "input_json_delta": the "partial_json" string from the delta object is
+        extracted and appended to the accumulated tool arguments buffer. A
+        TOOL_CALL_DELTA event is emitted carrying the index and the partial
+        string pointer.
+
+      <notable reason="text-delta-pointer-aliases-sse-buffer">
+        The text pointer carried in a TEXT_DELTA event is not copied — it
+        aliases directly into the SSE event data buffer. The pointer is
+        ephemeral and must not be retained by the caller beyond the callback
+        invocation.
+      </notable>
+
+      <notable reason="signature-replacement-not-accumulation">
+        Signature deltas use replacement semantics. Each new signature_delta
+        discards the previous value and stores only the incoming string. If
+        multiple signature deltas arrive (which is unusual), only the last one
+        is retained. This is in contrast to thinking text and tool arguments,
+        which are appended across deltas.
+      </notable>
+
+      <notable reason="thinking-delta-also-accumulated">
+        Unlike text_delta — which is only emitted, not stored — thinking_delta
+        content is both emitted as a THINKING_DELTA event and appended to the
+        accumulated thinking text buffer for inclusion in the final response.
+      </notable>
+    </content-block-delta-processing>
+
+    <content-block-stop-processing order="7">
+      On receiving a content_block_stop event, the processor reads the "index"
+      integer (defaulting to 0 if absent). If the current block type is tool
+      call, a TOOL_CALL_DONE event is emitted carrying the index. For all other
+      block types (text, thinking, redacted thinking), no event is emitted.
+
+      After the conditional emission, the current block index is reset to -1
+      to indicate no active block.
+
+      <notable reason="tool-state-not-cleared-on-stop">
+        After emitting TOOL_CALL_DONE, the accumulated tool state (id, name,
+        arguments) is deliberately left intact in the streaming context.
+        The response builder reads this state when assembling the final response.
+        Clearing the state here would cause the tool call to be lost from the
+        response.
+      </notable>
+    </content-block-stop-processing>
+
+    <message-delta-processing order="8">
+      On receiving a message_delta event, the processor extracts data from two
+      top-level fields:
+
+      - The nested "delta" object may contain a "stop_reason" string. If
+        present, it is translated to an internal finish reason enumeration
+        value and stored in the streaming context.
+
+      - The top-level "usage" object (not nested inside "delta") may contain
+        "output_tokens" and "thinking_tokens" integers. If present, they are
+        stored in the streaming context. After extraction, the total token count
+        is computed as input_tokens + output_tokens + thinking_tokens and stored.
+
+      No event is emitted for message_delta events.
+    </message-delta-processing>
+
+    <message-stop-processing order="9">
+      On receiving a message_stop event, the processor emits a DONE event
+      carrying the accumulated finish reason and the complete usage record
+      (input, output, thinking, and total token counts). The event data
+      payload from message_stop itself is not used.
+    </message-stop-processing>
+
+    <in-stream-error-processing order="10">
+      On receiving an error event, the processor extracts the "error" object
+      from the root. If the error object is absent or not an object, an ERROR
+      event is emitted with category UNKNOWN and a generic message.
+
+      When the error object is present, the "type" and "message" string fields
+      are extracted. The "message" value (defaulting to "Unknown error" if
+      absent) is carried directly in the emitted ERROR event. The "type" value
+      is mapped to an error category:
+
+      - "authentication_error" → AUTH
+      - "rate_limit_error" → RATE_LIMIT
+      - "invalid_request_error" → INVALID_ARG
+      - "overloaded_error" → SERVER
+      - Any other type string, or absent type → UNKNOWN
+
+      An ERROR event is emitted with the mapped category and extracted message.
+
+      <notable reason="in-stream-errors-use-type-not-http-status">
+        In-stream error events carry their own type string and are categorized
+        by that string directly. This differs from non-streaming Anthropic
+        errors, which are categorized solely by HTTP status code with the error
+        body used only for structural validation.
+      </notable>
+    </in-stream-error-processing>
+
+  </behavior>
+
+</specification>

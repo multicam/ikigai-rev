@@ -1,0 +1,170 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<specification topic="Agent Session Restore Replay">
+
+  <topic-statement>
+    The agent session restore replay subsystem populates an agent's in-memory
+    conversation history and scrollback display by iterating over the message
+    records loaded from the database, converting each to its live representation
+    and rendering each to the scrollback buffer.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Conversation population (filtering, conversion, token cache tracking),
+      scrollback population (command and fork side-effect replay before each
+      render), render error handling, and mark restoration from the replay
+      context mark stack.
+    </in-scope>
+
+    <boundary name="Message loading">
+      How database records are queried and assembled into the replay context is
+      handled by the agent restoration orchestrator and is out of scope here.
+    </boundary>
+
+    <boundary name="Command side-effect replay">
+      The logic that interprets command and fork event data to update agent
+      configuration fields is handled by a separate command-effect replay
+      subsystem and is out of scope here.
+    </boundary>
+
+    <boundary name="Event rendering">
+      How individual message records are converted to scrollback display lines
+      is handled by the event rendering subsystem and is out of scope here.
+    </boundary>
+
+    <boundary name="Token cache management">
+      The structure of the token cache and how turns are defined within it are
+      out of scope here; this subsystem only records that a new turn begins
+      whenever a user-role message is encountered during replay.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Replay context">
+      <field name="messages" type="ordered array of database message records"
+             note="chronologically ordered; includes all message kinds" />
+      <field name="count" type="non-negative integer"
+             note="number of entries in the messages array" />
+      <field name="mark stack" type="ordered collection of replay mark records"
+             note="marks extracted during earlier phases of restoration" />
+    </contract>
+
+    <contract name="Replay mark record">
+      <field name="context index" type="non-negative integer"
+             note="the position within the conversation array that this mark references" />
+      <field name="label" type="text or null"
+             note="optional human-readable label for the mark" />
+    </contract>
+
+    <contract name="Restored mark">
+      <field name="message index" type="non-negative integer"
+             note="copied from the replay mark's context index" />
+      <field name="label" type="text or null"
+             note="deep-copied from the replay mark's label; null if the source label is null" />
+      <field name="timestamp" type="null"
+             note="always null after restore; not preserved from database" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <conversation-population order="1">
+      The agent's live conversation array is built by iterating every entry in
+      the replay context in order.
+
+      For each entry, two preconditions must both be satisfied for the message
+      to be included in the conversation:
+
+      1. The message kind must be a conversation kind (one of: system, user,
+         assistant, tool_call, tool_result, tool).
+      2. The message must not be marked as interrupted.
+
+      Messages that fail either precondition are silently skipped.
+
+      For each qualifying message, the database record is converted to an
+      in-memory provider message object. If conversion fails, the error is
+      logged and the message is skipped; restoration continues with the next
+      entry without aborting.
+
+      System messages yield a null provider message object on successful
+      conversion. A null result is not an error — system prompts are handled
+      through the agent's system prompt field rather than the conversation
+      array, so a null conversion result is silently ignored.
+
+      For all other qualifying messages that produce a non-null provider
+      message object, the object is appended to the agent's live conversation
+      array. If the message has user role, the token cache records a new turn
+      at this point.
+
+      <notable reason="interrupted messages are excluded from conversation">
+        A message flagged as interrupted is not added to the live conversation
+        even if its kind is a conversation kind. Interrupted messages represent
+        incomplete LLM turns and must not be submitted to the provider as
+        complete history.
+      </notable>
+
+      <notable reason="add-to-conversation failures are logged and skipped">
+        If appending a successfully converted message to the conversation array
+        fails (for example, due to memory exhaustion), the error is logged and
+        the message is skipped. Restoration continues; the agent may start with
+        a truncated conversation history.
+      </notable>
+    </conversation-population>
+
+    <scrollback-population order="2">
+      The agent's scrollback display is reconstructed by iterating every entry
+      in the replay context in order, including entries that were excluded from
+      the conversation in the previous phase.
+
+      Before rendering each entry, command-side effects are applied if the
+      message kind is "command" or "fork". This ensures that state changes
+      recorded as historical commands (such as model selections or fork events
+      that establish pinned documents and toolset filters) take effect before
+      the corresponding event is rendered to the scrollback, keeping the
+      displayed history consistent with the agent's configuration at each point
+      in time.
+
+      After any applicable side-effects are applied, the entry is rendered to
+      the scrollback buffer using the message kind, content, data, and
+      interrupted flag. If rendering fails, the error is logged and the entry
+      is skipped; scrollback reconstruction continues with the next entry
+      without aborting.
+
+      <notable reason="all messages are rendered, not just conversation messages">
+        Non-conversation kinds such as "command", "fork", and others are
+        rendered to the scrollback even though they are excluded from the live
+        conversation array. The scrollback is a complete historical display;
+        the conversation array is a filtered input for the LLM.
+      </notable>
+
+      <notable reason="fork events replay the same side-effect path as commands">
+        Both "command" kind messages and "fork" kind messages are routed through
+        the command-effect replay logic. Fork events carry pinned-document and
+        toolset-filter data in their payload, which the replay logic extracts
+        and applies to the agent.
+      </notable>
+    </scrollback-population>
+
+    <marks-restoration order="3">
+      If the replay context's mark stack contains one or more entries, an array
+      of mark objects is allocated on the agent and populated in stack order.
+
+      For each entry in the mark stack a mark object is allocated and
+      initialized with the entry's context index as the message index, a
+      deep copy of the entry's label (or null if the label is absent), and a
+      null timestamp. The mark is appended to the agent's mark array and the
+      agent's mark count is incremented.
+
+      If the mark stack is empty, no mark array is allocated and the agent's
+      mark count remains zero.
+
+      <notable reason="marks restoration is not currently reachable">
+        The marks restoration operation is defined but is excluded from coverage
+        tracking and is not invoked by any current execution path in the agent
+        restoration orchestrator. It exists as infrastructure for future use.
+      </notable>
+    </marks-restoration>
+
+  </behavior>
+
+</specification>

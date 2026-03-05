@@ -1,0 +1,154 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<specification topic="Separator Layer Rendering">
+
+  <topic-statement>
+    The separator layer renders a single-row horizontal dividing line with optional
+    embedded navigation context and optional embedded debug information.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Separator layer creation, visibility determination, height reporting, the rendering
+      algorithm including baseline line characters, navigation context formatting,
+      debug information formatting, visual-width-aware layout, and the post-line terminal
+      sequence.
+    </in-scope>
+
+    <boundary name="Layer protocol">
+      The separator participates in the general layer rendering pipeline through the
+      standard visibility, height, and render callbacks. How the pipeline invokes those
+      callbacks and assembles the overall frame is out of scope.
+    </boundary>
+
+    <boundary name="Display width calculation">
+      Computing the number of terminal columns occupied by a byte sequence, excluding
+      ANSI escape sequences, is performed by the scrollback display-width utility. This
+      specification records that the utility is used to measure navigation and debug
+      string widths, not how the utility operates.
+    </boundary>
+
+    <boundary name="Navigation context sourcing">
+      The parent, sibling, and current agent UUIDs and child count are supplied by the
+      caller through a post-creation configuration step. How those values are determined
+      (agent registry lookups, tree traversal) is out of scope.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Separator layer state">
+      <field name="visible flag" type="pointer to boolean" note="raw pointer; visibility is determined by dereferencing this pointer at render time, not at creation time" />
+      <field name="debug info" type="five optional pointers" note="scroll offset, first visible row, terminal height, document height (all size_t pointers), and render elapsed time (uint64_t pointer); all default to null at creation; all must be set together via a dedicated configuration call to enable debug display" />
+      <field name="navigation context" type="struct of optional strings and count" note="parent UUID, previous sibling UUID, current UUID, next sibling UUID (all const char pointers, nullable), and child count (size_t); all default to null/zero at creation; set via a dedicated configuration call" />
+    </contract>
+
+    <contract name="Navigation string elements">
+      <field name="parent indicator" type="string" note="upward arrow followed by first 6 characters of parent UUID followed by '...' when parent UUID is non-null; dim upward arrow followed by '-' (ANSI reset after) when parent UUID is null" />
+      <field name="previous sibling indicator" type="string" note="leftward arrow followed by first 6 characters of previous sibling UUID followed by '...' when non-null; dim leftward arrow followed by '-' (ANSI reset after) when null" />
+      <field name="current agent" type="string" note="'[' followed by first 6 characters of current UUID followed by '...]'" />
+      <field name="next sibling indicator" type="string" note="rightward arrow followed by first 6 characters of next sibling UUID followed by '...' when non-null; dim rightward arrow followed by '-' (ANSI reset after) when null" />
+      <field name="child count indicator" type="string" note="downward arrow followed by the decimal child count when count is greater than zero; dim downward arrow followed by '-' (ANSI reset after) when count is zero" />
+    </contract>
+
+    <contract name="Debug string format">
+      <field name="off" type="integer" note="current scroll offset; the viewport_offset pointer value, or 0 if pointer is null" />
+      <field name="row" type="integer" note="first visible row; the viewport_row pointer value, or 0 if pointer is null" />
+      <field name="h" type="integer" note="terminal height in rows; the viewport_height pointer value, or 0 if pointer is null" />
+      <field name="doc" type="integer" note="total document height; the document_height pointer value, or 0 if pointer is null" />
+      <field name="sb" type="integer" note="scrollback rows; computed as document_height minus 3 when document_height is at least 3, otherwise 0; the subtracted 3 accounts for the separator, input, and status layers" />
+      <field name="t" type="string" note="render elapsed time: formatted as an integer followed by 'us' when elapsed is below 1000 microseconds; formatted as a decimal with one decimal place followed by 'ms' when elapsed is 1000 microseconds or above" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <creation order="1">
+      The separator layer is created with a name string and a pointer to an external
+      boolean visibility flag. Debug info pointers are all initialized to null. Navigation
+      context strings are all initialized to null and child count to zero. The layer
+      registers three callbacks: visibility check, height query, and render.
+    </creation>
+
+    <visibility order="2">
+      The visibility predicate dereferences the stored boolean pointer and returns its
+      value. The flag is not copied at creation; changes to the pointed-to boolean are
+      reflected immediately at the next render.
+    </visibility>
+
+    <height order="3">
+      The separator always reports a height of exactly one row regardless of terminal
+      width or content.
+    </height>
+
+    <rendering order="4">
+      Rendering produces exactly one row by the following algorithm:
+
+      <navigation-string-assembly order="1">
+        If the current agent UUID is non-null, a navigation string is assembled by
+        formatting all five navigation elements (parent indicator, previous sibling
+        indicator, current agent, next sibling indicator, child count indicator) with
+        single spaces separating them and a leading and trailing space, in that order.
+        The resulting string is stored in a fixed 256-byte buffer.
+
+        If the current agent UUID is null, no navigation string is produced and the
+        navigation string has zero length.
+      </navigation-string-assembly>
+
+      <debug-string-assembly order="2">
+        If the debug scroll-offset pointer is non-null, a debug string is assembled
+        containing all six fields in the format described in the data contracts section.
+        The time threshold for switching from microsecond to millisecond display is
+        exactly 1000 microseconds (values of 999 and below use the microsecond form;
+        values of 1000 and above use the millisecond form). The debug string is stored
+        in a fixed 128-byte buffer with a leading and trailing space.
+
+        If the debug scroll-offset pointer is null, no debug string is produced and the
+        debug string has zero length.
+      </debug-string-assembly>
+
+      <line-character-count order="3">
+        The visual widths of the navigation and debug strings are computed by scanning
+        their bytes and excluding all ANSI escape code sequences. The total number of
+        horizontal box-drawing characters to emit is the terminal width minus the sum
+        of both visual widths. If the sum of visual widths is zero or equals or exceeds
+        the terminal width, the full terminal width of box-drawing characters is emitted.
+
+        <notable reason="visual width excludes ANSI codes">
+          Navigation strings contain ANSI dim and reset sequences for absent-slot
+          indicators. These sequences consume bytes but occupy no terminal columns.
+          Using display-width calculation rather than byte length ensures the total
+          rendered row width matches the terminal width exactly.
+        </notable>
+      </line-character-count>
+
+      <output-assembly order="4">
+        The row is assembled by appending to the output buffer in this order:
+
+        1. The computed number of horizontal box-drawing characters (Unicode U+2500,
+           three bytes each in UTF-8), one at a time.
+        2. The navigation string, if non-empty.
+        3. The debug string, if non-empty.
+        4. A clear-to-end-of-line sequence followed by carriage return and line feed.
+      </output-assembly>
+    </rendering>
+
+    <post-creation-configuration order="5">
+      Two separate post-creation operations update the layer's state:
+
+      The debug configuration operation accepts five pointers and stores all of them,
+      replacing any previously stored pointers. All five are expected to be set together;
+      the debug display is gated solely on whether the scroll-offset pointer is non-null.
+
+      The navigation context configuration operation accepts four UUID string pointers
+      and a child count value, storing them directly as raw pointers. The stored pointers
+      alias the caller's strings and are not copied. Any or all UUID pointers may be null.
+
+      <notable reason="stored pointers are not owned by the layer">
+        Both debug pointers and navigation UUID pointers are raw aliases to memory owned
+        elsewhere. The layer does not copy or free them. Callers must ensure the pointed-to
+        data remains valid for the layer's lifetime.
+      </notable>
+    </post-creation-configuration>
+
+  </behavior>
+
+</specification>

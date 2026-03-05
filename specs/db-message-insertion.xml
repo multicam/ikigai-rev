@@ -1,0 +1,86 @@
+<specification topic="db-message-insertion">
+  <topic-statement>The database message insertion system validates message kinds and persists conversation messages to a database session.</topic-statement>
+
+  <scope>
+    <in-scope>Kind string validation against the set of recognized message kinds</in-scope>
+    <in-scope>Parameterized insertion of a message record into a database session</in-scope>
+    <in-scope>In-memory construction of a tool result message record</in-scope>
+    <boundary name="message-retrieval">Reading or querying previously inserted messages is not covered here.</boundary>
+    <boundary name="session-lifecycle">Creating or managing database sessions is out of scope.</boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="message-record">
+      <field name="id" type="integer" notes="0 when not yet persisted; assigned by database on insert" />
+      <field name="kind" type="string" notes="one of the 13 recognized kind strings" />
+      <field name="content" type="string|null" notes="free-form text content; nullable" />
+      <field name="data_json" type="string|null" notes="JSON-encoded auxiliary data; nullable" />
+      <field name="agent_uuid" type="string" notes="UUID of the owning agent" />
+      <field name="session_id" type="integer" notes="positive integer identifying the database session" />
+    </contract>
+
+    <contract name="tool-result-data-json">
+      <field name="tool_call_id" type="string" notes="ID of the tool call being responded to" />
+      <field name="name" type="string" notes="name of the tool that was invoked" />
+      <field name="output" type="string" notes="raw output text from the tool" />
+      <field name="success" type="boolean" notes="extracted from the tool_success field of the output JSON; defaults to false if parsing fails" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+    <kind-validation order="1">
+      Exactly 13 kind strings are recognized: "clear", "system", "user", "assistant",
+      "tool_call", "tool_result", "mark", "rewind", "agent_killed", "command", "fork",
+      "usage", and "interrupted". Validation is an exact, case-sensitive string match
+      against each member of this set. Any string not in the set causes validation to
+      return false; any exact match returns true.
+    </kind-validation>
+
+    <insertion-preconditions order="2">
+      Before inserting a message, the system asserts that the database handle and its
+      underlying connection are both non-null, and that the session identifier is a
+      positive integer greater than zero. Violations of these preconditions abort the
+      process immediately rather than returning an error.
+    </insertion-preconditions>
+
+    <insertion-execution order="3">
+      A temporary memory context is created for the duration of the insertion. A
+      parameterized INSERT statement is built with five positional parameters: session
+      identifier (rendered as a decimal string), agent UUID, message kind, content
+      (which may be null), and auxiliary JSON data (which may be null). The statement
+      requests the database to return the assigned message ID. The result is wrapped
+      so that it is automatically released when the temporary context is freed.
+    </insertion-execution>
+
+    <insertion-success order="4">
+      When the database reports a successful command result, the operation returns
+      success with no additional value. The temporary memory context and all
+      allocations within it are released.
+    </insertion-success>
+
+    <insertion-failure order="5">
+      When the database reports any result other than a successful command, an error
+      message is produced. The temporary memory context is released after the
+      operation, so the error message must survive that release.
+
+      <notable reason="error-allocation-context">
+        The error message is allocated on the database context rather than on the
+        temporary context. Allocating it on the temporary context would cause it to
+        be freed before the caller could read it, producing a dangling pointer. By
+        attaching it to the longer-lived database context, the error string remains
+        valid after the temporary context is destroyed.
+      </notable>
+    </insertion-failure>
+
+    <tool-result-construction order="6">
+      A tool result message record is constructed in memory without being persisted.
+      The record carries an ID of zero to signal that it has not yet been assigned a
+      database identity. Its kind is fixed as "tool_result". The content field holds
+      the provided output text verbatim. The auxiliary JSON data encodes four fields:
+      the tool call identifier being responded to, the tool name, the raw output text,
+      and a success boolean. The success flag is extracted by parsing the output text
+      as JSON and reading the "tool_success" field; if that parse fails or the field
+      is absent, success defaults to false.
+    </tool-result-construction>
+  </behavior>
+</specification>
