@@ -1,0 +1,119 @@
+<specification topic="Input Layer Rendering">
+
+  <topic-statement>
+    The input layer renders the agent's text input buffer as terminal rows,
+    preserving newlines and reserving cursor space when the buffer is empty.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Visibility determination from an external flag, height calculation by
+      scanning text bytes with column tracking, and rendering that converts
+      newlines to terminal row endings and appends a trailing clear-to-EOL
+      sequence.
+    </in-scope>
+
+    <boundary name="Input Buffer">
+      The text content, its byte length, and the visibility flag are managed
+      by the REPL context. This layer stores raw non-owning pointers to live
+      REPL state and reads them at each call.
+    </boundary>
+
+    <boundary name="Layer Protocol">
+      How the layer's visibility, height, and render functions are invoked by
+      the rendering pipeline is covered by the Layer Rendering specification.
+      This topic covers only the implementations of those three functions for
+      the input layer.
+
+      <shared topic="Layer Rendering">
+        The rendering pipeline calls the visibility predicate once per frame.
+        If it returns false, height and render are not called. If true, height
+        is called to measure the layer, and render is called with a terminal
+        width, a zero-indexed start row within the layer, and a row count.
+      </shared>
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="External State (accessed via live raw pointers)">
+      <field name="visible flag" type="boolean" note="controls layer visibility; read via pointer at each visibility check" />
+      <field name="text pointer" type="pointer to string" note="the input buffer text; read via pointer at each height and render call" />
+      <field name="text length" type="non-negative integer" note="byte length of the text; read via pointer at each height and render call" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <visibility order="1">
+      The layer is visible when the external boolean flag is true. It is
+      invisible when the flag is false.
+    </visibility>
+
+    <height-calculation order="2">
+      When the text length is zero, the height is 1. A single row is always
+      reserved to provide space for cursor placement, even with no text.
+
+      When the text length is non-zero, the height is computed by scanning
+      each byte of the text in order, tracking physical rows and a current
+      column position. Both counters start at 1 and 0 respectively.
+
+      For each byte:
+      - If the byte is a newline character (\n): the physical row count is
+        incremented by one, and the column position is reset to zero.
+      - For any other byte: the column position is incremented by one. If the
+        column position equals or exceeds the terminal width, the physical row
+        count is incremented by one and the column position is reset to zero.
+
+      The final physical row count is returned as the height.
+
+      <notable reason="byte-level column counting">
+        Each non-newline byte increments the column counter by exactly one,
+        regardless of the byte's role in a multi-byte sequence. Multi-byte
+        UTF-8 characters are counted as multiple columns, not one. ANSI escape
+        sequences are also counted byte-by-byte, inflating the column count
+        for styled text.
+      </notable>
+    </height-calculation>
+
+    <rendering order="3">
+      The width, start_row, and row_count parameters are accepted by the render
+      function but none of them are used in any part of the output.
+
+      <notable reason="render parameters ignored">
+        The render function's width, start_row, and row_count parameters are
+        all discarded. The full text is always rendered from byte zero,
+        regardless of viewport clipping parameters.
+      </notable>
+
+      <empty-buffer order="1">
+        When the text length is zero, the ANSI erase-to-end-of-line sequence
+        (ESC[K) followed by carriage-return and line-feed (\r\n) is appended
+        to the output. This produces a single blank row that preserves the
+        cursor's visual position.
+      </empty-buffer>
+
+      <non-empty-buffer order="2">
+        When the text length is non-zero, each byte is processed in order:
+        - A newline character (\n) is replaced by the ANSI erase-to-end-of-line
+          sequence (ESC[K) followed by carriage-return and line-feed (\r\n).
+        - Any other byte is output verbatim as a single byte.
+
+        After all bytes have been processed, if the last byte of the text is
+        not a newline, the ANSI erase-to-end-of-line sequence (ESC[K) followed
+        by carriage-return and line-feed (\r\n) is appended to terminate the
+        final partial row.
+
+        <notable reason="no padding or truncation">
+          Lines wider than the terminal width are not truncated, and lines
+          shorter than the terminal width are not padded. The ESC[K sequence
+          erases any stale content from the cursor to the end of the terminal
+          line, which serves as implicit right-side clearing without adding
+          spaces.
+        </notable>
+      </non-empty-buffer>
+
+    </rendering>
+
+  </behavior>
+
+</specification>

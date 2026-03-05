@@ -47,7 +47,8 @@
       Google finishReason strings are mapped to internal finish reasons:
       - "STOP" → STOP
       - "MAX_TOKENS" → LENGTH
-      - "SAFETY", "BLOCKLIST", "PROHIBITED_CONTENT", "SPII" → CONTENT_FILTER
+      - "SAFETY", "BLOCKLIST", "PROHIBITED_CONTENT", "IMAGE_SAFETY",
+        "IMAGE_PROHIBITED_CONTENT", "RECITATION" → CONTENT_FILTER
       - "MALFORMED_FUNCTION_CALL", "UNEXPECTED_TOOL_CALL" → ERROR
       - All other values (including absent) → UNKNOWN
     </finish-reason-mapping>

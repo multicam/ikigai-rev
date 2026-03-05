@@ -1,0 +1,140 @@
+<specification topic="Completion Layer Rendering">
+
+  <topic-statement>
+    The completion layer renders tab-completion candidates as a list of
+    terminal rows, highlighting the selected entry with reverse-video styling
+    and padding each row to the full terminal width.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Visibility determination from an external completion context pointer,
+      height computation from the candidate count, per-candidate row rendering
+      with description lookup, selection highlighting, width padding, and
+      line termination.
+    </in-scope>
+
+    <boundary name="Tab Completion">
+      The candidate list, candidate count, and current selection index are
+      managed by the tab completion subsystem. This topic receives them via
+      a live pointer and renders the result.
+    </boundary>
+
+    <boundary name="Command Registry">
+      Command descriptions are retrieved from an external registry at render
+      time. This topic uses the description string that is returned; it does
+      not manage the registry.
+    </boundary>
+
+    <boundary name="Layer Protocol">
+      How the layer's visibility, height, and render functions are called by
+      the rendering pipeline is covered by the Layer Rendering specification.
+      This topic covers only the implementations of those three functions for
+      the completion layer.
+
+      <shared topic="Layer Rendering">
+        The rendering pipeline calls the visibility predicate once per frame.
+        If it returns false, height and render are not called. If true, height
+        is called to measure the layer, and render is called with a terminal
+        width, a zero-indexed start row within the layer, and a row count to
+        render.
+      </shared>
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Completion Context (external, accessed via pointer)">
+      <field name="count" type="non-negative integer" note="total number of candidates" />
+      <field name="current" type="non-negative integer" note="zero-indexed position of the selected candidate" />
+      <field name="candidates" type="array of string" note="candidate strings in display order" />
+    </contract>
+
+    <contract name="Command Record (from command registry)">
+      <field name="name" type="string" note="command name used for lookup" />
+      <field name="description" type="string" note="human-readable description shown next to the candidate" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <visibility order="1">
+      The layer is visible when the completion context pointer dereferences
+      to a non-null value. When the pointer dereferences to null, the layer
+      is invisible and produces no rows.
+    </visibility>
+
+    <height-calculation order="2">
+      When invisible, height is zero. When visible, height equals the candidate
+      count from the completion context.
+
+      <notable reason="width parameter ignored">
+        The terminal width parameter is accepted by the height function but is
+        not used in any calculation. Candidate count alone determines height
+        regardless of terminal width.
+      </notable>
+    </height-calculation>
+
+    <rendering order="3">
+      The number of candidates rendered is the lesser of the supplied row count
+      and the total candidate count. Candidates are rendered starting from
+      index zero regardless of the start_row parameter.
+
+      <notable reason="start_row ignored">
+        The start_row parameter, which would normally indicate an offset into
+        the layer's row space for viewport clipping, is accepted but never
+        used. Rendering always begins from candidate index zero.
+      </notable>
+
+      Before rendering any row, the full command registry is queried to obtain
+      all command records (name and description pairs).
+
+      <per-candidate-row order="1">
+        For each candidate at index i (from 0 to candidates_to_render minus 1):
+
+        1. If i equals the current selection index, the ANSI sequence for
+           reverse video combined with bold (ESC[7;1m) is appended to the
+           output.
+
+        2. Two spaces are appended.
+
+        3. The candidate name string (all bytes) is appended.
+
+        4. Three spaces are appended.
+
+        5. The description is resolved: the command registry records are scanned
+           linearly. The first record whose name matches the candidate name
+           exactly provides the description. If no record matches, an empty
+           string is used as the description.
+
+        6. The description string (all bytes) is appended.
+
+        7. If i equals the current selection index, the ANSI reset sequence
+           (ESC[0m) is appended.
+
+        8. Padding: a visible length is computed as 2 plus the byte length of
+           the candidate name plus 3 plus the byte length of the description.
+           While this visible length is strictly less than the terminal width,
+           one space is appended and the visible length is incremented.
+
+        9. The ANSI erase-to-end-of-line sequence (ESC[K) followed by
+           carriage-return and line-feed (\r\n) is appended.
+
+        <notable reason="visible-length calculation uses byte lengths">
+          ANSI escape sequences within a candidate name or description would
+          be counted as bytes in the visible length, causing the padding to
+          undershoot. Candidate names and descriptions sourced from the command
+          registry are plain text, so this does not affect normal operation.
+        </notable>
+
+        <notable reason="no truncation for over-width content">
+          When the combined byte length of the candidate row equals or exceeds
+          the terminal width, the padding loop does not execute and the content
+          is not truncated. The line will extend beyond the terminal width.
+        </notable>
+      </per-candidate-row>
+
+    </rendering>
+
+  </behavior>
+
+</specification>
