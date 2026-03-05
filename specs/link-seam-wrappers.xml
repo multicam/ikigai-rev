@@ -1,0 +1,110 @@
+<specification topic="Link Seam Wrappers">
+
+  <topic-statement>
+    The link-seam wrapper system exposes every external library call and selected
+    internal call through a thin indirection layer that test builds can replace
+    without modifying production code.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      The MOCKABLE symbol attribute, the two-mode compilation strategy (inline in
+      release, weak symbol in debug), the aggregation header that assembles all
+      wrapper families into a single include, and the general contract that every
+      wrapped call is a transparent passthrough unless a test overrides it.
+    </in-scope>
+    <boundary name="Individual wrapper families">
+      The specific functions wrapped in each family (HTTP client, HTML parsing,
+      internal application functions, POSIX, standard library, JSON, talloc) are
+      documented separately. This specification covers only the mechanism that
+      applies uniformly to all of them.
+    </boundary>
+    <boundary name="Test override mechanism">
+      Tests replace wrapped functions by providing a strong-symbol definition of
+      the same name. The linker resolves the strong definition over the weak one.
+      The test framework conventions for doing this are outside scope.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="MOCKABLE attribute">
+      <field name="release build" type="keyword" note="expands to 'static inline'; definition lives in the header; call is inlined at the call site with zero overhead" />
+      <field name="debug/test build" type="keyword" note="expands to '__attribute__((weak))'; definition lives in the .c file; the symbol is a weak global that any translation unit can override" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <release-mode-dispatch order="1">
+      In release builds (NDEBUG defined), each wrapper is defined as a static
+      inline function directly in its header file. The compiler inlines the call
+      at every use site, producing identical machine code to calling the underlying
+      function directly. No wrapper symbol appears in the object file or binary.
+      No runtime indirection exists.
+    </release-mode-dispatch>
+
+    <debug-mode-dispatch order="2">
+      In debug and test builds (NDEBUG not defined), each wrapper is declared as a
+      weak symbol in the header and defined as a weak symbol in a corresponding
+      .c file. The weak definition calls through to the underlying function
+      unchanged. Any translation unit may provide a strong-symbol definition of the
+      same name; the linker selects the strong definition over the weak one,
+      replacing the call everywhere in the binary without source modification.
+    </debug-mode-dispatch>
+
+    <transparent-passthrough order="3">
+      When no test override is present, every wrapper forwards all arguments to the
+      underlying function and returns its result unchanged. Arguments are not
+      validated, logged, or transformed. The wrapper is behaviorally invisible.
+    </transparent-passthrough>
+
+    <aggregation-header order="4">
+      A single umbrella header includes all wrapper family headers in one
+      directive. Code that needs access to the full set of wrapped symbols includes
+      only this umbrella. The umbrella itself contains no wrapper definitions; it
+      is purely compositional.
+
+      The families included are: talloc allocation, JSON library, HTTP client
+      (curl), POSIX system calls, standard library, and internal application
+      functions.
+
+      <notable reason="web wrappers excluded from umbrella">
+        The HTML parsing wrappers are not included in the umbrella header. Code
+        that needs them must include the HTML wrapper header directly. This is the
+        only wrapper family omitted from the umbrella.
+      </notable>
+    </aggregation-header>
+
+    <variadic-limitation order="5">
+      Some underlying functions are variadic (accept variable argument lists).
+      Wrapping variadic functions requires special handling.
+
+      In release builds, variadic functions that cannot be expressed as inline
+      functions are wrapped using C preprocessor macros that expand directly to
+      the underlying call, bypassing the wrapper mechanism entirely. These macros
+      cannot be overridden by tests.
+
+      In debug builds, variadic wrappers are defined as proper functions. They
+      extract a single generic pointer argument from the variadic list and forward
+      it to the underlying function. This means only the first variadic argument
+      is forwarded; the wrapper does not support multiple variadic arguments.
+
+      <notable reason="variadic extraction uses void pointer">
+        The debug-mode variadic wrappers extract variadic arguments as a raw void
+        pointer (va_arg with void* type) regardless of the actual type the
+        underlying function expects. For integer or enum arguments this works by
+        coincidence on platforms where pointer and integer registers align, but
+        is not formally correct C.
+      </notable>
+    </variadic-limitation>
+
+    <lcov-exclusion order="6">
+      All wrapper definitions in debug/test builds are marked for exclusion from
+      line coverage analysis. Because these functions only delegate to the real
+      implementation, covering them adds no meaningful assurance and would inflate
+      coverage accounting. Release builds have no symbols to exclude.
+    </lcov-exclusion>
+
+  </behavior>
+
+</specification>

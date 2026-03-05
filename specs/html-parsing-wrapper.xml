@@ -1,0 +1,65 @@
+<specification topic="HTML Parsing Wrapper">
+
+  <topic-statement>
+    The HTML parsing wrapper exposes the HTML document parsing and document
+    freeing operations through the link-seam mechanism so tests can substitute
+    or intercept them.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      The two wrapped HTML operations: parsing an in-memory HTML byte buffer into
+      a document tree, and releasing a parsed document's memory. The build-mode
+      selection between inline and weak-symbol form.
+    </in-scope>
+    <boundary name="Link-seam mechanism">
+      The MOCKABLE attribute and the inline-vs-weak-symbol compilation strategy
+      are shared infrastructure.
+      <shared topic="Link Seam Wrappers">
+        In release builds the wrappers are static inline; in debug builds they
+        are weak symbols that tests can override.
+      </shared>
+    </boundary>
+    <boundary name="HTML parsing library">
+      The actual document parsing and tree construction are performed by an
+      external HTML parsing library. This wrapper does not modify those behaviors.
+    </boundary>
+    <boundary name="Curl HTTP wrappers">
+      The HTML parsing wrapper header explicitly includes the HTTP client wrapper
+      header as a dependency, making the full HTTP wrapper surface available to
+      any translation unit that includes this header. The HTTP wrappers themselves
+      are documented separately.
+    </boundary>
+  </scope>
+
+  <behavior>
+
+    <parse-html-buffer order="1">
+      Parses an HTML document from a caller-supplied byte buffer. The caller
+      provides the buffer, its size in bytes, a URL string used as the document's
+      base URI, a character encoding name, and an integer options bitmask. Returns
+      an opaque document handle on success, or null on failure. All arguments are
+      forwarded to the underlying library unchanged; no preprocessing or validation
+      occurs.
+    </parse-html-buffer>
+
+    <free-document order="2">
+      Releases all memory associated with a parsed HTML document. Accepts the
+      opaque document handle returned by the parse operation. Forwards the handle
+      to the underlying library's free routine unchanged. Returns nothing. No
+      null-check is performed before forwarding; passing null is undefined behavior
+      inherited from the underlying library.
+    </free-document>
+
+    <umbrella-exclusion order="3">
+      <notable reason="not included in the aggregation umbrella">
+        This wrapper family is not pulled in by the master wrapper umbrella header.
+        Translation units that require HTML parsing operations must include this
+        header directly. Every other wrapper family is collected by the umbrella;
+        this one is the sole exception.
+      </notable>
+    </umbrella-exclusion>
+
+  </behavior>
+
+</specification>

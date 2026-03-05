@@ -1,0 +1,61 @@
+<specification topic="Pthread Thread Wrapper">
+  <topic-statement>Interceptable delegating wrappers over the two thread lifecycle primitives — creation and joining — that enable test-time failure injection without changing production behavior.</topic-statement>
+
+  <scope>
+    <in-scope>Thread creation and thread join operations as interceptable seams</in-scope>
+    <in-scope>Build-mode selection between zero-overhead inlining and weak-symbol overridability</in-scope>
+    <boundary name="Thread semantics">The actual scheduling, stack allocation, and synchronization behaviors of the underlying thread primitives; this module delegates unconditionally and adds nothing</boundary>
+    <boundary name="Thread consumers">Tool execution workers, wait-command workers, and REPL shutdown logic all use these wrappers but are described elsewhere</boundary>
+    <boundary name="Mutex wrappers">Mutex primitives are a separate wrapper set described in the pthread mutex wrapper spec</boundary>
+    <boundary name="Test mocking">Override of these seams in test code; this module only provides the seam, not the override</boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="ThreadCreateArgs">
+      <field name="thread" type="pointer to platform thread handle, written on success" />
+      <field name="attr" type="pointer to platform thread attribute object, or null for defaults" />
+      <field name="start_routine" type="function pointer accepting a void pointer and returning void pointer" />
+      <field name="arg" type="void pointer passed to start_routine" />
+      <field name="return" type="int, zero on success, nonzero on failure" />
+    </contract>
+    <contract name="ThreadJoinArgs">
+      <field name="thread" type="platform thread handle identifying the thread to join" />
+      <field name="retval" type="pointer to void pointer to receive the thread's return value, or null to discard" />
+      <field name="return" type="int, zero on success, nonzero on failure" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+    <build-mode-dispatch order="1">
+      In release builds (NDEBUG defined), both thread wrappers are compiled as static inline functions directly in the header. Each wrapper expands to a single call to the corresponding platform primitive with no overhead. No object file is produced for these wrappers in release mode.
+
+      In debug and test builds (NDEBUG not defined), both thread wrappers are compiled as weak symbols in a separate translation unit. The header provides only forward declarations. Because weak symbols can be overridden by a strong symbol with the same name in another translation unit, test code can replace either wrapper with a custom implementation without modifying production sources.
+      <notable reason="The header itself contains full inline bodies inside the NDEBUG guard — the .c file duplicates those bodies under the opposite guard. The two copies must remain identical; there is no compile-time check that they match.">In release builds the .c file compiles to an empty translation unit (every definition is inside the NDEBUG-false guard), producing no object code at all.</notable>
+    </build-mode-dispatch>
+
+    <thread-create-delegation order="2">
+      The creation wrapper accepts a pointer to a thread handle, an optional attribute pointer, a start function, and an opaque argument pointer. It delegates immediately to the platform thread creation primitive, passing all four arguments unchanged. The platform's return code is returned directly; zero indicates the thread was created and its handle written to the output parameter. A nonzero return leaves the output handle in an unspecified state.
+
+      The wrapper introduces no default attribute; passing null for the attribute parameter causes the platform primitive to apply its own defaults (detach state, stack size, scheduling policy, etc.).
+
+      Callers always pass null for the attribute parameter, accepting platform defaults for all thread attributes.
+    </thread-create-delegation>
+
+    <thread-join-delegation order="3">
+      The join wrapper accepts a thread handle and an optional pointer for receiving the thread's return value. It delegates immediately to the platform blocking-join primitive. The call blocks until the target thread terminates. The platform result code is returned unchanged.
+
+      All callers in the codebase pass null for the return-value pointer, discarding the thread's return value. The wrapper does not enforce this; a non-null pointer is passed through to the platform.
+
+      Join is called in three distinct contexts:
+      — Normal tool completion: called after the completion flag is observed to be true, then the mutex-protected running and complete flags are cleared to false.
+      — Interrupted tool completion: called after the interrupt flag is cleared, before discarding the result, then the same flag cleanup follows.
+      — REPL shutdown: called if the tool thread is still marked running at the time the REPL context is destroyed, ensuring the thread is not orphaned at process teardown.
+      <notable reason="The REPL destructor performs a non-mutex-protected read of the running flag before deciding to join. This is a potential data race if the worker thread is modifying that flag concurrently. The comment in the code acknowledges this as a known limitation (no pthread_cancel, deliberate wait).">There is no timeout on the join call at shutdown; if a background subprocess is permanently blocked, the process will hang indefinitely waiting for the thread.</notable>
+    </thread-join-delegation>
+
+    <coverage-exclusion order="4">
+      In debug builds the entire implementation is marked for coverage exclusion. Because the wrappers are replaced by test-provided overrides during testing, the weak-symbol bodies are never executed under test and produce no coverage data.
+      <notable reason="This is the intended pattern: the seam bodies exist only for production use, not for direct test exercise.">All lines of each thread wrapper body are excluded from coverage measurement even though they are compiled.</notable>
+    </coverage-exclusion>
+  </behavior>
+</specification>

@@ -1,0 +1,134 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<specification topic="Wait Tool Handler">
+
+  <topic-statement>
+    The wait tool handler translates a JSON tool invocation from the LLM into
+    a blocking wait operation and serializes the result back into a JSON
+    envelope for the tool call infrastructure.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Argument parsing and validation for the wait tool, dispatch to the
+      appropriate wait mode based on argument presence, and construction of
+      the JSON result object from the wait result structure.
+    </in-scope>
+
+    <boundary name="Wait Core Logic">
+      The blocking poll loop, PostgreSQL notification registration, mailbox
+      queries, fan-in state tracking, and interrupt handling are implemented
+      by the wait synchronization subsystem. This topic invokes that subsystem
+      but does not implement it.
+      <shared topic="Wait Synchronization" />
+    </boundary>
+
+    <boundary name="Tool Result Wrapping">
+      The raw JSON result produced here is wrapped in a standard tool envelope
+      before being returned to the tool execution infrastructure.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+
+    <contract name="Tool Arguments">
+      <field name="timeout" type="number" note="required; maximum seconds to wait; 0 means non-blocking instant check" />
+      <field name="from_agents" type="array of string" note="optional; if present and is an array, enables fan-in mode; each element must be a string UUID" />
+    </contract>
+
+    <contract name="Next-Message Success Result">
+      <field name="from" type="string" note="present only when a message was received; UUID of the sending agent" />
+      <field name="message" type="string" note="present only when a message was received; the message body" />
+      <field name="status" type="string" note="present only when no message was received; the value 'timeout'" />
+    </contract>
+
+    <contract name="Fan-in Success Result">
+      <field name="results" type="array of objects" note="one object per target agent, in the order targets were specified" />
+      <field name="results[].agent_uuid" type="string" note="UUID of the target agent" />
+      <field name="results[].agent_name" type="string" note="display name of the target agent" />
+      <field name="results[].status" type="string" note="one of: running, received, idle, dead" />
+      <field name="results[].message" type="string" note="present only when status is 'received'; the message body" />
+    </contract>
+
+    <contract name="Error Result">
+      <field name="error" type="text" note="human-readable description" />
+      <field name="code" type="text" note="one of: PARSE_ERROR, INVALID_ARG" />
+    </contract>
+
+  </data-contracts>
+
+  <behavior>
+
+    <argument-parsing order="1">
+      The JSON argument string is parsed. If parsing fails, the handler returns
+      an error with code PARSE_ERROR and does not proceed.
+
+      The parsed object must contain a "timeout" field whose value is any
+      numeric type. If the field is absent or not a number, the handler returns
+      an error with code INVALID_ARG. The timeout value is truncated to a
+      signed 32-bit integer.
+
+      The presence of a "from_agents" field is then examined. Fan-in mode is
+      activated if and only if the field is present in the parsed object and
+      its value is a JSON array. A missing field or a field with a non-array
+      value (including null) selects next-message mode. An empty array is
+      treated as a valid fan-in invocation with zero targets.
+
+      <notable reason="from_agents type is not validated element-by-element before dispatch">
+        Each element of the "from_agents" array is validated to be a string
+        during the element-copying loop. If a non-string element is encountered,
+        the handler returns an error with code INVALID_ARG at that point, but
+        elements already copied into the target array before the failing element
+        are left allocated.
+      </notable>
+    </argument-parsing>
+
+    <next-message-dispatch order="2">
+      When fan-in mode is not selected, the handler delegates to the
+      next-message wait operation, passing the calling agent's identifier,
+      the session identifier, the timeout, and the agent's interrupt flag.
+
+      The wait runs synchronously on the calling thread (which is the tool
+      execution background thread). The main REPL thread is not involved
+      until the wait completes.
+    </next-message-dispatch>
+
+    <fan-in-dispatch order="3">
+      When fan-in mode is selected, all UUIDs from the "from_agents" array
+      are copied into a fresh array. The handler then delegates to the fan-in
+      wait operation, passing the calling agent's identifier, the session
+      identifier, the timeout, the UUID array, the count of targets, and the
+      agent's interrupt flag.
+
+      The wait runs synchronously on the calling thread.
+    </fan-in-dispatch>
+
+    <result-serialization order="4">
+      After the wait operation returns, the handler constructs a JSON result
+      object from the wait result structure:
+
+      For next-message mode:
+      - If a message was received (indicated by a non-null sender identifier),
+        the result object contains a "from" field with the sender UUID and a
+        "message" field with the message body.
+      - If no message was received (timeout or interrupt), the result object
+        contains a "status" field with the value "timeout".
+
+      <notable reason="interrupt is reported as timeout">
+        When the wait is interrupted (e.g., due to a user abort), the result
+        object is constructed the same way as a timeout: a "status" field with
+        value "timeout". The caller cannot distinguish an interrupt from a
+        genuine timeout expiration through the JSON result alone.
+      </notable>
+
+      For fan-in mode:
+      - A "results" array is constructed with one object per entry in the
+        wait result. Each object contains "agent_uuid", "agent_name", and
+        "status" fields. A "message" field is added only when the entry's
+        message is non-null.
+
+      The JSON result is wrapped in a success envelope and returned.
+    </result-serialization>
+
+  </behavior>
+
+</specification>

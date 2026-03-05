@@ -1,0 +1,125 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<specification topic="Internal Tool Registration">
+
+  <topic-statement>
+    The internal tool registration process installs the four built-in
+    agent-communication tools — fork, kill, send, and wait — into the shared
+    tool registry using hardcoded JSON schemas.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      The JSON schema definitions for each built-in tool, the sequence and
+      method by which schemas are parsed and tools are added to the registry,
+      and the association between each tool name and its handler and
+      completion hook.
+    </in-scope>
+
+    <boundary name="Tool Registry">
+      The registry's storage and lookup behavior is managed by the tool
+      registry subsystem. This topic only populates the registry; it does
+      not define how tools are retrieved or dispatched.
+    </boundary>
+
+    <boundary name="Tool Handlers">
+      The execution logic for each tool (fork handler, kill handler, send
+      handler, wait handler) is implemented separately. This topic wires the
+      associations but does not define the handler behaviors.
+    </boundary>
+
+    <boundary name="Shared Initialization">
+      Registration is triggered by the shared context initialization and the
+      registry refresh command. Those callers are out of scope here.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+
+    <contract name="Fork Tool Schema">
+      <field name="name" type="text" note="'fork'" />
+      <field name="description" type="text" note="instructs the LLM that this creates a child agent with a specific task, inheriting parent history, working independently with its own LLM stream" />
+      <field name="parameters.name" type="string" note="required; short human-readable label for the child agent" />
+      <field name="parameters.prompt" type="string" note="required; the task for the child agent to work on" />
+    </contract>
+
+    <contract name="Kill Tool Schema">
+      <field name="name" type="text" note="'kill'" />
+      <field name="description" type="text" note="instructs the LLM that this terminates an agent and all its descendants, returning a list of killed UUIDs" />
+      <field name="parameters.uuid" type="string" note="required; UUID of the agent to terminate, described as cascading to all descendants" />
+    </contract>
+
+    <contract name="Send Tool Schema">
+      <field name="name" type="text" note="'send'" />
+      <field name="description" type="text" note="instructs the LLM that this sends a message to another agent retrievable with the wait tool" />
+      <field name="parameters.to" type="string" note="required; UUID of the recipient agent, described as 'must be running'" />
+      <field name="parameters.message" type="string" note="required; message content to send" />
+    </contract>
+
+    <contract name="Wait Tool Schema">
+      <field name="name" type="text" note="'wait'" />
+      <field name="description" type="text" note="instructs the LLM that this waits for messages from other agents, supporting next-message and fan-in modes" />
+      <field name="parameters.timeout" type="number" note="required; maximum seconds to wait; 0 for non-blocking instant check" />
+      <field name="parameters.from_agents" type="array of string" note="optional; specific agent UUIDs for fan-in mode; omit to wait for next message from anyone" />
+    </contract>
+
+  </data-contracts>
+
+  <behavior>
+
+    <registration-sequence order="1">
+      Registration parses all four schemas and registers all four tools in a
+      fixed sequence: fork, kill, send, wait. The sequence is:
+
+      1. A temporary allocation context is created to hold schema string buffers
+         during parsing.
+      2. For each of the four tools, the hardcoded JSON schema string is copied
+         into the temporary context and parsed into an in-memory JSON document.
+         The JSON allocator used for parsing is backed by the registry's own
+         allocation context, so the parsed documents are owned by the registry.
+         If parsing fails, the process panics immediately.
+      3. Each tool is registered with the registry under its name, with its
+         parsed schema document, its handler, and its completion hook (if any).
+         If registration fails, the process panics immediately.
+      4. The temporary allocation context is freed, releasing the schema string
+         buffers. The parsed documents are unaffected because they were allocated
+         under the registry context.
+
+      <notable reason="panic on any failure">
+        All failure paths during registration — schema parse failure, registry
+        add failure — terminate the process via panic. There is no partial
+        registration or graceful degradation.
+      </notable>
+    </registration-sequence>
+
+    <completion-hooks order="2">
+      Two of the four tools have completion hooks that run on the main thread
+      after the tool handler returns from the background tool thread:
+
+      - The fork tool has a completion hook that transfers the newly created
+        child agent from the tool thread's allocation context into the REPL's
+        agent array.
+      - The kill tool has a completion hook that sets the dead flag on the
+        corresponding in-memory agent entry.
+      - The send tool has no completion hook.
+      - The wait tool has no completion hook.
+
+      <notable reason="kill schema describes cascade; kill handler does not cascade">
+        The kill tool's schema description tells the LLM that termination
+        "cascades to all descendants." The actual handler only terminates the
+        directly named agent without cascading to any descendants. The "killed"
+        array in the result always contains exactly one UUID.
+      </notable>
+    </completion-hooks>
+
+    <schema-ownership order="3">
+      Schema JSON documents are allocated using a talloc-backed JSON allocator
+      that attaches all allocations to the registry's context. This means the
+      documents live for the lifetime of the registry and are freed when the
+      registry is destroyed. The schema string buffers used during parsing are
+      owned by the temporary context and are freed immediately after registration
+      completes.
+    </schema-ownership>
+
+  </behavior>
+
+</specification>

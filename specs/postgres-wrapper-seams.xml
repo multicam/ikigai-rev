@@ -1,0 +1,150 @@
+<specification topic="PostgreSQL Wrapper Seams">
+
+  <topic-statement>
+    The PostgreSQL wrapper seam layer provides build-mode-controlled substitution
+    points for seven libpq operations, enabling test code to replace any operation
+    with a controlled implementation without modifying production call sites.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      The seven wrapped libpq operations, the dual-build mechanism that selects
+      between inlined and overridable implementations, the weak-symbol override
+      protocol for test code, and coverage exclusion for the debug-build bodies.
+    </in-scope>
+
+    <boundary name="Database Connection">
+      The actual PostgreSQL connection lifecycle, schema migration, transaction
+      control, and teardown are covered by the Database Connection specification.
+      This specification covers only the wrapper seam mechanism.
+    </boundary>
+
+    <boundary name="PostgreSQL Client Library">
+      The behavior of the seven underlying libpq functions — query execution,
+      result inspection, socket access, input consumption, and notification polling
+      — is defined entirely by the PostgreSQL client library. The wrapper seam
+      adds no logic; it either delegates unconditionally (debug) or is eliminated
+      entirely (release).
+    </boundary>
+
+    <boundary name="Test Override Implementations">
+      What test-supplied override functions do with their arguments, what values
+      they return, and how they interact with the rest of a test are concerns of
+      individual tests. This specification covers only the seam mechanism that
+      makes overriding possible.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+
+    <contract name="Wrapped Operations">
+      The seven wrapped operations and their pass-through signatures:
+
+      <field name="execute-command" type="query handle → result handle"
+             note="executes a literal SQL command string on a connection" />
+      <field name="execute-params" type="query handle + command + params → result handle"
+             note="executes a parameterized SQL command; accepts parameter type OIDs, values, lengths, formats, and a result format selector" />
+      <field name="get-cell-value" type="result handle + row index + column index → string"
+             note="retrieves the text value of a single result cell" />
+      <field name="get-result-status" type="result handle → status enum"
+             note="retrieves the execution status code of a completed result" />
+      <field name="get-socket" type="connection handle → file descriptor integer"
+             note="retrieves the file descriptor of the underlying connection socket" />
+      <field name="consume-input" type="connection handle → integer"
+             note="processes any pending input available on the connection" />
+      <field name="get-notifications" type="connection handle → notification handle or null"
+             note="dequeues the next pending asynchronous NOTIFY notification, or null if none" />
+    </contract>
+
+  </data-contracts>
+
+  <behavior>
+
+    <release-build-inlining order="1">
+      When the project is compiled with the NDEBUG flag set, all seven wrappers
+      are defined as static inline functions directly in the header. Each wrapper
+      body is a single unconditional delegation to the corresponding libpq function,
+      passing all arguments through without modification and returning the result
+      unchanged. Because the functions are inline, the compiler eliminates them
+      entirely; production binaries contain no wrapper call overhead and no
+      additional symbol for any of the seven operations.
+
+      <notable reason="header defines function bodies in release mode">
+        In release builds the header file contains the complete function bodies,
+        not just declarations. This is intentional: the inline keyword requires
+        the definition to be visible at each call site. No separate compilation
+        unit is involved for release builds.
+      </notable>
+    </release-build-inlining>
+
+    <debug-build-weak-symbols order="2">
+      When NDEBUG is not set (debug and test builds), the seven wrappers are
+      compiled as weak symbols from a dedicated compilation unit. The header
+      exposes only declarations in this mode. Weak symbols allow a linker to
+      accept a strong-symbol override from any other translation unit linked
+      into the same binary. If no override is present, the linker uses the weak
+      definition, which delegates unconditionally to the corresponding libpq
+      function, identical in behavior to the release inline.
+
+      The weak-symbol approach is chosen over function pointers or dependency
+      injection structs because it requires no changes at call sites and imposes
+      no runtime overhead in builds where overrides are absent.
+
+      <notable reason="override replaces the entire function, not a pointer">
+        Test overrides work by providing a strong-symbol definition of the same
+        name in the test translation unit. The linker selects the strong symbol
+        over the weak one at link time. This means overrides are per-binary, not
+        per-call-site, and a single override applies to all callers within the
+        linked test binary.
+      </notable>
+    </debug-build-weak-symbols>
+
+    <coverage-exclusion order="3">
+      The debug-build compilation unit is bracketed by coverage exclusion markers.
+      The seven function bodies inside it are excluded from line coverage
+      measurement. Because each body is a trivial single-line delegation with no
+      branches, including them would inflate denominator counts without providing
+      meaningful coverage signal. All meaningful coverage data for these operations
+      comes from the call sites and from override implementations in test files,
+      which are not excluded.
+    </coverage-exclusion>
+
+    <override-protocol order="4">
+      A test that needs to control one of the seven operations provides a
+      strong-symbol function definition with the identical name and signature
+      as the wrapped operation. No registration, configuration, or pointer
+      assignment is required. The override is active for the entire duration
+      of the test binary's execution; there is no mechanism to swap overrides
+      between individual test cases within the same binary.
+
+      Overrides may return synthetic result handles, error codes, or any
+      other value appropriate to the scenario being tested. Because the
+      underlying libpq is never called when an override is present, no
+      database connection is required to exercise error handling paths that
+      depend on these operations.
+
+      <notable reason="some tests override the unwrapped libpq symbol directly">
+        Certain libpq functions that are not themselves in the wrapper set —
+        such as the error-message retrieval function, the result-clearing
+        function, the row-count function, and the null-check function — are
+        overridden by test code using strong-symbol definitions of the libpq
+        names themselves rather than wrapper names. These functions were not
+        included in the wrapper set, so tests that need to control them bypass
+        the wrapper layer entirely and override the library symbol. This is
+        a distinct override strategy from the one used for the seven wrapped
+        operations.
+      </notable>
+    </override-protocol>
+
+    <unsafe-function-ban order="5">
+      The debug-build compilation unit includes a compile-time enforcement header
+      as its final include. This header poisons a set of unsafe C standard library
+      and string functions via a compiler pragma, causing any use of those banned
+      symbols within the unit to be a compile error. None of the seven wrapper
+      bodies use any banned function; the inclusion is a project-wide discipline
+      applied uniformly to all implementation units.
+    </unsafe-function-ban>
+
+  </behavior>
+
+</specification>

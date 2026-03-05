@@ -1,0 +1,71 @@
+<specification topic="Standard Library Formatting and Time Link Seams">
+  <topic-statement>A collection of thin, build-mode-sensitive wrappers around C standard library string formatting and time functions that serve as link seams for test failure injection.</topic-statement>
+
+  <scope>
+    <in-scope>The wrapping mechanism and pass-through behavior for string formatting (formatted printing, variadic printing) and time formatting (UTC broken-down time conversion, time-to-string formatting).</in-scope>
+    <boundary name="Test overriding">Tests replace any wrapped call by providing a strong symbol with the same name; this spec does not describe what those overrides do.</boundary>
+    <boundary name="Caller error handling">Callers receive raw return values exactly as the underlying library produces them; this layer adds no error transformation.</boundary>
+    <boundary name="Environment variable lookup">The environment variable lookup wrapper defined here is behaviorally identical to the same wrapper defined in the POSIX seam module; the two coexist as weak symbols. See the POSIX link seams specification for detail on that duplication.</boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="MOCKABLE macro">
+      <field name="release build (NDEBUG defined)" type="expands to: static inline" />
+      <field name="debug/test build (NDEBUG absent)" type="expands to: __attribute__((weak))" />
+    </contract>
+
+    <contract name="String formatting operations">
+      <field name="variadic-list formatted print to buffer" type="(str: char*, size: size_t, format: const char*, ap: va_list) -> int" />
+      <field name="variadic formatted print to buffer" type="(str: char*, size: size_t, format: const char*, ...) -> int" />
+    </contract>
+
+    <contract name="Time operations">
+      <field name="convert time_t to UTC broken-down time" type="(timep: const time_t*) -> struct tm*" />
+      <field name="format broken-down time as string" type="(s: char*, max: size_t, format: const char*, tm: const struct tm*) -> size_t" />
+    </contract>
+
+    <contract name="Environment operation">
+      <field name="get environment variable" type="(name: const char*) -> char*" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+    <build-mode-dispatch order="1">
+      When the release build flag is set at compile time, every wrapper is compiled as a static inline function defined directly in the header. The body of the implementation file is excluded entirely from compilation. The result is zero-overhead inlining with no separate object code.
+
+      When the release build flag is absent (debug or test builds), every wrapper is compiled as a function with a weak linkage attribute. The implementation resides in a separate compilation unit. A test can supply a replacement strong symbol with the same name, which the linker will prefer over the weak symbol, thereby intercepting any call to the wrapped operation.
+
+      <notable reason="Dual definition pattern">The function bodies are written identically in both the header (for release) and the implementation file (for debug). Keeping them synchronized is a manual responsibility; there is no single source of truth.</notable>
+    </build-mode-dispatch>
+
+    <pass-through delegation order="2">
+      Every wrapper delegates directly to the underlying library function with identical arguments and returns the result unchanged. No error checking, retry logic, or argument transformation is applied by the wrapper.
+    </pass-through delegation>
+
+    <snprintf-via-vsnprintf order="3">
+      The fixed-argument formatted-print wrapper accepts a variadic argument list, opens a variadic argument handle from the trailing arguments, and delegates entirely to the variadic-list variant of the same underlying function. The variadic handle is closed before the result is returned. The wrapper never calls the non-variadic form of the underlying function directly.
+
+      <notable reason="Indirect delegation path">Using the variadic-list form rather than the direct variadic form is necessary because C does not permit forwarding a variadic argument pack to another variadic function. This indirection is a language requirement, not an architectural choice.</notable>
+    </snprintf-via-vsnprintf>
+
+    <strftime-format-warning suppression order="4">
+      The time-formatting wrapper passes the caller-supplied format string directly to the underlying time formatter. Because the format string is not a compile-time string literal, the compiler would emit a diagnostic warning about non-literal format arguments. The wrapper suppresses this warning for the duration of the single function call using diagnostic push and pop pragmas that bracket only the delegating call. The suppression is scoped and does not affect surrounding code.
+
+      <notable reason="Intentional diagnostic suppression">The suppression is the deliberate design; callers are trusted to supply safe format strings. A developer reading this should understand the suppression is documented and intentional, not an oversight.</notable>
+    </strftime-format-warning>
+
+    <getenv-duplication order="5">
+      An environment variable lookup wrapper is defined in this module with the same name and identical behavior as the one defined in the POSIX seam module. Both are weak symbols. The linker accepts both and selects one; in test builds a strong override replaces both. The duplication has no runtime impact but represents an ambiguity in module ownership.
+
+      <notable reason="Cross-module symbol duplication">Weak symbol semantics permit multiple identical weak definitions without a linker error, but the canonical location for this operation is ambiguous. The POSIX seam module is the more natural home for an OS environment call; its presence here appears to be a copy carried over during an earlier refactoring.</notable>
+    </getenv-duplication>
+
+    <coverage-exclusion order="6">
+      The entire implementation file body is wrapped in a coverage-exclusion annotation. Because the release build inlines all functions from the header and the debug build relies on test mocking rather than executing the wrapper bodies, the wrapper bodies are excluded from coverage reporting by convention.
+    </coverage-exclusion>
+
+    <unsafe-function enforcement order="7">
+      After all standard headers are included, the implementation file includes a poison header that bans a set of unsafe C functions at compile time using a compiler pragma. Any use of the banned functions anywhere later in the same translation unit is a compile error. The banned set includes direct-write formatting functions, unsafe string manipulation, and numeric conversion functions that lack error reporting. This enforcement does not affect the wrappers' own behavior but prevents accidental use of banned calls in proximity to the wrapper implementations.
+    </unsafe-function enforcement>
+  </behavior>
+</specification>

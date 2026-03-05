@@ -1,0 +1,157 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<specification topic="Debug Log File">
+
+  <topic-statement>
+    The debug log file system provides compile-time-conditional printf-style
+    diagnostic logging to a rotating plain-text file.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Compile-time gating of all logging behavior, log directory creation,
+      rotation of any pre-existing log file on startup, log file creation,
+      per-call write format, immediate flushing, and atexit cleanup.
+    </in-scope>
+
+    <boundary name="Structured JSONL Logger">
+      The application's persistent structured logger records events in JSONL
+      format to a different file path and is always active regardless of build
+      mode. This topic is entirely separate from that logger.
+    </boundary>
+
+    <boundary name="Panic Handler">
+      If any initialization step fails (missing environment variable, failed
+      directory creation, failed file open), the panic handler is invoked and
+      the process terminates. The panic handler's behavior is out of scope here.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Log Entry">
+      <field name="timestamp" type="text" note="local time formatted as YYYY-MM-DD HH:MM:SS" />
+      <field name="source file" type="text" note="the source file path as provided by the compiler" />
+      <field name="line number" type="integer" note="the source line number" />
+      <field name="function name" type="text" note="the enclosing function name as provided by the compiler" />
+      <field name="message" type="text" note="caller-supplied printf-style formatted text" />
+    </contract>
+
+    <contract name="Archive File Name">
+      <field name="timestamp portion" type="text" note="birth time (or mtime fallback) of the previous log file, formatted as YYYY-MM-DDTHH-MM-SSZ±HH-MM using local timezone offset" />
+      <field name="suffix" type="text" note="always '.log'" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <compile-time-gating order="1">
+      All logging behavior — initialization, the write call, and the public
+      macro — is present only in DEBUG builds. In non-DEBUG builds, both the
+      initialization call and every log-write call compile to no-ops that
+      produce no code and have no side effects. There is no runtime flag or
+      environment variable that enables or disables the feature; the build
+      configuration is the sole switch.
+
+      <notable reason="entire file excluded from coverage">
+        The source file is wrapped in LCOV coverage exclusion directives,
+        so coverage tooling does not measure any of its lines.
+      </notable>
+    </compile-time-gating>
+
+    <initialization order="2">
+      Initialization must be called once early in the process lifecycle before
+      any log writes are attempted.
+
+      <directory-resolution order="1">
+        The log directory path is read from an environment variable. If the
+        variable is unset or empty, the process panics immediately.
+
+        If the path does not yet exist as a directory, it is created recursively
+        with mode 0755. Any intermediate directories that do not exist are also
+        created. Creation proceeds segment by segment; if a segment already
+        exists, that is not treated as an error. If creation fails for any other
+        reason, the process panics.
+      </directory-resolution>
+
+      <rotation order="2">
+        If a file named "debug.log" already exists in the log directory, it is
+        archived before the new log is opened:
+
+        1. The birth time of the existing file is queried using the statx system
+           call with the STATX_BTIME flag. If the kernel does not support birth
+           time or does not report it for this file, the file's modification time
+           is used as a fallback.
+
+        2. The birth time is converted to local time and formatted as a timestamp
+           string with the local timezone offset, using hyphens as separators
+           within the time portion to produce a filesystem-safe name of the form
+           YYYY-MM-DDTHH-MM-SS±HH-MM.
+
+        3. An archive path is constructed by appending ".log" to the timestamp
+           string within the log directory.
+
+        4. If no file at the archive path already exists, the existing "debug.log"
+           is renamed to the archive path. If the archive path already exists,
+           the rename is skipped and "debug.log" is left in place to be
+           overwritten.
+
+        <notable reason="overwrite on archive collision">
+          If the archive file already exists — which can happen if two processes
+          start within the same second — the existing log is overwritten by the
+          new session rather than being preserved or merged. The collision check
+          uses a second stat call; there is a TOCTOU race between that check and
+          the rename.
+        </notable>
+      </rotation>
+
+      <file-creation order="3">
+        A new "debug.log" file is opened for writing in the log directory,
+        truncating any file that was not renamed during the rotation step.
+        If the open fails, the process panics.
+
+        A cleanup function is registered with atexit to flush and close the
+        file when the process exits normally.
+
+        A header line reading "=== IKIGAI DEBUG LOG ===" is written to the
+        new file and flushed immediately.
+      </file-creation>
+    </initialization>
+
+    <log-write order="3">
+      Each log write emits one line to the file. The public interface is a
+      macro that automatically supplies the source file path, line number,
+      and function name at the call site; the caller supplies only the
+      format string and any arguments.
+
+      The write sequence is:
+      1. If the log file is not open (not yet initialized, or already closed
+         by the atexit handler), the write is silently discarded.
+      2. The current local time is obtained and formatted as YYYY-MM-DD HH:MM:SS.
+      3. A context prefix is written: "[TIMESTAMP] FILE:LINE:FUNCTION: "
+      4. The caller's formatted message is appended using printf-style formatting.
+      5. A newline character is appended.
+      6. The file is flushed immediately so the file can be tailed in real time.
+
+      <notable reason="no write buffering">
+        Every log call flushes the underlying file stream. This enables
+        real-time observation via tail -f but imposes a flush cost on every
+        log statement.
+      </notable>
+    </log-write>
+
+    <cleanup order="4">
+      The atexit handler flushes and closes the log file, then sets the
+      internal file pointer to null. If the file pointer is already null
+      when the handler runs, it does nothing.
+
+      <notable reason="atexit handler does not unregister itself">
+        The atexit handler is registered once at initialization. It cannot
+        be unregistered. If initialization is called more than once (which
+        is not a supported usage), multiple handlers would be registered
+        and would each attempt to flush and close whatever the file pointer
+        points to at exit time.
+      </notable>
+    </cleanup>
+
+  </behavior>
+
+</specification>

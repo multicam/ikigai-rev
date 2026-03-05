@@ -1,0 +1,182 @@
+<specification topic="Internal Function Wrappers">
+
+  <topic-statement>
+    The internal function wrappers expose a fixed set of application-internal
+    operations through the link-seam mechanism so tests can inject failures or
+    substitute behavior without modifying production code.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      The seventeen internal application operations exposed as link seams, the
+      void-pointer type erasure used in debug-mode declarations, the build-mode
+      selection between inline (release) and weak-symbol (debug) form, and the
+      transparent passthrough contract for each wrapped call.
+    </in-scope>
+    <boundary name="Link-seam mechanism">
+      The MOCKABLE attribute and the build-mode dispatch strategy are shared
+      infrastructure.
+      <shared topic="Link Seam Wrappers">
+        In release builds the wrappers are static inline and carry their concrete
+        type casts inline. In debug builds they are weak symbols whose declarations
+        use void pointers to avoid pulling application headers into consumer
+        translation units.
+      </shared>
+    </boundary>
+    <boundary name="Wrapped operations">
+      Each wrapper forwards to the real implementation. The semantics of paths
+      translation, database operations, scrollback, REPL rendering, agent state
+      transitions, request building, HTTP multiplexing, tool execution, template
+      processing, and token counting are documented in separate specifications for
+      those subsystems.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Type erasure in debug declarations">
+      <field name="structured context arguments" type="void*" note="opaque pointers in the debug-mode header declarations; cast to concrete types inside the .c implementation" />
+      <field name="structured context arguments" type="concrete pointer" note="fully typed in the release-mode inline definitions; no casting visible to callers" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <type-erasure-strategy order="1">
+      In debug builds, the wrapper declarations in the header use generic opaque
+      pointer types in place of the concrete structured types. This avoids
+      requiring consumers of the wrapper header to also include the full set of
+      application domain headers. The .c implementation file includes the concrete
+      headers and performs the type cast internally before forwarding to the real
+      function.
+
+      In release builds, the inline definitions include the concrete headers and
+      carry the casts directly, so callers see the full types and no erasure occurs.
+
+      <notable reason="asymmetric type visibility">
+        A test that calls a wrapper in debug mode sees a void pointer signature,
+        while production code compiled in release mode sees a fully typed
+        signature. The two compilation modes present different call sites to the
+        compiler.
+      </notable>
+    </type-erasure-strategy>
+
+    <uri-translation-seams order="2">
+      Two path-translation operations are wrapped: converting an application-scheme
+      URI to a filesystem path, and converting a filesystem path to an
+      application-scheme URI. Both accept an allocator context, an opaque paths
+      configuration handle, an input string, and an output string pointer. Both
+      return a result value. All arguments are forwarded unchanged after casting
+      the opaque handle to the concrete type.
+    </uri-translation-seams>
+
+    <external-tool-execution-seam order="3">
+      The external tool execution operation is wrapped. It accepts an allocator
+      context, a tool path string, an agent identifier string, a JSON arguments
+      string, an output pointer for the child process ID, and an output pointer for
+      the result string. Returns a result value. All arguments are forwarded
+      unchanged.
+    </external-tool-execution-seam>
+
+    <database-seams order="4">
+      Two database operations are wrapped.
+
+      Database initialization accepts an allocator context, a connection string,
+      a data directory path, and an output pointer for the opaque database context.
+      Returns a result value.
+
+      Message insertion accepts an opaque database context handle, a session
+      identifier, an agent UUID string, a message kind string, a content string,
+      and a JSON data string. Returns a result value.
+
+      Both forward all arguments unchanged after casting the opaque handle.
+    </database-seams>
+
+    <scrollback-seam order="5">
+      The scrollback line-append operation is wrapped. It accepts an opaque
+      scrollback handle, a text buffer, and a byte length. Returns a result value.
+      All arguments are forwarded unchanged after casting.
+    </scrollback-seam>
+
+    <repl-rendering-seam order="6">
+      The REPL frame rendering operation is wrapped. It accepts an opaque REPL
+      context handle and returns a result value. The handle is cast to the concrete
+      type and forwarded.
+    </repl-rendering-seam>
+
+    <agent-provider-seam order="7">
+      The agent provider retrieval operation is wrapped. It accepts an opaque
+      agent handle and an output pointer for the opaque provider handle. Returns a
+      result value. Both handles are cast to concrete types internally.
+    </agent-provider-seam>
+
+    <request-building-seam order="8">
+      The request build operation is wrapped. It accepts an allocator context, an
+      opaque agent handle, an opaque tool registry handle, and an output pointer
+      for the opaque request handle. Returns a result value. All opaque handles
+      are cast to concrete types internally.
+    </request-building-seam>
+
+    <http-multi-seams order="9">
+      Two HTTP multiplexer operations are wrapped.
+
+      The creation operation accepts a parent allocator context and an output
+      pointer. The underlying call returns a result value; when that result
+      indicates success, the ok field of the result is written to the output
+      pointer before the result is returned. This means the caller receives the
+      created handle via the output pointer rather than directly from the result
+      value.
+
+      The info-read operation accepts an opaque HTTP multiplexer handle and an
+      opaque logger handle. It returns nothing. Both handles are cast to concrete
+      types internally.
+
+      <notable reason="result unpacking in the http-multi-create wrapper">
+        The HTTP multi creation wrapper unpacks the result's ok pointer into a
+        separate out-parameter, diverging from the raw underlying function
+        signature. All other wrappers forward their result values without
+        modification.
+      </notable>
+    </http-multi-seams>
+
+    <agent-tool-loop-seams order="10">
+      Three operations supporting the tool execution loop are wrapped.
+
+      Starting tool execution accepts an opaque agent handle and returns nothing.
+
+      Querying whether the loop should continue accepts a const opaque agent handle
+      and returns an integer (nonzero means continue, zero means stop).
+
+      Submitting a tool loop continuation accepts an opaque REPL context handle and
+      an opaque agent handle and returns nothing.
+
+      All three forward their arguments unchanged after casting.
+    </agent-tool-loop-seams>
+
+    <agent-state-seams order="11">
+      Two agent state-management operations are wrapped.
+
+      Message addition accepts an opaque agent handle and an opaque message handle.
+      Returns a result value. Both handles are cast to concrete types internally.
+
+      Transitioning the agent to idle accepts an opaque agent handle and returns
+      nothing. The handle is cast to the concrete type internally.
+    </agent-state-seams>
+
+    <template-processing-seam order="12">
+      The template processing operation is wrapped. It accepts an allocator
+      context, a template text string, an opaque agent handle, an opaque
+      configuration handle, and an output pointer for the opaque result handle.
+      Returns a result value. All opaque handles are cast to concrete types
+      internally.
+    </template-processing-seam>
+
+    <token-counting-seam order="13">
+      The HTTP-based token counting operation is wrapped. It accepts an allocator
+      context, a URL string, an API key string, a request body string, an output
+      pointer for the response string, and an output pointer for the HTTP status
+      code. Returns a result value. All arguments are forwarded unchanged.
+    </token-counting-seam>
+
+  </behavior>
+
+</specification>

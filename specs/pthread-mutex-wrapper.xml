@@ -1,0 +1,65 @@
+<specification topic="Pthread Mutex Wrapper">
+  <topic-statement>Interceptable delegating wrappers over the four pthread mutex primitives that enable test-time failure injection without changing production behavior.</topic-statement>
+
+  <scope>
+    <in-scope>Mutex initialization, destruction, locking, and unlocking operations as interceptable seams</in-scope>
+    <in-scope>Build-mode selection between zero-overhead inlining and weak-symbol overridability</in-scope>
+    <boundary name="Mutex semantics">The actual blocking, memory-ordering, and error behaviors of the underlying mutex primitives; this module delegates unconditionally and adds nothing</boundary>
+    <boundary name="Mutex consumers">Agent creation, state transitions, thread execution lifecycle, and tool polling all use these wrappers but are described elsewhere</boundary>
+    <boundary name="Test mocking">Override of these seams in test code; this module only provides the seam, not the override</boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="MutexInitArgs">
+      <field name="mutex" type="pointer to platform mutex object" />
+      <field name="attr" type="pointer to platform mutex attribute object, or null for defaults" />
+      <field name="return" type="int, zero on success, nonzero on failure" />
+    </contract>
+    <contract name="MutexDestroyArgs">
+      <field name="mutex" type="pointer to platform mutex object" />
+      <field name="return" type="int, zero on success, nonzero on failure" />
+    </contract>
+    <contract name="MutexLockArgs">
+      <field name="mutex" type="pointer to platform mutex object" />
+      <field name="return" type="int, zero on success, nonzero on failure" />
+    </contract>
+    <contract name="MutexUnlockArgs">
+      <field name="mutex" type="pointer to platform mutex object" />
+      <field name="return" type="int, zero on success, nonzero on failure" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+    <build-mode-dispatch order="1">
+      In release builds (NDEBUG defined), all four mutex wrappers are compiled as static inline functions directly in the header. Each wrapper expands to a single call to the corresponding platform primitive with no overhead. No object file is produced for these wrappers in release mode.
+
+      In debug and test builds (NDEBUG not defined), all four mutex wrappers are compiled as weak symbols in a separate translation unit. The header provides only forward declarations. Because weak symbols can be overridden by a strong symbol with the same name in another translation unit, test code can replace any wrapper with a custom implementation without modifying production sources.
+      <notable reason="The header itself contains full inline bodies inside the NDEBUG guard — the .c file duplicates those bodies under the opposite guard. The two copies must remain identical; there is no compile-time check that they match.">In release builds the .c file compiles to an empty translation unit (every definition is inside the NDEBUG-false guard), producing no object code at all.</notable>
+    </build-mode-dispatch>
+
+    <mutex-init-delegation order="2">
+      The initialization wrapper accepts a pointer to a mutex object and an optional attribute pointer. It delegates immediately to the platform mutex initialization primitive, passing both arguments unchanged. The return value from the platform call is returned directly to the caller with no transformation. A nonzero return indicates failure; the mutex object is left uninitialized in that case and must not be used.
+
+      The wrapper introduces no default attribute; passing null for the attribute parameter causes the platform primitive to apply its own defaults.
+    </mutex-init-delegation>
+
+    <mutex-destroy-delegation order="3">
+      The destruction wrapper accepts a pointer to a previously initialized mutex. It delegates immediately to the platform mutex destruction primitive and returns the platform's result code unchanged. Destruction of a locked mutex or a mutex that was never initialized produces platform-defined behavior; the wrapper does not guard against either condition.
+
+      Callers in the codebase perform a lock-then-unlock sequence immediately before calling destroy, satisfying the platform requirement that the mutex be unlocked at destruction time.
+    </mutex-destroy-delegation>
+
+    <mutex-lock-delegation order="4">
+      The lock wrapper accepts a pointer to an initialized mutex and delegates immediately to the platform blocking-lock primitive. The call blocks until the mutex is acquired. The platform result code is returned unchanged. The wrapper does not implement timeouts, try-lock semantics, or deadlock detection.
+    </mutex-lock-delegation>
+
+    <mutex-unlock-delegation order="5">
+      The unlock wrapper accepts a pointer to a mutex held by the calling thread and delegates immediately to the platform unlock primitive. The platform result code is returned unchanged. The wrapper does not verify ownership or check for double-unlock.
+    </mutex-unlock-delegation>
+
+    <coverage-exclusion order="6">
+      In debug builds the entire implementation is marked for coverage exclusion. Because the wrappers are replaced by test-provided overrides during testing, the weak-symbol bodies are never executed under test and produce no coverage data.
+      <notable reason="This is the intended pattern: the seam bodies exist only for production use, not for direct test exercise.">All six lines of each mutex wrapper body are excluded from coverage measurement even though they are compiled.</notable>
+    </coverage-exclusion>
+  </behavior>
+</specification>

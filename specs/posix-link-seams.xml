@@ -1,0 +1,109 @@
+<specification topic="POSIX System Call Link Seams">
+  <topic-statement>A collection of thin, build-mode-sensitive wrappers around POSIX system calls and C stdio operations that serve as link seams for test failure injection.</topic-statement>
+
+  <scope>
+    <in-scope>The wrapping mechanism itself: build-mode dispatch, weak symbol declaration, and pass-through delegation for all covered system calls.</in-scope>
+    <boundary name="Test overriding">Tests replace any wrapped call by providing a strong symbol with the same name; this spec does not describe what those overrides do.</boundary>
+    <boundary name="Caller error handling">Callers receive raw return values and errno exactly as the underlying OS produces them; this layer adds no error transformation.</boundary>
+    <boundary name="Debug logging">The wrappers contain commented-out diagnostic logging that does not execute; what that logging would have produced is out of scope.</boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="MOCKABLE macro">
+      <field name="release build (NDEBUG defined)" type="expands to: static inline" />
+      <field name="debug/test build (NDEBUG absent)" type="expands to: __attribute__((weak))" />
+    </contract>
+
+    <contract name="Socket operations">
+      <field name="create socket" type="(domain: int, type: int, protocol: int) -> int" />
+      <field name="bind address" type="(sockfd: int, addr: sockaddr*, addrlen: socklen_t) -> int" />
+      <field name="listen for connections" type="(sockfd: int, backlog: int) -> int" />
+      <field name="send data on socket" type="(sockfd: int, buf: const void*, len: size_t, flags: int) -> ssize_t" />
+    </contract>
+
+    <contract name="File descriptor operations">
+      <field name="open file by path" type="(pathname: const char*, flags: int) -> int" />
+      <field name="close file descriptor" type="(fd: int) -> int" />
+      <field name="stat file" type="(pathname: const char*, statbuf: stat*) -> int" />
+      <field name="make directory" type="(pathname: const char*, mode: mode_t) -> int" />
+      <field name="manipulate file descriptor" type="(fd: int, cmd: int, arg: int) -> int" />
+      <field name="create pipe" type="(pipefd[2]: int) -> int" />
+      <field name="associate stream with descriptor" type="(fd: int, mode: const char*) -> FILE*" />
+    </contract>
+
+    <contract name="I/O operations">
+      <field name="write to descriptor" type="(fd: int, buf: const void*, count: size_t) -> ssize_t" />
+      <field name="read from descriptor" type="(fd: int, buf: void*, count: size_t) -> ssize_t" />
+      <field name="multiplex I/O" type="(nfds: int, readfds: fd_set*, writefds: fd_set*, exceptfds: fd_set*, timeout: timeval*) -> int" />
+    </contract>
+
+    <contract name="Terminal operations">
+      <field name="get terminal attributes" type="(fd: int, termios_p: termios*) -> int" />
+      <field name="set terminal attributes" type="(fd: int, optional_actions: int, termios_p: const termios*) -> int" />
+      <field name="flush terminal queue" type="(fd: int, queue_selector: int) -> int" />
+      <field name="device control" type="(fd: int, request: unsigned long, argp: void*) -> int" />
+    </contract>
+
+    <contract name="Process and signal operations">
+      <field name="set signal action" type="(signum: int, act: const sigaction*, oldact: sigaction*) -> int" />
+      <field name="send signal to process" type="(pid: pid_t, sig: int) -> int" />
+      <field name="wait for process state change" type="(pid: pid_t, status: int*, options: int) -> pid_t" />
+      <field name="sleep for microseconds" type="(usec: useconds_t) -> int" />
+    </contract>
+
+    <contract name="C stdio stream operations">
+      <field name="open file as stream" type="(pathname: const char*, mode: const char*) -> FILE*" />
+      <field name="read from stream" type="(ptr: void*, size: size_t, nmemb: size_t, stream: FILE*) -> size_t" />
+      <field name="write to stream" type="(ptr: const void*, size: size_t, nmemb: size_t, stream: FILE*) -> size_t" />
+      <field name="seek in stream" type="(stream: FILE*, offset: long, whence: int) -> int" />
+      <field name="get stream position" type="(stream: FILE*) -> long" />
+      <field name="close stream" type="(stream: FILE*) -> int" />
+      <field name="open process as stream" type="(command: const char*, mode: const char*) -> FILE*" />
+      <field name="close process stream" type="(stream: FILE*) -> int" />
+    </contract>
+
+    <contract name="Filesystem and environment operations">
+      <field name="open directory" type="(name: const char*) -> DIR*" />
+      <field name="check file accessibility" type="(pathname: const char*, mode: int) -> int" />
+      <field name="rename file or directory" type="(oldpath: const char*, newpath: const char*) -> int" />
+      <field name="get current working directory" type="(buf: char*, size: size_t) -> char*" />
+      <field name="get environment variable" type="(name: const char*) -> char*" />
+      <field name="get password entry by uid" type="(uid: uid_t) -> passwd*" />
+    </contract>
+
+    <contract name="Glob operations">
+      <field name="expand pathname pattern" type="(pattern: const char*, flags: int, errfunc: function pointer, pglob: glob_t*) -> int" />
+      <field name="free glob results" type="(pglob: glob_t*) -> void" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+    <build-mode-dispatch order="1">
+      When the release build flag is set at compile time, every wrapper is compiled as a static inline function defined directly in the header. The body of the implementation file is excluded entirely from compilation. The result is zero-overhead inlining with no separate object code.
+
+      When the release build flag is absent (debug or test builds), every wrapper is compiled as a function with a weak linkage attribute. The implementation resides in a separate compilation unit. A test can supply a replacement strong symbol with the same name, which the linker will prefer over the weak symbol, thereby intercepting any call to the wrapped operation.
+
+      <notable reason="Dual definition pattern">The function bodies are written identically in both the header (for release) and the implementation file (for debug). Keeping them synchronized is a manual responsibility; there is no single source of truth.</notable>
+    </build-mode-dispatch>
+
+    <pass-through delegation order="2">
+      Every wrapper delegates directly to the underlying system call with identical arguments and returns the result unchanged. No error checking, logging, retry logic, or argument transformation is applied by the wrapper itself. The caller receives the same return value and errno state that the underlying OS would have produced.
+
+      <notable reason="Commented-out instrumentation">The write and read wrappers contain commented-out diagnostic code that would have logged byte-level I/O activity to a debug channel, including a hex-escape formatter for non-printable bytes. This code is inert and produces no observable effect. The formatter itself is additionally marked as unused and only compiled when a secondary debug flag is present.</notable>
+    </pass-through delegation>
+
+    <getenv-duplication order="3">
+      The environment variable lookup wrapper is declared and defined in both this module and the standard library wrapper module. Both definitions are identical in behavior. In a given build, both object files are present; the weak symbol semantics mean the linker resolves to whichever definition it encounters first (or the test's strong override). There is no behavioral difference between the two copies.
+
+      <notable reason="Symbol duplication across modules">Having the same weak symbol defined in two compilation units is normally a linker error for strong symbols. Weak symbols allow multiple definitions; the linker accepts all and selects one arbitrarily. In practice tests mock it by name and the duplication is invisible at runtime, but it represents an inconsistency in module ownership.</notable>
+    </getenv-duplication>
+
+    <coverage-exclusion order="4">
+      The entire implementation file body is wrapped in a coverage-exclusion annotation. Because the release build inlines all functions from the header and the debug build relies on test mocking rather than line-by-line execution of the wrapper bodies themselves, the wrapper bodies are never the subject of direct coverage measurement. They are excluded from coverage reporting by convention.
+    </coverage-exclusion>
+
+    <unsafe-function enforcement order="5">
+      After all system headers are included, the implementation file includes a poison header that bans a set of unsafe C functions at compile time using a compiler pragma. Any use of the banned functions anywhere later in the same translation unit is a compile error. This enforcement is additive to the wrapper layer and does not affect the wrappers' own behavior.
+    </unsafe-function enforcement>
+  </behavior>
+</specification>

@@ -1,0 +1,259 @@
+<specification topic="Error Result">
+
+  <topic-statement>
+    The error result system defines a typed, stack-allocated result type that
+    carries either a success value or a heap-allocated error descriptor, together
+    with a fixed set of error codes and macros for constructing, propagating, and
+    inspecting results.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      The result type and its two variants (success and failure), the error
+      descriptor structure and its fields, the complete set of named error codes,
+      error construction with formatted messages, result checking predicates,
+      error-code-to-string conversion, error message retrieval with fallback,
+      formatted diagnostic output, early-return propagation macros, the injectable
+      allocator used to create error descriptors, and the PANIC invocation on
+      allocation failure or invalid code.
+    </in-scope>
+    <boundary name="Panic handler">
+      When allocation fails during error construction, or when an unrecognized
+      error code is passed to the code-to-string converter, the system invokes the
+      process-terminating panic sequence defined elsewhere.  The details of that
+      sequence — terminal restoration, log write, stderr output, abort — are
+      outside this specification.
+    </boundary>
+    <boundary name="Memory management">
+      Error descriptors are heap-allocated under a caller-supplied parent context
+      using hierarchical memory management.  Ownership, lifetime, and deallocation
+      semantics are governed by the memory management layer.  This specification
+      records only that descriptors are allocated on the supplied parent context and
+      that allocation failures trigger panic rather than returning a secondary error.
+    </boundary>
+    <boundary name="Test injection">
+      The allocator used to create error descriptors is a separately defined
+      function with a weak-symbol declaration, allowing tests to substitute a
+      failing allocator to exercise the allocation-failure panic path.  The
+      substitution mechanism itself is outside this specification.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+
+    <contract name="Error code enumeration">
+      A fixed enumeration of twelve named codes.  The success sentinel has
+      numeric value zero.  All failure codes have positive values.
+      <field name="OK"                    type="enum member (value 0)" />
+      <field name="INVALID_ARG"           type="enum member" />
+      <field name="OUT_OF_RANGE"          type="enum member" />
+      <field name="IO"                    type="enum member" />
+      <field name="PARSE"                 type="enum member" />
+      <field name="DB_CONNECT"            type="enum member" />
+      <field name="DB_MIGRATE"            type="enum member" />
+      <field name="OUT_OF_MEMORY"         type="enum member" />
+      <field name="AGENT_NOT_FOUND"       type="enum member" />
+      <field name="PROVIDER"              type="enum member" />
+      <field name="MISSING_CREDENTIALS"   type="enum member" />
+      <field name="NOT_IMPLEMENTED"       type="enum member" />
+    </contract>
+
+    <contract name="Error descriptor">
+      A heap-allocated structure carrying a classified, located, human-readable
+      description of a single failure.  Always allocated under a caller-supplied
+      parent context.
+      <field name="code"  type="error code enumeration member" />
+      <field name="file"  type="const char * (source file name literal)" />
+      <field name="line"  type="signed 32-bit integer (source line number)" />
+      <field name="msg"   type="char[256] (null-terminated formatted message)" />
+    </contract>
+
+    <contract name="Result">
+      A stack-allocated discriminated union.  Carries either a non-typed success
+      pointer or a pointer to an error descriptor.  The discriminant is separate
+      from the union.
+      <field name="ok"     type="void * (meaningful only when is_err is false)" />
+      <field name="err"    type="error descriptor pointer (meaningful only when is_err is true)" />
+      <field name="is_err" type="bool" />
+    </contract>
+
+  </data-contracts>
+
+  <behavior>
+
+    <result-construction-success order="1">
+      A success result is constructed by supplying a void pointer value.  The
+      resulting result has its discriminant set to false and its success field set
+      to the supplied pointer.  The pointer may be NULL; no assertion or check is
+      performed on its value.  Construction is always inlined at the call site.
+    </result-construction-success>
+
+    <result-construction-failure order="2">
+      A failure result is constructed by supplying a non-NULL error descriptor
+      pointer.  If the pointer is NULL the process panics immediately via an
+      assertion.  The resulting result has its discriminant set to true and its
+      error field set to the supplied pointer.  Construction is always inlined at
+      the call site.
+    </result-construction-failure>
+
+    <error-descriptor-construction order="3">
+      An error descriptor is constructed by supplying: a parent memory context, an
+      error code, a source file name string, a source line number, a printf-style
+      format string, and any format arguments.
+
+      The descriptor is allocated as a zero-initialized block of exactly the size
+      of the descriptor structure, under the supplied parent context.  If
+      allocation fails, the process panics immediately; no error is returned.
+
+      The code, file pointer, and line number are stored directly.  The format
+      string and arguments are rendered into the 256-byte message buffer using
+      bounded formatted string printing.  If the rendered output would exceed 255
+      characters, it is silently truncated and null-terminated.
+
+      If the formatted printing function itself reports a failure (returning a
+      negative value), the process panics immediately.
+
+      <notable reason="panic on allocation failure, not a returned error">
+        Errors encountered while constructing an error descriptor do not produce a
+        secondary error result; they terminate the process immediately.  There is
+        no graceful fallback path.
+      </notable>
+      <notable reason="vsnprintf failure panic excluded from coverage">
+        The branch that panics on a negative return from the formatted printing
+        function is explicitly excluded from coverage measurement.  The comment in
+        the source acknowledges that exercising this path would require a circular
+        dependency — mocking the print function in error-construction code that is
+        itself part of the error reporting infrastructure.
+      </notable>
+    </error-descriptor-construction>
+
+    <public-construction-macros order="4">
+      Two macros form the intended public API for creating results.
+
+      The success macro wraps the construction call with no additional behavior.
+      It accepts a single pointer value and produces a success result.
+
+      The failure macro combines error descriptor construction with result
+      wrapping.  It accepts: a parent context, a bare suffix name (which is
+      prefixed to form the full error code), a format string, and optional format
+      arguments.  It automatically captures the current source file name and line
+      number, so the descriptor always reflects the call site of the macro, not any
+      internal helper.
+
+      <notable reason="code suffix is textual, not an enum value">
+        The failure macro concatenates a fixed prefix with the provided suffix to
+        form the code name.  Passing an unrecognized suffix is a compile-time
+        error, not a runtime failure.
+      </notable>
+    </public-construction-macros>
+
+    <result-checking-predicates order="5">
+      Two predicates inspect a result.  Both accept a non-NULL pointer to a result;
+      passing NULL causes an assertion failure.  The success predicate returns true
+      when the discriminant is false.  The failure predicate returns true when the
+      discriminant is true.  Both are always inlined.
+    </result-checking-predicates>
+
+    <error-propagation-macros order="6">
+      Two macros provide automatic early-return propagation when a called
+      expression produces a failure result.
+
+      The first (CHECK) evaluates the expression, captures the result in a local
+      variable, and if the discriminant is true returns that result immediately from
+      the enclosing function.  No value is extracted from a success result; the
+      macro is used for side-effecting calls where the success payload is
+      irrelevant.
+
+      The second (TRY) evaluates the expression, captures the result, and if the
+      discriminant is true returns that result immediately.  On success it yields
+      the success pointer as the value of the macro expression, allowing direct
+      assignment.  This macro uses a compiler statement expression and requires a
+      compiler that supports that extension.
+
+      Both macros use a do-while(0) or statement-expression wrapper to ensure
+      correct behavior when placed inside conditional branches without braces.
+    </error-propagation-macros>
+
+    <error-code-to-string-conversion order="7">
+      A predicate maps each of the twelve error codes to a fixed human-readable
+      English string:
+      - OK                  -> "OK"
+      - INVALID_ARG         -> "Invalid argument"
+      - OUT_OF_RANGE        -> "Out of range"
+      - IO                  -> "IO error"
+      - PARSE               -> "Parse error"
+      - DB_CONNECT          -> "Database connection error"
+      - DB_MIGRATE          -> "Database migration error"
+      - OUT_OF_MEMORY       -> "Out of memory"
+      - AGENT_NOT_FOUND     -> "Agent not found"
+      - PROVIDER            -> "Provider error"
+      - MISSING_CREDENTIALS -> "Missing credentials"
+      - NOT_IMPLEMENTED     -> "Not implemented"
+
+      If a numeric value outside the enumeration is supplied, the process panics
+      immediately.  The switch default arm is excluded from coverage measurement
+      because valid code never reaches it.
+
+      <notable reason="OK is a valid input">
+        The success sentinel code (value 0) is a valid input and maps to the
+        string "OK".  The function does not distinguish between success and failure
+        codes; it converts any recognized code, including the success code.
+      </notable>
+    </error-code-to-string-conversion>
+
+    <error-message-retrieval order="8">
+      Given a non-NULL error descriptor pointer, the human-readable message is
+      obtained as follows: if the message buffer's first byte is non-zero (i.e., a
+      non-empty formatted message was stored at construction time), the buffer
+      pointer is returned directly.  Otherwise the error code is converted to its
+      canonical string using the code-to-string converter, and that string is
+      returned.
+
+      <notable reason="empty message falls back to code string, not to an empty string">
+        A descriptor constructed with an empty format string or a format that
+        renders to an empty string silently falls back to the canonical code
+        description.  The empty-message condition is undetectable by the caller.
+      </notable>
+    </error-message-retrieval>
+
+    <error-inspection order="9">
+      Given a non-NULL error descriptor pointer, the stored error code is returned
+      directly.  Passing NULL causes an assertion failure.
+    </error-inspection>
+
+    <formatted-diagnostic-output order="10">
+      Given a non-NULL output stream and a non-NULL error descriptor pointer, a
+      single line is written to the stream using the standard formatted output
+      function.  The format is:
+
+        Error: &lt;message&gt; [&lt;file&gt;:&lt;line&gt;]\n
+
+      The message is obtained via the message-retrieval behavior above.  The file
+      field is the literal pointer stored in the descriptor; if that pointer is
+      NULL, the string "unknown" is substituted.  The line number is formatted as a
+      signed decimal 32-bit integer.  Passing NULL for either the stream or the
+      descriptor causes an assertion failure.
+    </formatted-diagnostic-output>
+
+    <injectable-allocator order="11">
+      Error descriptor allocation is performed through a separately defined
+      function rather than by calling the memory manager directly.  That function
+      accepts a parent context and a byte count, asserts the context is non-NULL,
+      and delegates to the underlying zero-initializing allocator.
+
+      Because the function is separately defined (not inlined), test code can
+      substitute a replacement implementation that simulates allocation failure.
+      This allows the allocation-failure panic path inside error descriptor
+      construction to be exercised under test.
+
+      <notable reason="weak symbol, not a function pointer">
+        The substitution mechanism relies on a linkage attribute that allows a
+        test-provided definition to override the production definition at link
+        time, rather than a runtime function pointer.  This means the injection
+        is binary-level, not configurable at runtime.
+      </notable>
+    </injectable-allocator>
+
+  </behavior>
+
+</specification>

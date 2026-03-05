@@ -1,0 +1,122 @@
+<specification topic="Talloc Wrapper Seam">
+
+  <topic-statement>
+    The talloc wrapper seam exposes hierarchical memory allocation operations as
+    individually mockable link seams so that tests can intercept or replace any
+    allocation call without modifying production code.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Five allocation wrappers: zero-initialized allocation by size, string
+      duplication, zero-initialized array allocation, reallocation, and
+      formatted-string allocation.
+    </in-scope>
+
+    <boundary name="Memory Management">
+      All allocations are performed within the hierarchical memory manager. The
+      caller supplies a parent context for each operation; ownership of the
+      resulting memory belongs to that context tree.
+    </boundary>
+
+    <boundary name="Test Infrastructure">
+      Tests define strong-symbol replacements for any subset of these wrappers.
+      The strong definition shadows the default weak symbol, giving the test
+      full control over that operation's behavior (e.g., simulating allocation
+      failure by returning NULL).
+    </boundary>
+  </scope>
+
+  <behavior>
+
+    <build-mode-selection order="1">
+      The wrappers exist in two forms depending on the build configuration.
+
+      In a debug or test build (when the NDEBUG macro is not defined), each
+      wrapper is compiled as a weak symbol. A weak symbol has a default
+      implementation but yields to any strong-symbol definition of the same
+      name in the final link. This is the mechanism that makes individual
+      wrappers replaceable in tests.
+
+      In a release build (when NDEBUG is defined), each wrapper is a static
+      inline function defined in the header. No separate compilation unit is
+      involved; the call is inlined at every call site with zero runtime
+      overhead and no exported symbol.
+
+      <notable reason="Coverage exclusion">
+        The debug-build compilation unit that contains all five wrapper bodies
+        is marked to be excluded from line-coverage measurement. This is
+        intentional: the wrappers are pass-through delegators, and measuring
+        coverage of one-line forwarding functions adds noise without signal.
+      </notable>
+    </build-mode-selection>
+
+    <zero-allocation order="2">
+      Allocates a block of the requested byte size as a child of the given
+      parent context. The entire block is zero-initialized before being
+      returned. Returns NULL if the allocation fails.
+    </zero-allocation>
+
+    <string-duplication order="3">
+      Allocates a null-terminated copy of the given string as a child of the
+      given parent context. The length of the allocation equals the string
+      length plus the null terminator. Returns NULL if the string pointer is
+      NULL or if the allocation fails.
+    </string-duplication>
+
+    <array-allocation order="4">
+      Allocates a contiguous block sized to hold the given number of elements,
+      each of the given byte size, as a child of the given parent context.
+      The total byte count is the product of element size and element count.
+      The entire block is zero-initialized before being returned.
+
+      <notable reason="Manual sizing, no type safety">
+        Unlike a type-safe array macro, this wrapper accepts raw element size
+        and count integers. The caller is responsible for passing the correct
+        element size. The implementation multiplies the two values and calls
+        the raw sized allocator — no overflow protection is applied to the
+        multiplication.
+      </notable>
+    </array-allocation>
+
+    <reallocation order="5">
+      Resizes an existing allocation to the given byte size, keeping the
+      allocation under the given parent context. The parent context must match
+      the context under which the pointer was originally allocated. Returns the
+      (potentially moved) pointer, or NULL if the reallocation fails. If NULL
+      is returned, the original allocation is freed.
+
+      <notable reason="Context parameter required by signature but unused internally">
+        The underlying memory manager does not require the parent context to
+        perform a reallocation — it tracks ownership internally. The context
+        parameter is present solely to satisfy the link-seam calling convention
+        and to allow tests that inject failures based on the context.
+      </notable>
+    </reallocation>
+
+    <formatted-string-allocation order="6">
+      Produces a formatted string as a child of the given parent context, using
+      the given format string and variadic arguments. The behavior matches
+      standard printf formatting. The variadic argument list is captured into
+      a local argument list object, which is then forwarded to the underlying
+      variadic-accepting allocator. The local argument list is cleaned up
+      before the function returns. Returns the allocated string, or NULL if
+      the allocation fails.
+    </formatted-string-allocation>
+
+    <test-override-pattern order="7">
+      A test that needs to control a specific allocation operation defines a
+      function with the exact same signature as the wrapper, without any weak
+      attribute. Because the linker resolves strong symbols before weak ones,
+      the test's definition becomes the active implementation for that link
+      unit. The test can then consult thread-local or file-local flags to
+      decide whether to forward the call normally, return NULL to simulate
+      out-of-memory, or return a controlled substitute value.
+
+      Thread-local state is used for the flags so that test binaries running
+      multiple test suites in parallel do not interfere with one another.
+    </test-override-pattern>
+
+  </behavior>
+
+</specification>

@@ -1,0 +1,186 @@
+<specification topic="JSON Wrapper Seam">
+
+  <topic-statement>
+    The JSON wrapper seam exposes JSON library operations as individually
+    mockable link seams so that tests can intercept any JSON call without
+    modifying production code.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Sixteen wrappers covering: reading a JSON document from a file path,
+      reading a JSON document from a memory buffer, writing a mutable JSON
+      document to a file path, traversing to the document root, looking up an
+      object field by key, extracting a signed integer value, extracting a
+      string value, creating a mutable object node, creating a mutable array
+      node, adding a string field to a mutable object, adding a signed-integer
+      field to a mutable object, adding an unsigned-integer field to a mutable
+      object, adding a boolean field to a mutable object, adding an arbitrary
+      value field to a mutable object, appending an arbitrary value to a
+      mutable array, and performing a deep copy of an immutable value into a
+      mutable document.
+    </in-scope>
+
+    <boundary name="JSON Library">
+      Each wrapper delegates unconditionally to the corresponding JSON library
+      operation. The wrapper adds no logic, transformation, or error handling
+      of its own. The library's return value is passed through unchanged.
+    </boundary>
+
+    <boundary name="Test Infrastructure">
+      Tests define strong-symbol replacements for any subset of these wrappers.
+      The strong definition shadows the default weak symbol, giving the test
+      full control over that operation — for example, returning NULL from the
+      parse wrapper to simulate a malformed-JSON failure path.
+    </boundary>
+
+    <boundary name="Allocator Integration">
+      The file-reading and file-writing wrappers accept an optional custom
+      allocator parameter that the JSON library uses for its internal
+      allocations. Supplying a talloc-backed allocator (described separately
+      in the JSON Allocator specification) causes all document memory to be
+      tracked under a talloc context. The wrappers themselves impose no policy
+      on this parameter.
+    </boundary>
+  </scope>
+
+  <behavior>
+
+    <build-mode-selection order="1">
+      The wrappers exist in two forms depending on the build configuration.
+
+      In a debug or test build (when the NDEBUG macro is not defined), each
+      wrapper is compiled as a weak symbol. A weak symbol has a default
+      implementation but yields to any strong-symbol definition of the same
+      name in the final link. This is the mechanism that makes individual
+      wrappers replaceable in tests.
+
+      In a release build (when NDEBUG is defined), each wrapper is a static
+      inline function defined in the header. No separate compilation unit is
+      involved; the call is inlined at every call site with zero runtime
+      overhead and no exported symbol.
+
+      <notable reason="Coverage exclusion">
+        The debug-build compilation unit that contains all sixteen wrapper
+        bodies is marked to be excluded from line-coverage measurement. This
+        is intentional: the wrappers are unconditional one-line delegators and
+        measuring their coverage adds noise without signal.
+      </notable>
+    </build-mode-selection>
+
+    <document-reading-from-file order="2">
+      Reads a JSON document from the file at the given path. Accepts flags
+      that control parsing strictness, an optional custom allocator for
+      document memory, and an output struct that receives a detailed error
+      description on failure. Returns a parsed document handle on success, or
+      NULL on failure with the error struct populated.
+    </document-reading-from-file>
+
+    <document-reading-from-buffer order="3">
+      Reads a JSON document from the given byte buffer of the given length.
+      Accepts flags that control parsing strictness. Uses the library's default
+      allocator; there is no allocator parameter on this overload. Returns a
+      parsed document handle on success, or NULL on failure.
+    </document-reading-from-buffer>
+
+    <document-writing-to-file order="4">
+      Writes a mutable JSON document to the file at the given path. Accepts
+      flags that control serialization style (e.g., pretty-printing), an
+      optional custom allocator for scratch memory during serialization, and an
+      output struct that receives a detailed error description on failure.
+      Returns true on success, false on failure.
+    </document-writing-to-file>
+
+    <root-access order="5">
+      Returns the root value of a parsed document. The document handle is the
+      sole input. The return value is a borrowed pointer into the document's
+      memory; its lifetime is bounded by the document's lifetime.
+    </root-access>
+
+    <object-field-lookup order="6">
+      Looks up a field in a JSON object value by its string key using a linear
+      scan. Returns the associated value if the key is present, or NULL if not
+      found or if the input is not an object.
+    </object-field-lookup>
+
+    <signed-integer-extraction order="7">
+      Extracts the signed 64-bit integer contained in a JSON number value.
+      Returns the integer. Behavior is undefined if the value is not a numeric
+      type or if the numeric value falls outside the 64-bit signed range.
+    </signed-integer-extraction>
+
+    <string-extraction order="8">
+      Extracts the null-terminated string contents of a JSON string value.
+      Returns a pointer into the document's internal storage; the pointer is
+      valid for the lifetime of the document. Returns NULL if the value is not
+      a string type.
+    </string-extraction>
+
+    <mutable-object-creation order="9">
+      Creates an empty mutable JSON object node within a mutable document.
+      The node's memory is owned by the document. Returns the node handle.
+    </mutable-object-creation>
+
+    <mutable-array-creation order="10">
+      Creates an empty mutable JSON array node within a mutable document.
+      The node's memory is owned by the document. Returns the node handle.
+    </mutable-array-creation>
+
+    <mutable-object-string-field order="11">
+      Adds a key-value pair to a mutable object where the value is a string.
+      The key and value strings are copied into the document's memory. Returns
+      true on success, false if the operation fails.
+    </mutable-object-string-field>
+
+    <mutable-object-signed-integer-field order="12">
+      Adds a key-value pair to a mutable object where the value is a signed
+      64-bit integer. Returns true on success, false on failure.
+    </mutable-object-signed-integer-field>
+
+    <mutable-object-unsigned-integer-field order="13">
+      Adds a key-value pair to a mutable object where the value is an unsigned
+      64-bit integer. Returns true on success, false on failure.
+    </mutable-object-unsigned-integer-field>
+
+    <mutable-object-boolean-field order="14">
+      Adds a key-value pair to a mutable object where the value is a boolean.
+      Returns true on success, false on failure.
+    </mutable-object-boolean-field>
+
+    <mutable-object-arbitrary-field order="15">
+      Adds a key-value pair to a mutable object where the value is an
+      already-constructed mutable node (object, array, or scalar). The value
+      node must belong to the same mutable document. Returns true on success,
+      false on failure.
+    </mutable-object-arbitrary-field>
+
+    <mutable-array-element-append order="16">
+      Appends an already-constructed mutable node to a mutable array. The
+      node must belong to the same mutable document as the array. Returns true
+      on success, false on failure.
+    </mutable-array-element-append>
+
+    <immutable-to-mutable-copy order="17">
+      Performs a deep copy of an immutable JSON value (from a parsed document)
+      into a mutable document, recursively duplicating all child nodes. Returns
+      the root of the copied subtree as a mutable node owned by the target
+      document, or NULL on failure.
+    </immutable-to-mutable-copy>
+
+    <test-override-pattern order="18">
+      A test that needs to control a specific JSON operation defines a function
+      with the exact same signature as the wrapper, without any weak attribute.
+      Because the linker resolves strong symbols before weak ones, the test's
+      definition becomes the active implementation for that link unit. The test
+      can then consult file-local flags to decide whether to forward the call
+      normally or return NULL to simulate a failure (e.g., a parse error or
+      allocation failure inside the library).
+
+      File-local (static) state is the standard pattern for these flags, since
+      each test file compiles into its own binary and tests within a file run
+      sequentially.
+    </test-override-pattern>
+
+  </behavior>
+
+</specification>
