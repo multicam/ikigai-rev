@@ -1,0 +1,127 @@
+<specification topic="OpenAI Reasoning Effort Mapping">
+
+  <topic-statement>
+    The OpenAI reasoning effort mapper translates the internal thinking level
+    enumeration to the API-specific reasoning effort string required by each
+    OpenAI model, accounting for model-specific restrictions on available
+    effort values.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      The set of models classified as reasoning-capable, the per-model
+      effort level string lookup table, and the Responses API model
+      classification table.
+    </in-scope>
+
+    <boundary name="OpenAI API Routing">
+      Which API endpoint (Chat Completions or Responses API) is used for
+      each model is covered by the OpenAI API routing specification. This
+      topic covers only the reasoning effort string lookup.
+    </boundary>
+
+    <boundary name="Model Capability Registry">
+      Whether a model supports thinking at all is determined by the model
+      capability registry. This topic specifies the effort string for models
+      that do support reasoning.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Thinking Level Enumeration">
+      <field name="min" type="enum" note="minimum reasoning; maps to 'none', 'minimal', or lowest available" />
+      <field name="low" type="enum" note="light reasoning" />
+      <field name="med" type="enum" note="medium reasoning" />
+      <field name="high" type="enum" note="maximum reasoning; may map to 'xhigh' on some models" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <reasoning-model-identification order="1">
+      The following models are classified as reasoning-capable:
+      - o1, o1-mini, o1-preview
+      - o3, o3-mini, o3-pro
+      - o4-mini
+      - gpt-5, gpt-5-mini, gpt-5-nano, gpt-5-pro
+      - gpt-5.1, gpt-5.1-chat-latest, gpt-5.1-codex, gpt-5.1-codex-mini
+      - gpt-5.2, gpt-5.2-chat-latest, gpt-5.2-codex, gpt-5.2-pro
+
+      Models not in this list are not reasoning models and do not use effort
+      strings.
+    </reasoning-model-identification>
+
+    <per-model-effort-mapping order="2">
+      Each model has a distinct effort string for each thinking level. The
+      mapping reflects API constraints that vary by model:
+
+      **o1, o1-mini, o1-preview** (reasoning cannot be disabled):
+      - min → "low" (lowest supported value; "none" rejected by API)
+      - low → "low"
+      - med → "medium"
+      - high → "high"
+
+      **o3, o3-pro, o4-mini** (full range including disable):
+      - min → "none"
+      - low → "low"
+      - med → "medium"
+      - high → "high"
+
+      **o3-mini** (same as o3):
+      - min → "none"
+      - low → "low"
+      - med → "medium"
+      - high → "high"
+
+      **gpt-5, gpt-5-mini, gpt-5-nano** (minimum is "minimal", not "none"):
+      - min → "minimal"
+      - low → "low"
+      - med → "medium"
+      - high → "high"
+
+      **gpt-5-pro** (always uses maximum reasoning):
+      - min, low, med, high → "high"
+
+      **gpt-5.1, gpt-5.1-codex, gpt-5.1-codex-mini** (supports "none"):
+      - min → "none"
+      - low → "low"
+      - med → "medium"
+      - high → "high"
+
+      **gpt-5.1-chat-latest** (adaptive reasoning; API rejects other values):
+      - min, low, med, high → "medium"
+
+      **gpt-5.2, gpt-5.2-codex** (supports extended "xhigh"):
+      - min → "none"
+      - low → "low"
+      - med → "medium"
+      - high → "xhigh"
+
+      **gpt-5.2-chat-latest** (adaptive reasoning; API rejects other values):
+      - min, low, med, high → "medium"
+
+      **gpt-5.2-pro** (no disable, extended top):
+      - min → "medium"
+      - low → "medium"
+      - med → "high"
+      - high → "xhigh"
+
+      <notable reason="model-specific-api-restrictions">
+        Each model family imposes different constraints on which effort values
+        the API accepts. The mapping encodes these restrictions to prevent
+        API rejection errors. For example, older o1 models cannot disable
+        reasoning (so "min" maps to "low"), while some gpt-5 models require
+        "minimal" rather than "none" as the minimum value.
+      </notable>
+    </per-model-effort-mapping>
+
+    <responses-api-classification order="3">
+      A separate lookup determines whether a model uses the Responses API
+      or the Chat Completions API. All reasoning models listed above use the
+      Responses API. Models not in the reasoning model table use the Chat
+      Completions API by default.
+    </responses-api-classification>
+
+  </behavior>
+
+</specification>

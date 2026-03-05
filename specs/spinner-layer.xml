@@ -1,0 +1,125 @@
+<specification topic="Spinner Layer">
+
+  <topic-statement>
+    The spinner layer renders an animated single-row braille character
+    indicator that advances on a time-based schedule while the agent awaits
+    a response.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Spinner frame management, time-based frame advancement, visibility
+      control, single-row rendering, and integration with the REPL event loop
+      for animation timing.
+    </in-scope>
+
+    <boundary name="Layer Cake">
+      This topic provides three callbacks: visibility, height, and render.
+    </boundary>
+
+    <boundary name="Agent State">
+      This topic reads and writes a spinner state record owned by the agent.
+      The agent's state machine (IDLE / WAITING_FOR_LLM / EXECUTING_TOOL /
+      dead) controls the visibility flag within that record.
+    </boundary>
+
+    <boundary name="REPL Event Loop">
+      The event loop reads CLOCK_MONOTONIC time and calls the time-based
+      advance operation after each select() iteration. If advance occurs,
+      the loop triggers a full frame re-render externally.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Spinner State">
+      <field name="frame_index" type="numeric"
+             note="current animation frame, 0–9" />
+      <field name="visible" type="boolean" />
+      <field name="last_advance_ms" type="int64"
+             note="CLOCK_MONOTONIC timestamp in milliseconds of last advance" />
+    </contract>
+
+    <contract name="Animation Frames (in order)">
+      <field name="0" type="text" note="⠋" />
+      <field name="1" type="text" note="⠙" />
+      <field name="2" type="text" note="⠹" />
+      <field name="3" type="text" note="⠸" />
+      <field name="4" type="text" note="⠼" />
+      <field name="5" type="text" note="⠴" />
+      <field name="6" type="text" note="⠦" />
+      <field name="7" type="text" note="⠧" />
+      <field name="8" type="text" note="⠇" />
+      <field name="9" type="text" note="⠏" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <frame-retrieval order="1">
+      Returns the braille character at position (frame_index modulo 10) in
+      the frame sequence. The modulo ensures the index is always valid
+      regardless of the raw frame_index value.
+    </frame-retrieval>
+
+    <manual-frame-advance order="2">
+      Increments frame_index by 1, then applies modulo 10. Frame 9 wraps
+      back to frame 0.
+    </manual-frame-advance>
+
+    <time-based-frame-advance order="3">
+      Computes elapsed time as (now_ms − last_advance_ms). If elapsed is
+      greater than or equal to 120, the frame is advanced and last_advance_ms
+      is updated to now_ms; the operation returns true. Otherwise no state
+      change occurs and the operation returns false.
+
+      <notable reason="backward clock">
+        If now_ms is less than last_advance_ms (e.g., after a clock
+        adjustment), elapsed is negative and no advance occurs. The spinner
+        stalls until the clock catches up.
+      </notable>
+    </time-based-frame-advance>
+
+    <visibility-check order="4">
+      Returns the boolean visible flag from the spinner state.
+
+      Visibility is set to true when the agent transitions from IDLE to
+      WAITING_FOR_LLM. It is set to false when the agent transitions back to
+      IDLE. During frame rendering, if the agent is dead, the visible flag is
+      forced to false regardless of the stored value. If the agent is in
+      WAITING_FOR_LLM or EXECUTING_TOOL state, it is forced to true.
+    </visibility-check>
+
+    <height-reporting order="5">
+      Always returns 1. The spinner occupies exactly one terminal row.
+    </height-reporting>
+
+    <rendering order="6">
+      The width, start_row, and row_count parameters are ignored.
+
+      The current braille frame character (3 bytes UTF-8) is appended,
+      followed by the literal text " Waiting for response..." (24 bytes),
+      followed by an ANSI erase-to-end-of-line sequence and CRLF (5 bytes).
+      No color sequences are applied. The content is the same for every frame
+      except the leading braille character.
+    </rendering>
+
+    <animation-loop-integration order="7">
+      When the spinner is visible, the REPL event loop's select() call times
+      out after 80 milliseconds. After each iteration, the current
+      CLOCK_MONOTONIC time is read in milliseconds and passed to the
+      time-based advance operation. If the operation returns true (at least
+      120 milliseconds have elapsed since the last advance), a full frame
+      re-render is triggered. This produces approximately 8 animation frames
+      per second.
+
+      <notable reason="decoupled threshold">
+        The select() timeout (80 ms) is shorter than the advance threshold
+        (120 ms). The spinner does not advance on every timeout; it advances
+        only when the 120 ms threshold is crossed. The shorter timeout
+        provides timely checking without causing spurious advances.
+      </notable>
+    </animation-loop-integration>
+
+  </behavior>
+
+</specification>

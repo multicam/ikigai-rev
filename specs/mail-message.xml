@@ -1,0 +1,53 @@
+<specification topic="Mail Message">
+
+  <topic-statement>
+    The mail message record stores the fields of a single inter-agent mail
+    item and is the canonical in-memory representation of one message
+    delivered between agents.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      The mail message data fields and the single constructor that creates
+      and initialises a new in-memory mail message record.
+    </in-scope>
+
+    <boundary name="Mail Storage">
+      Persisting mail messages to the database and querying received messages
+      are covered by the mail storage specification.
+    </boundary>
+
+    <boundary name="Inter-Agent Messaging">
+      How the send and wait tools use mail messages to coordinate between
+      agents is covered by the inter-agent messaging specification.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Mail Message">
+      <field name="id" type="64-bit integer" note="zero until persisted; assigned by database on insert" />
+      <field name="from_uuid" type="string" note="UUID of the sending agent; deep-copied on construction" />
+      <field name="to_uuid" type="string" note="UUID of the receiving agent; deep-copied on construction" />
+      <field name="body" type="string" note="message content; deep-copied on construction" />
+      <field name="timestamp" type="64-bit integer" note="Unix epoch seconds at construction time" />
+      <field name="read" type="boolean" note="always initialised to false (unread)" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <construction order="1">
+      A new mail message is created by supplying the sender UUID, recipient
+      UUID, and body text. All three strings are deep-copied into
+      allocations owned by the new message record. The id field is set to
+      zero, the timestamp is set to the current Unix wall-clock time, and
+      the read flag is set to false.
+
+      All allocations are children of the caller's talloc context, so
+      freeing the context also frees the message and all its string fields.
+      If any allocation fails, the process aborts.
+    </construction>
+
+  </behavior>
+
+</specification>

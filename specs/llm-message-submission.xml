@@ -1,0 +1,156 @@
+<specification topic="LLM Message Submission">
+
+  <topic-statement>
+    The LLM message submission system sends a user message to the provider
+    and manages the full request lifecycle from input validation through
+    async stream initiation.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Handling the Enter key action (routing to slash commands or LLM
+      submission), creating and persisting the user message, clearing prior
+      response state, transitioning agent state, building the normalized
+      provider request, and initiating the async HTTP stream.
+    </in-scope>
+
+    <boundary name="Slash Command Dispatcher">
+      If the input begins with '/', it is forwarded to the command dispatcher.
+      Command execution behavior is handled externally.
+    </boundary>
+
+    <boundary name="Provider">
+      The normalized request is handed off to the provider's streaming
+      interface. Streaming events and completion callbacks are registered but
+      the provider manages all HTTP communication.
+    </boundary>
+
+    <boundary name="Database">
+      User messages and agent idle status are persisted via database helpers.
+      Persistence errors are logged but do not block the request.
+    </boundary>
+
+    <boundary name="Stream Callbacks">
+      Stream event handling and response completion processing are handled by
+      the LLM stream callback system, registered here but executed externally.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Slash Command Detection">
+      <field name="first character" type="text"
+             note="'/' triggers slash command path; anything else is user message" />
+    </contract>
+
+    <contract name="User Message (persisted)">
+      <field name="session_id" type="numeric" />
+      <field name="agent_uuid" type="text" />
+      <field name="kind" type="text" note="literal 'user'" />
+      <field name="content" type="text" note="the message text" />
+      <field name="data_json" type="json"
+             note="object with model, temperature, max_completion_tokens from config" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <enter-key-dispatch order="1">
+      The text and length of the current input buffer are read.
+
+      <completion-dismissal order="1">
+        Any active completion is dismissed regardless of input content.
+      </completion-dismissal>
+
+      <slash-command-path order="2">
+        If the first character of the input is '/': the input buffer is
+        cleared and the viewport offset is reset to zero before any command
+        processing. A null-terminated copy of the input text is made; if
+        allocation fails, the process aborts. The copy is forwarded to the
+        command dispatcher. If the command is the legacy pretty-print command
+        ("/pp"), it is handled locally by formatting and appending the input
+        buffer state to the scrollback. All other slash commands are forwarded
+        to the general command dispatcher; any error returned is logged and
+        freed.
+      </slash-command-path>
+
+      <message-path order="3">
+        If the first character is not '/': the current input text is appended
+        to the scrollback (making the user's message visible in the
+        conversation history). If the text is non-empty and global
+        configuration is present, a null-terminated copy is made and sent to
+        the provider. If the text is empty, no action is taken. The copy is
+        freed after sending.
+      </message-path>
+
+      Returns success unconditionally.
+    </enter-key-dispatch>
+
+    <sending-to-provider order="2">
+      <model-validation order="1">
+        If the agent's model field is null or empty, an error message is
+        appended to the scrollback and the operation returns immediately
+        without sending.
+      </model-validation>
+
+      <user-message-creation order="2">
+        A user-role text message is created and added to the agent's
+        in-memory conversation array.
+      </user-message-creation>
+
+      <token-cache-turn order="3">
+        If a token cache is present on the agent, a new turn boundary is
+        recorded (incrementing the turn counter and initializing the new
+        turn as uncached).
+      </token-cache-turn>
+
+      <database-persistence order="4">
+        If a database context and valid session ID are present, the user
+        message is persisted. A JSON metadata object containing the model,
+        temperature, and max completion tokens from configuration is
+        constructed and included. If the database insert fails, a warning is
+        logged via JSONL and the operation continues.
+      </database-persistence>
+
+      <response-buffer-reset order="5">
+        The agent's previous assistant response string and streaming line
+        buffer are freed if they exist and set to null. The tool iteration
+        counter is reset to zero.
+      </response-buffer-reset>
+
+      <active-status-update order="6">
+        If a database context is present, the agent's idle flag is set to
+        false in the database. Errors are logged and ignored.
+      </active-status-update>
+
+      <state-transition order="7">
+        The agent transitions from IDLE to WAITING_FOR_LLM. This makes the
+        spinner visible and hides the input buffer.
+      </state-transition>
+
+      <provider-initialization order="8">
+        The agent's provider instance is retrieved (lazily created if not
+        cached). If provider creation fails, the error message is appended
+        to the scrollback and the agent transitions back to IDLE.
+      </provider-initialization>
+
+      <request-building order="9">
+        A normalized provider request is built from the conversation: the
+        agent's model, system prompt, message history, tool definitions
+        (filtered by the agent's toolset filter if present), and thinking
+        level. If request building fails, the error is appended to the
+        scrollback and the agent transitions back to IDLE.
+      </request-building>
+
+      <stream-initiation order="10">
+        The provider's streaming interface is called with the request and
+        two callbacks: a stream event callback for incremental updates and
+        a completion callback for final response processing, both receiving
+        the agent as context. If stream initiation fails, the error is
+        appended to the scrollback and the agent transitions back to IDLE.
+        On success, the agent's HTTP-in-flight flag is set.
+      </stream-initiation>
+    </sending-to-provider>
+
+  </behavior>
+
+</specification>

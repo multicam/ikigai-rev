@@ -1,0 +1,66 @@
+<specification topic="Agent Name Lookup">
+
+  <topic-statement>
+    The agent name lookup retrieves display names for a batch of agent UUIDs
+    in a single parameterized database query.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Batch UUID-to-name query construction, parameter array building, result
+      parsing, and null name handling.
+    </in-scope>
+
+    <boundary name="Agent Database Layer">
+      Individual agent record retrieval is covered by the agent database layer
+      specification. This topic covers only the batch name lookup operation.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Input">
+      <field name="uuid array" type="array of strings" note="agent UUIDs to look up" />
+      <field name="uuid count" type="non-negative integer" note="number of UUIDs; if zero, returns empty result immediately" />
+    </contract>
+
+    <contract name="Name Entry">
+      <field name="uuid" type="string" note="copied into caller's talloc context" />
+      <field name="name" type="string or null" note="null if the agent's name field is null in the database" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <empty-input-shortcut order="1">
+      If the UUID count is zero, the output array is set to null and the
+      output count is set to zero. Success is returned immediately without
+      querying the database.
+    </empty-input-shortcut>
+
+    <query-construction order="2">
+      A SQL query is built dynamically with a WHERE clause of the form
+      WHERE uuid IN ($1, $2, ..., $N), where N equals the UUID count. The
+      parameter placeholders are appended one by one to a talloc-managed
+      string.
+    </query-construction>
+
+    <result-parsing order="3">
+      The result array is allocated on the caller's talloc context with one
+      entry per returned row. For each row, the UUID and name fields are
+      copied into the entry. If the name field is null in the database, the
+      entry's name pointer is set to null.
+
+      If the query returns zero rows, the output array is set to null and
+      the output count is set to zero; this is not an error.
+
+      <notable reason="partial-results">
+        The output contains only entries for UUIDs that exist in the database.
+        UUIDs supplied in the input that have no corresponding record produce
+        no entry in the output array. The caller must not assume a 1-to-1
+        correspondence between input UUIDs and output entries.
+      </notable>
+    </result-parsing>
+
+  </behavior>
+
+</specification>

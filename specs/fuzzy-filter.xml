@@ -1,0 +1,91 @@
+<specification topic="Fuzzy Filter">
+
+  <topic-statement>
+    The fuzzy filter scores and ranks a candidate string list against a search
+    query, returning the best-matching results up to a caller-specified limit.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Prefix filtering, fuzzy subsequence scoring, result sorting, and result
+      count limiting.
+    </in-scope>
+
+    <boundary name="Tab Completion">
+      The fuzzy filter is invoked by the tab-completion system to rank
+      completion candidates. Candidate generation and selection are handled
+      externally.
+    </boundary>
+
+    <boundary name="Fzy Library">
+      Subsequence matching and scoring are delegated to the vendored fzy
+      library. The fzy library's behaviour is not specified here.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Input">
+      <field name="candidates" type="array of strings" note="caller-owned; not copied" />
+      <field name="candidate_count" type="non-negative integer" />
+      <field name="search" type="string" note="may be empty; must not be null" />
+      <field name="max_results" type="positive integer" note="upper bound on returned results" />
+    </contract>
+
+    <contract name="Result Entry">
+      <field name="candidate" type="string pointer" note="points into the original candidates array; not a copy" />
+      <field name="score" type="double" note="higher values indicate better matches" />
+    </contract>
+
+    <contract name="Output">
+      <field name="result array" type="array of result entries" note="talloc-owned by the caller's context; null when no results" />
+      <field name="count" type="non-negative integer" note="number of entries in the result array" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <prefix-filter order="1">
+      Before fuzzy scoring is applied, candidates are filtered by prefix. A
+      candidate passes only if it begins with the search string, compared
+      case-insensitively. Candidates that do not pass the prefix test are
+      excluded from scoring entirely.
+
+      An empty search string passes all candidates through the prefix filter,
+      because every string begins with an empty prefix.
+    </prefix-filter>
+
+    <fuzzy-scoring order="2">
+      Each candidate that passed the prefix filter is tested for a fuzzy match:
+      the search string's characters must all appear in the candidate in order
+      (not necessarily consecutively). Candidates that fail this test are
+      excluded. Candidates that pass receive a numeric score; higher scores
+      indicate a closer match.
+    </fuzzy-scoring>
+
+    <sorting order="3">
+      Scored candidates are sorted in descending score order. Candidates with
+      higher scores appear first in the result array.
+    </sorting>
+
+    <result-limiting order="4">
+      If the number of matching candidates exceeds max_results, only the first
+      max_results entries (the highest-scoring) are returned. If the number of
+      matches is at or below max_results, all matches are returned.
+
+      If no candidates match, null is returned and the output count is zero.
+    </result-limiting>
+
+    <notable reason="candidate-pointers-are-aliases">
+      Result entries hold pointers directly into the caller-supplied candidates
+      array. The caller must ensure candidate strings remain valid for as long
+      as the result array is in use.
+    </notable>
+
+    <notable reason="zero-candidates-returns-null">
+      When candidate_count is zero, the function returns null immediately
+      without consulting the search string.
+    </notable>
+
+  </behavior>
+
+</specification>

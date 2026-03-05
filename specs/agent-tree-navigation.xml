@@ -1,0 +1,130 @@
+<specification topic="Agent Tree Navigation">
+
+  <topic-statement>
+    The agent tree navigation system switches the active agent by traversing
+    parent-child-sibling relationships within the in-memory agent array.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Switching the current agent, navigating to previous or next sibling, navigating
+      to a parent agent, navigating to the most recently created child agent, and
+      updating the navigation display context in the separator layer.
+    </in-scope>
+
+    <boundary name="Agent Array">
+      This topic reads agent records (uuid, parent_uuid, created_at) from the
+      array and updates the current pointer. It does not add or remove agents
+      from the array.
+    </boundary>
+
+    <boundary name="Separator Layer">
+      This topic sends navigation context (prev sibling UUID, next sibling UUID,
+      current UUID, child count) to the separator layer for display. Rendering
+      of that context is handled externally.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Agent Record (navigation-relevant fields)">
+      <field name="uuid" type="text" />
+      <field name="parent_uuid" type="text" nullable="true"
+             note="null for root agents" />
+      <field name="created_at" type="numeric"
+             note="UNIX timestamp; 0 for legacy agents" />
+    </contract>
+
+    <contract name="Navigation Context (sent to separator layer)">
+      <field name="parent_uuid" type="text" nullable="true" />
+      <field name="prev_sibling_uuid" type="text" nullable="true" />
+      <field name="current_uuid" type="text" />
+      <field name="next_sibling_uuid" type="text" nullable="true" />
+      <field name="child_count" type="numeric" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <switching-active-agent order="1">
+      When a switch is requested with a null target, an invalid-argument error
+      is returned. When the target equals the current agent, the operation
+      returns success immediately without any state change. Otherwise, the
+      current agent pointer is updated to the target and the navigation display
+      context is refreshed.
+    </switching-active-agent>
+
+    <navigating-to-previous-sibling order="2">
+      Siblings are all agents whose parent identifier matches the current
+      agent's parent identifier. Two null parent identifiers are considered
+      equal (both root-level agents are siblings of each other).
+
+      <sibling-collection order="1">
+        All sibling agents are collected into a fixed-capacity local buffer of
+        64 slots by scanning the full agent array.
+
+        <notable reason="buffer overflow">
+          If more than 64 agents share the same parent, writes past the end of
+          the 64-slot buffer occur. No bounds check exists on the collection
+          loop. This is a silent memory corruption hazard.
+        </notable>
+      </sibling-collection>
+
+      <sibling-navigation order="2">
+        If one or fewer siblings are found, the operation returns success
+        immediately with no state change. Otherwise, the current agent's
+        position within the sibling list is located, and the previous sibling
+        is selected with wraparound: if the current agent is first in the list,
+        the last sibling is selected. The switch is then performed.
+      </sibling-navigation>
+    </navigating-to-previous-sibling>
+
+    <navigating-to-next-sibling order="3">
+      Uses the same sibling collection algorithm as previous-sibling navigation.
+      Navigation advances forward by one position modulo the sibling count,
+      wrapping from last back to first.
+    </navigating-to-next-sibling>
+
+    <navigating-to-parent order="4">
+      If the current agent has no parent identifier (it is a root agent),
+      the operation returns success immediately with no state change.
+
+      Otherwise, the parent is looked up in the agent array by exact UUID
+      match. If the parent is not found (it was removed from the array after
+      being killed or reaped), the operation returns success immediately with
+      no state change. If found, the switch is performed.
+    </navigating-to-parent>
+
+    <navigating-to-most-recent-child order="5">
+      The agent array is scanned for agents whose parent identifier equals
+      the current agent's UUID. Among matching agents, the one with the
+      highest created_at timestamp is selected. If multiple children have
+      identical timestamps (including the legacy value of zero), the first
+      one encountered in array order wins. If no children are found, the
+      operation returns success with no state change. Otherwise, the switch
+      is performed.
+    </navigating-to-most-recent-child>
+
+    <updating-navigation-display-context order="6">
+      This operation is triggered automatically after every agent switch. It
+      is also called after fork and kill operations.
+
+      If the current agent is null or the separator layer is absent, the
+      operation returns immediately without updating anything.
+
+      The full agent array is scanned once to compute:
+      - Previous sibling: the sibling with the highest created_at value that
+        is strictly less than the current agent's created_at.
+      - Next sibling: the sibling with the lowest created_at value that is
+        strictly greater than the current agent's created_at.
+      - Child count: the number of agents whose parent identifier matches the
+        current agent's UUID.
+
+      Sibling comparison uses the same parent-equality logic as navigation
+      (null parent identifiers are equal). The resulting UUIDs (which may be
+      null for prev and next) and the child count are sent to the separator
+      layer.
+    </updating-navigation-display-context>
+
+  </behavior>
+
+</specification>

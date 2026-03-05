@@ -1,0 +1,84 @@
+<specification topic="Finish Reason Mapping">
+
+  <topic-statement>
+    The finish reason mapping system translates provider-specific stop reason
+    strings from each provider's streaming or response format into a unified
+    internal finish reason enumeration.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Anthropic stop_reason string mapping, OpenAI Chat Completions
+      finish_reason string mapping, and OpenAI Responses API status and
+      incomplete_details mapping.
+    </in-scope>
+
+    <boundary name="Provider Serialization">
+      How streaming events are normalized across providers is covered by
+      the provider serialization specification. This topic covers only the
+      finish reason string-to-enum translation step within that process.
+    </boundary>
+
+    <boundary name="Google Streaming Events">
+      Google Gemini finish reason mapping is covered by the Google streaming
+      events specification.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Internal Finish Reason Enumeration">
+      <field name="STOP" type="enum" note="natural end of response" />
+      <field name="LENGTH" type="enum" note="stopped due to output token limit" />
+      <field name="TOOL_USE" type="enum" note="stopped to invoke a tool" />
+      <field name="CONTENT_FILTER" type="enum" note="stopped by content policy" />
+      <field name="ERROR" type="enum" note="stopped due to an error condition" />
+      <field name="UNKNOWN" type="enum" note="unrecognized or absent reason" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <anthropic-mapping order="1">
+      Anthropic stop_reason strings map as follows:
+      - "end_turn" → STOP
+      - "max_tokens" → LENGTH
+      - "tool_use" → TOOL_USE
+      - "stop_sequence" → STOP
+      - "refusal" → CONTENT_FILTER
+      - All other values → UNKNOWN
+    </anthropic-mapping>
+
+    <openai-chat-mapping order="2">
+      OpenAI Chat Completions finish_reason strings map as follows:
+      - "stop" → STOP
+      - "length" → LENGTH
+      - "tool_calls" → TOOL_USE
+      - "content_filter" → CONTENT_FILTER
+      - "error" → ERROR
+      - All other values (including absent) → UNKNOWN
+    </openai-chat-mapping>
+
+    <openai-responses-mapping order="3">
+      OpenAI Responses API uses a status field with an optional
+      incomplete_details.reason field for incomplete responses.
+
+      Primary status mappings:
+      - "completed" → STOP
+      - "failed" → ERROR
+      - "cancelled" → STOP
+      - "incomplete" with incomplete_details.reason "max_output_tokens" → LENGTH
+      - "incomplete" with incomplete_details.reason "content_filter" → CONTENT_FILTER
+      - "incomplete" with any other or absent reason → LENGTH (default for incomplete)
+      - All other status values → UNKNOWN
+
+      <notable reason="incomplete-defaults-to-length">
+        When the status is "incomplete" but no incomplete_details.reason is
+        provided or the reason is unrecognized, the finish reason defaults
+        to LENGTH rather than UNKNOWN. This is a conservative assumption
+        that the output was cut off by a token limit.
+      </notable>
+    </openai-responses-mapping>
+
+  </behavior>
+
+</specification>

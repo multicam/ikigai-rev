@@ -1,0 +1,141 @@
+<specification topic="Response Line Buffer">
+
+  <topic-statement>
+    The response line buffer accumulates incoming streaming text chunks,
+    flushes complete lines to the scrollback with a model prefix on the first
+    line, and extracts response metadata and tool calls at completion.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Text delta accumulation in the full response string and in the
+      pending line buffer, newline-triggered line flushing to the scrollback,
+      first-line model prefix insertion, usage event rendering, response
+      metadata storage, and tool call and thinking block extraction from
+      the completed response.
+    </in-scope>
+
+    <boundary name="Scrollback">
+      Complete lines are appended to the scrollback by this topic. The
+      scrollback manages its own storage.
+    </boundary>
+
+    <boundary name="Provider Response">
+      The content block array of the completed response is read by this topic
+      for tool call and thinking block extraction. The provider constructs
+      and owns the response.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Finish Reason Mapping">
+      <field name="IK_FINISH_STOP" type="enum" note="stored as 'stop'" />
+      <field name="IK_FINISH_LENGTH" type="enum" note="stored as 'length'" />
+      <field name="IK_FINISH_TOOL_USE" type="enum" note="stored as 'tool_use'" />
+      <field name="IK_FINISH_CONTENT_FILTER" type="enum" note="stored as 'content_filter'" />
+      <field name="IK_FINISH_ERROR" type="enum" note="stored as 'error'" />
+      <field name="IK_FINISH_UNKNOWN" type="enum" note="stored as 'unknown'" />
+    </contract>
+
+    <contract name="Content Block Types Processed">
+      <field name="IK_CONTENT_THINKING" type="enum"
+             note="stores text and signature into pending thinking fields" />
+      <field name="IK_CONTENT_REDACTED_THINKING" type="enum"
+             note="stores encrypted data into pending redacted field" />
+      <field name="IK_CONTENT_TOOL_CALL" type="enum"
+             note="creates tool call record; loop stops after first" />
+      <field name="IK_CONTENT_TEXT" type="enum" note="ignored (text was streamed)" />
+      <field name="IK_CONTENT_TOOL_RESULT" type="enum" note="ignored" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <text-delta-accumulation order="1">
+      When a text chunk arrives, if the chunk is empty, the operation returns
+      immediately.
+
+      The chunk is appended to the agent's full response string. If no
+      response string exists yet, it is initialized from the chunk. If
+      appending fails due to out-of-memory, the process aborts.
+
+      The chunk is then scanned byte-by-byte for newline characters. For
+      each newline found, the segment from the previous newline position
+      (or chunk start) to the newline is flushed as a complete scrollback
+      line. After all newlines, any remaining content after the last newline
+      is appended to the pending line buffer. If the buffer does not exist
+      yet, it is initialized from the trailing segment; otherwise it is
+      extended.
+    </text-delta-accumulation>
+
+    <line-flushing order="2">
+      A segment is flushed to the scrollback as follows:
+
+      <first-line-prefix order="1">
+        If the streaming-first-line flag is set and the model text output
+        prefix exists (the "●" symbol), the prefix followed by a space is
+        prepended to the line content. The combined string (prefix + space +
+        any pending buffer content + segment) is appended to the scrollback
+        as one line. The streaming-first-line flag is cleared after the
+        first flush.
+      </first-line-prefix>
+
+      <subsequent-lines order="2">
+        Lines after the first are appended directly: if a pending line buffer
+        exists, it is prepended to the segment and the combined string is
+        appended to the scrollback.
+      </subsequent-lines>
+
+      <empty-segment order="3">
+        If the segment is empty and the first-line flag is set, the flush
+        is deferred (no line is appended and no prefix is emitted). The
+        prefix will be applied to the next non-empty line.
+
+        If the segment is empty and the first-line flag is not set, an empty
+        line is appended to the scrollback.
+      </empty-segment>
+
+      After each flush the pending line buffer is freed and set to null.
+    </line-flushing>
+
+    <usage-event-rendering order="3">
+      The agent's input, output, and thinking token counts are summed. If
+      the total is greater than zero, a usage event is rendered to the
+      scrollback as a JSON object containing all three counts. If the total
+      is zero or less, an empty line is appended instead.
+    </usage-event-rendering>
+
+    <response-metadata-storage order="4">
+      Previous response model and finish reason strings are freed. The
+      response model string from the provider response is copied into
+      agent-owned memory. The finish reason enum is mapped to a string using
+      the mapping in the data contract above and copied into agent-owned
+      memory. Token counts (input, output, thinking) are copied from the
+      response usage structure into the agent's numeric fields. If any string
+      copy fails due to out-of-memory, the process aborts.
+    </response-metadata-storage>
+
+    <tool-call-extraction order="5">
+      All pending thinking and tool call fields on the agent are cleared
+      (freed if non-null, set to null). The response's content block array
+      is then iterated:
+
+      - A thinking block stores its text and signature (each independently,
+        each may be null) into the agent's pending thinking fields.
+      - A redacted thinking block stores its encrypted data into the agent's
+        pending redacted data field.
+      - A tool call block creates a tool call record (copying ID, name, and
+        arguments) and stores it as the agent's pending tool call. If a
+        thought signature is present on the block, it is stored in the
+        agent's pending tool thought signature field. Iteration stops after
+        the first tool call block.
+
+      <notable reason="single-tool-call-limit">
+        Only the first tool call content block is processed. Any additional
+        tool call blocks in the same response are silently ignored.
+      </notable>
+    </tool-call-extraction>
+
+  </behavior>
+
+</specification>

@@ -1,0 +1,122 @@
+<specification topic="Provider Error Categorization">
+
+  <topic-statement>
+    The provider error categorization system maps HTTP status codes and
+    provider-specific error fields to standardized error categories, and
+    classifies categories by retry eligibility.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      HTTP status code to error category mapping for each of the three
+      providers (Anthropic, Google, OpenAI), provider-specific error code
+      refinement (OpenAI only), and the retry eligibility classification
+      shared across all providers.
+    </in-scope>
+
+    <boundary name="LLM Response Handling">
+      How error categories are used to decide whether to retry or abort a
+      request is covered by the LLM response handling specification.
+    </boundary>
+
+    <boundary name="Provider Streaming">
+      In-stream error events use a subset of these categories. Stream error
+      events are documented in the individual provider streaming
+      specifications.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Error Category">
+      <field name="AUTH" type="enum" note="authentication or authorisation failure" />
+      <field name="RATE_LIMIT" type="enum" note="request rate or quota exceeded" />
+      <field name="INVALID_ARG" type="enum" note="malformed or rejected request" />
+      <field name="NOT_FOUND" type="enum" note="requested resource or model not found" />
+      <field name="CONTENT_FILTER" type="enum" note="response blocked by content policy" />
+      <field name="SERVER" type="enum" note="provider-side server error" />
+      <field name="TIMEOUT" type="enum" note="request or network timeout" />
+      <field name="NETWORK" type="enum" note="transport-level failure before HTTP response" />
+      <field name="UNKNOWN" type="enum" note="unrecognized status code or error type" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <anthropic-http-mapping order="1">
+      Anthropic HTTP status codes are mapped as follows:
+      - 401, 403 → AUTH
+      - 429 → RATE_LIMIT
+      - 400 → INVALID_ARG
+      - 404 → NOT_FOUND
+      - 500, 529 → SERVER (529 is Anthropic's "overloaded" status)
+      - All other codes → UNKNOWN
+
+      The error response body may contain a JSON error type and message,
+      but the category is determined solely by the HTTP status code;
+      the error body fields are not used for categorization.
+    </anthropic-http-mapping>
+
+    <google-http-mapping order="2">
+      Google HTTP status codes are mapped as follows:
+      - 400 → INVALID_ARG
+      - 401, 403 → AUTH
+      - 404 → NOT_FOUND
+      - 429 → RATE_LIMIT
+      - 500, 502, 503 → SERVER
+      - 504 → TIMEOUT
+      - All other codes → UNKNOWN
+
+      An error message is extracted from the JSON body's nested error.message
+      field and formatted as "HTTP {code}: {message}". If the body cannot
+      be parsed, the message falls back to "HTTP {code}".
+    </google-http-mapping>
+
+    <openai-http-mapping order="3">
+      OpenAI HTTP status codes are initially mapped as follows:
+      - 401, 403 → AUTH
+      - 429 → RATE_LIMIT
+      - 400 → INVALID_ARG
+      - 404 → NOT_FOUND
+      - 500, 502, 503 → SERVER
+      - All other codes → UNKNOWN
+
+      This initial category is then refined by inspecting the error JSON body:
+
+      1. If the error.type or error.code field contains the substring
+         "content_filter", the category is overridden to CONTENT_FILTER
+         regardless of the HTTP status.
+
+      2. If content filter was not detected, the error.code field may
+         further refine the category:
+         - "invalid_api_key" or "invalid_org" → AUTH
+         - "rate_limit_exceeded" or "quota_exceeded" → RATE_LIMIT
+         - "model_not_found" → NOT_FOUND
+
+      Code-based refinement takes precedence over HTTP-status-based
+      categorization when the code is recognized.
+    </openai-http-mapping>
+
+    <retry-eligibility order="4">
+      Regardless of provider, error categories are classified for retry
+      eligibility as follows:
+
+      Retryable categories:
+      - RATE_LIMIT
+      - SERVER
+      - TIMEOUT
+      - NETWORK
+
+      Non-retryable categories:
+      - AUTH
+      - INVALID_ARG
+      - NOT_FOUND
+      - CONTENT_FILTER
+      - UNKNOWN
+
+      This classification is queried by the request retry logic to determine
+      whether to attempt the request again after a failure.
+    </retry-eligibility>
+
+  </behavior>
+
+</specification>

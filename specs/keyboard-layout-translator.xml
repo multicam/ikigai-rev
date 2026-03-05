@@ -1,0 +1,103 @@
+<specification topic="Keyboard Layout Translator">
+
+  <topic-statement>
+    The keyboard layout translator builds a reverse keymap from the system
+    keyboard layout and uses it to convert unshifted ASCII codepoints to
+    their shifted equivalents, enabling correct shifted-character output
+    for terminals that send only the base keycode.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      XKB context and keymap initialisation, reverse keymap construction,
+      shifted-codepoint translation, and resource cleanup.
+    </in-scope>
+
+    <boundary name="Escape Sequence Parser">
+      The escape sequence parser invokes translation when it receives a CSI u
+      sequence with a Shift modifier. This module does not handle escape
+      sequence parsing.
+    </boundary>
+
+    <boundary name="XKB Library">
+      Keymap loading, state management, and keysym lookup are delegated to
+      libxkbcommon. Internal XKB behaviour is out of scope.
+    </boundary>
+  </scope>
+
+  <behavior>
+
+    <initialisation order="1">
+      During input parser setup, an XKB context is created using system
+      defaults (RMLVO names are NULL, causing libxkbcommon to read from
+      environment variables and system configuration). A keymap is compiled
+      from that context, and an XKB state object is created from the keymap.
+      The Shift modifier mask is queried from the keymap.
+
+      If any XKB allocation fails, previously allocated objects are
+      dereferenced and the translator is marked as uninitialised. Subsequent
+      translation calls return the original codepoint without modification.
+
+      A reverse keymap is then built from the successfully initialised keymap
+      and state (see below).
+
+      <notable reason="non-fatal-on-failure">
+        Failure to initialise the keyboard translator does not prevent the
+        input system from operating. Shifted keys will be passed through with
+        their unshifted codepoints rather than being translated.
+      </notable>
+    </initialisation>
+
+    <reverse-keymap-construction order="2">
+      A 128-element array indexed by ASCII codepoint is populated with X11
+      keycodes. For each keycode from 9 to 100 inclusive, the unshifted keysym
+      at that keycode is resolved and converted to a Unicode codepoint. If the
+      resulting codepoint is in the printable ASCII range (32–127) and no
+      mapping has been recorded for that codepoint yet, the keycode is stored
+      at that index.
+
+      Scanning is limited to keycodes 9–100 to avoid the numeric keypad,
+      which can produce the same keysyms as the main keyboard and would
+      otherwise create ambiguous mappings.
+
+      Codepoints that map to multiple keycodes retain only the first (lowest
+      keycode) assignment.
+
+      All XKB modifiers are cleared before scanning so that only the base
+      (unshifted) layer is consulted.
+    </reverse-keymap-construction>
+
+    <shifted-codepoint-translation order="3">
+      Given an input codepoint, the translator:
+
+      1. Returns the original codepoint unchanged if the translator is
+         uninitialised.
+      2. Returns the original codepoint if it falls outside the range 32–127.
+      3. Looks up the keycode in the reverse map. If no keycode was recorded
+         for that codepoint (zero), returns the original.
+      4. Temporarily applies the Shift modifier to the XKB state.
+      5. Queries the keysym for the located keycode under the Shift modifier
+         and converts to a Unicode codepoint.
+      6. Clears all modifiers from the XKB state.
+      7. Returns the shifted codepoint if non-zero; otherwise returns the
+         original.
+
+      <notable reason="state-mutation">
+        Each translation call temporarily mutates the XKB state by applying
+        and then clearing the Shift modifier. The state is always restored
+        before returning, making the operation safe for sequential calls from
+        a single thread.
+      </notable>
+    </shifted-codepoint-translation>
+
+    <cleanup order="4">
+      The translator is registered as a talloc destructor on the input parser
+      context. When the parser is freed, all three XKB objects (context,
+      keymap, state) are dereferenced in the correct order. The destructor
+      handles null pointers safely and always returns zero to satisfy the
+      talloc destructor protocol.
+    </cleanup>
+
+  </behavior>
+
+</specification>

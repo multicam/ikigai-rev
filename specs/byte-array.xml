@@ -1,0 +1,78 @@
+<specification topic="Byte Array">
+
+  <topic-statement>
+    The byte array is a typed dynamic array of uint8_t values that delegates
+    all storage and capacity management to the generic array implementation.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      The typed API surface: creation, append, insert, delete, clear, element
+      access, and size query.
+    </in-scope>
+
+    <boundary name="Generic Array">
+      Capacity growth, memory allocation, bounds checking, and element shifting
+      are all handled by the generic array implementation. The byte array
+      provides only type-specific wrapping.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Creation Parameters">
+      <field name="increment" type="positive integer"
+             note="initial allocation size in elements; must be greater than zero" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <creation order="1">
+      A new byte array is created with an element size of one byte and the
+      caller-supplied increment. The initial data buffer is not allocated until
+      the first element is added (lazy allocation). If increment is zero, an
+      error is returned.
+    </creation>
+
+    <append order="2">
+      A single byte is appended after the last existing element. If the current
+      capacity is exhausted, the buffer is reallocated at double the current
+      capacity. Returns a success or failure result.
+    </append>
+
+    <insert order="3">
+      A single byte is inserted at a given index, shifting all elements at and
+      after that index one position to the right. The index may equal the
+      current size (equivalent to append). Returns a success or failure result.
+    </insert>
+
+    <delete order="4">
+      The element at a given index is removed by shifting all elements after it
+      one position to the left and decrementing the size. The index must be
+      less than the current size; violation aborts the process.
+    </delete>
+
+    <clear order="5">
+      The size is reset to zero without deallocating or zeroing the underlying
+      buffer. Capacity is preserved.
+    </clear>
+
+    <element-access order="6">
+      The byte value at a given index is returned. The index must be less than
+      the current size; violation aborts the process.
+    </element-access>
+
+    <size-query order="7">
+      Returns the number of elements currently stored. This is a read-only
+      query with no side effects.
+    </size-query>
+
+    <notable reason="lazy-allocation">
+      The internal buffer is not allocated at creation time. The first append
+      or insert triggers the initial allocation at the increment size, after
+      which capacity doubles on each exhaustion.
+    </notable>
+
+  </behavior>
+
+</specification>

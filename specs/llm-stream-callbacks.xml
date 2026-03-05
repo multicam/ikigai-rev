@@ -1,0 +1,195 @@
+<specification topic="LLM Stream Callbacks">
+
+  <topic-statement>
+    The LLM stream callback system processes provider streaming events and
+    final response completion to accumulate, display, and store LLM output
+    for an active agent.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Dispatching stream events (START, TEXT_DELTA, DONE, ERROR), accumulating
+      response text and error messages, flushing the line buffer at completion,
+      storing response metadata, and extracting tool calls and thinking blocks
+      from the completed response.
+    </in-scope>
+
+    <boundary name="Provider">
+      The provider sends stream events during delivery and a completion result
+      at the end. This topic consumes both; it does not control the provider.
+    </boundary>
+
+    <boundary name="Text Delta Handler">
+      Text delta content is delegated to an external helper that manages line
+      buffering and appends complete lines to the scrollback. This topic
+      provides the raw text; the helper performs the display work.
+    </boundary>
+
+    <boundary name="Scrollback">
+      Completed lines, flushed buffer content, and blank separator lines are
+      appended to the scrollback by this topic. The scrollback itself is
+      managed externally.
+    </boundary>
+
+    <boundary name="Response Helpers">
+      Metadata storage (model, finish reason, token counts), usage event
+      rendering, and tool call extraction are performed by external helpers
+      called from the completion phase. This topic calls them in sequence.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Stream Event">
+      <field name="type" type="enum"
+             note="START | TEXT_DELTA | THINKING_DELTA | TOOL_CALL_START |
+                   TOOL_CALL_DELTA | TOOL_CALL_DONE | DONE | ERROR" />
+      <field name="text" type="text" nullable="true"
+             note="present for TEXT_DELTA events" />
+      <field name="message" type="text" nullable="true"
+             note="present for ERROR events" />
+      <field name="usage.input_tokens" type="numeric"
+             note="present for DONE events" />
+      <field name="usage.output_tokens" type="numeric"
+             note="present for DONE events" />
+      <field name="usage.thinking_tokens" type="numeric"
+             note="present for DONE events" />
+    </contract>
+
+    <contract name="Completion Result">
+      <field name="success" type="boolean" />
+      <field name="response" type="object" nullable="true"
+             note="non-null only on success" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <stream-event-dispatch order="1">
+      Each incoming stream event is dispatched by type. The agent context is
+      mutable throughout.
+
+      <start-event order="1">
+        If a previous assistant response string exists in the agent, it is
+        freed. The streaming-first-line flag is set to true.
+      </start-event>
+
+      <text-delta-event order="2">
+        If the text field is non-null, the text is forwarded to the text delta
+        handler for line buffering and display. Null text is silently ignored.
+      </text-delta-event>
+
+      <thinking-delta-event order="3">
+        No action. Thinking content is not displayed during streaming.
+      </thinking-delta-event>
+
+      <tool-call-events order="4">
+        TOOL_CALL_START, TOOL_CALL_DELTA, and TOOL_CALL_DONE events produce no
+        action. The provider accumulates tool call data internally.
+      </tool-call-events>
+
+      <done-event order="5">
+        Token counts from the event's usage data are stored into the agent:
+        input_tokens, output_tokens, and thinking_tokens.
+      </done-event>
+
+      <error-event order="6">
+        If the error message field is non-null: any previously stored
+        http_error_message on the agent is freed, and the new message is
+        duplicated into agent-owned memory. If duplication fails due to
+        out-of-memory, the process aborts.
+      </error-event>
+
+      <notable reason="always-success return">
+        The stream callback never returns an error to the provider. All events
+        including ERROR events return a success result. Error information is
+        stored on the agent for later display.
+      </notable>
+    </stream-event-dispatch>
+
+    <completion-processing order="2">
+      Called once after the full response has been received (or failed).
+
+      <debug-logging order="1">
+        Logging of success/failure status, model, and token counts is performed
+        conditionally at compile time. When enabled, a JSONL record is produced
+        and written to the debug logger.
+      </debug-logging>
+
+      <response-content-check order="2">
+        The accumulated assistant response string is scanned for any character
+        that is not a space, tab, newline, or carriage return. If any such
+        character is found, had_response_content is set to true.
+      </response-content-check>
+
+      <line-buffer-flush order="3">
+        If a streaming line buffer exists in the agent (a partial line that
+        has not yet been appended to scrollback):
+        - If the streaming-first-line flag is set and an output prefix exists:
+          the prefix (a filled circle symbol followed by a space) is prepended
+          to the buffer content, and the combined string is appended to
+          scrollback as a single line. Memory for the combined string is
+          allocated; if allocation fails, the process aborts.
+        - Otherwise: the buffer content is appended to scrollback directly.
+
+        The line buffer is then freed and set to null. The streaming-first-line
+        flag is cleared.
+      </line-buffer-flush>
+
+      <blank-separator order="4">
+        If had_response_content is true, an empty line is appended to the
+        scrollback as a visual separator before the usage display.
+      </blank-separator>
+
+      <error-reconciliation order="5">
+        Any previously stored http_error_message is freed. If the completion
+        indicates failure and an error message is present, the message is
+        duplicated into agent-owned memory. If duplication fails, the process
+        aborts.
+      </error-reconciliation>
+
+      <success-path order="6">
+        Executed only when the completion succeeded and the response object
+        is non-null.
+
+        <metadata-storage order="1">
+          An external helper is called to store the response model identifier,
+          finish reason (converted from enum to string), and token counts
+          (input, output, thinking) onto the agent.
+        </metadata-storage>
+
+        <usage-rendering order="2">
+          An external helper computes total tokens (input + output + thinking).
+          If total is greater than zero, a structured usage event is rendered
+          to the scrollback. Otherwise, an empty line is appended.
+        </usage-rendering>
+
+        <tool-call-extraction order="3">
+          An external helper iterates the response content blocks. Before
+          iteration, pending thinking text, thinking signature, redacted data,
+          and tool call on the agent are all cleared.
+
+          For each content block:
+          - A thinking block stores its text and signature into the agent's
+            pending thinking fields.
+          - A redacted thinking block stores its data into the agent's pending
+            redacted data field.
+          - A tool call block creates a tool call record and stores it as the
+            pending tool call; iteration stops after the first tool call.
+
+          <notable reason="single-tool-call limit">
+            Only the first tool call content block is processed. Subsequent
+            tool call blocks in the same response are silently ignored.
+          </notable>
+        </tool-call-extraction>
+      </success-path>
+
+      <notable reason="always-success return">
+        The completion callback never returns an error regardless of outcome.
+        All processing paths return success, with error information stored on
+        the agent for subsequent display.
+      </notable>
+    </completion-processing>
+
+  </behavior>
+
+</specification>

@@ -1,0 +1,101 @@
+<specification topic="OpenAI Responses API Streaming">
+
+  <topic-statement>
+    The OpenAI Responses API streaming handler processes named SSE events
+    from the Responses API endpoint and translates them into normalized
+    stream events, handling text output, reasoning summaries, tool calls,
+    and completion.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Named Responses API event dispatch (response.created,
+      response.output_text.delta, response.reasoning_summary_text.delta,
+      response.output_item.added, response.function_call_arguments.delta,
+      response.output_item.done, error), model name caching, and tool
+      argument accumulation.
+    </in-scope>
+
+    <boundary name="OpenAI API Routing">
+      Which models use the Responses API versus Chat Completions is covered
+      by the OpenAI API routing and reasoning effort specifications.
+    </boundary>
+
+    <boundary name="Provider Serialization">
+      How requests are serialized for the Responses API is covered by the
+      provider serialization specification.
+    </boundary>
+  </scope>
+
+  <behavior>
+
+    <response-created order="1">
+      The `response.created` event contains a model field. The model name is
+      extracted and cached for use in the completion record.
+    </response-created>
+
+    <text-delta order="2">
+      The `response.output_text.delta` event contains a delta field with the
+      partial text output. The delta is emitted as a TEXT_DELTA stream event.
+      An optional content_index field identifies the output item position but
+      is not used in routing.
+    </text-delta>
+
+    <reasoning-delta order="3">
+      The `response.reasoning_summary_text.delta` event contains a delta
+      field with partial reasoning (thinking) output. The delta is emitted as
+      a THINKING_DELTA stream event. An optional summary_index field is
+      present but not used in routing.
+    </reasoning-delta>
+
+    <output-item-added order="4">
+      The `response.output_item.added` event signals that a new output item
+      has started. For items of type `function_call`:
+      - Any previously open tool call is ended.
+      - The accumulated arguments string is reset to empty.
+      - The call ID and function name are extracted from the item.
+      - A TOOL_CALL_START event is emitted with the call ID and function name.
+
+      Items of other types (such as text) are ignored; their content arrives
+      through the output_text.delta event.
+    </output-item-added>
+
+    <function-call-arguments-delta order="5">
+      The `response.function_call_arguments.delta` event carries a partial
+      arguments string for the current tool call. The delta is appended to
+      the accumulated arguments string. A TOOL_CALL_DELTA event is emitted
+      carrying the delta text (not the full accumulated string).
+    </function-call-arguments-delta>
+
+    <output-item-done order="6">
+      The `response.output_item.done` event signals that an output item is
+      complete. For function_call items, a TOOL_CALL_DONE event is emitted.
+      The tool call active flag is cleared, but the tool call data (ID, name,
+      accumulated arguments) is preserved for use in the completion response
+      builder.
+
+      Items of other types are ignored.
+    </output-item-done>
+
+    <error-event order="7">
+      The `error` event contains a type and message. The error type string
+      is mapped to an error category:
+      - "authentication_error" → AUTH
+      - "rate_limit_error" → RATE_LIMIT
+      - "invalid_request_error" → INVALID_ARG
+      - "server_error" → SERVER
+      - All other values → UNKNOWN
+
+      An ERROR stream event is emitted with the category and message.
+    </error-event>
+
+    <notable reason="arguments-accumulation">
+      Tool call arguments arrive in deltas and are accumulated by
+      concatenation. The TOOL_CALL_DELTA event carries each individual delta
+      for the REPL layer to use, while the internal accumulator builds the
+      complete arguments string for the completion record.
+    </notable>
+
+  </behavior>
+
+</specification>

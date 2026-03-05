@@ -1,0 +1,153 @@
+<specification topic="Input Action Dispatcher">
+
+  <topic-statement>
+    The input action dispatcher routes user input events to specialized
+    handlers and manages scroll detection, completion state, and interrupt
+    requests within the REPL.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Dispatching all 29 input action types to their respective handlers,
+      scroll detection interception and buffered arrow flush, escape-key
+      interrupt handling, and tool process interrupt with SIGTERM/SIGKILL
+      escalation.
+    </in-scope>
+
+    <boundary name="Specialized Handlers">
+      Text editing, completion cycling, history browsing, viewport scrolling,
+      agent navigation, and LLM submission are handled by separate modules.
+      This topic dispatches to them and propagates any errors they return.
+    </boundary>
+
+    <boundary name="Input Parser">
+      Raw bytes are parsed into input actions externally. This topic receives
+      fully parsed actions.
+    </boundary>
+  </scope>
+
+  <behavior>
+
+    <scroll-detection-pre-processing order="1">
+      Arrow-up and arrow-down events are intercepted before main dispatch and
+      passed to the scroll detector state machine along with the current
+      CLOCK_MONOTONIC timestamp. The detector may:
+      - Buffer the event (returning a signal that the caller is done — no
+        further processing for this action)
+      - Absorb the event as part of a mouse-scroll burst (same signal)
+      - Classify it as a scroll-up or scroll-down and execute the corresponding
+        viewport scroll action
+      - Pass it through as a plain arrow key (continue to main dispatch)
+
+      If the scroll detector is absent, arrow events fall through to main
+      dispatch immediately.
+    </scroll-detection-pre-processing>
+
+    <pending-arrow-flush order="2">
+      When any event other than arrow-up, arrow-down, or unknown arrives, the
+      scroll detector's pending buffered arrow (if any) is flushed first. A
+      flushed arrow-up triggers the arrow-up viewport action; a flushed
+      arrow-down triggers the arrow-down viewport action. This occurs before
+      the incoming event is processed.
+    </pending-arrow-flush>
+
+    <char-input order="3">
+      If a completion is active and the character is a space, the completion
+      is committed. Otherwise: any active history browsing is stopped, the
+      viewport offset is reset to zero, the codepoint is inserted into the
+      input buffer, and the completion context is updated with the new text.
+    </char-input>
+
+    <newline order="4">
+      Delegated to the LLM action handler, which determines whether the input
+      is a slash command or a regular user message and acts accordingly.
+    </newline>
+
+    <insert-newline order="5">
+      The viewport offset is reset to zero and a literal newline is inserted
+      into the input buffer without submitting.
+    </insert-newline>
+
+    <backspace-and-delete order="6">
+      The viewport offset is reset to zero, the character before or after the
+      cursor is removed, and the completion context is updated.
+    </backspace-and-delete>
+
+    <arrow-left-and-right order="7">
+      Any active completion is dismissed. The viewport offset is reset to zero.
+      The cursor moves one position in the input buffer.
+    </arrow-left-and-right>
+
+    <cursor-control-keys order="8">
+      Ctrl+A, Ctrl+E, Ctrl+K, Ctrl+U, and Ctrl+W all reset the viewport
+      offset to zero and then perform their respective input buffer operations:
+      move to line start, move to line end, kill to line end, kill entire
+      line, and delete word backward.
+    </cursor-control-keys>
+
+    <history-navigation order="9">
+      Ctrl+P and Ctrl+N return success immediately with no action. These keys
+      are reserved for future reverse-search functionality.
+    </history-navigation>
+
+    <ctrl-c order="10">
+      An interrupt request is submitted for any in-flight operation, then the
+      REPL quit flag is set to trigger graceful shutdown.
+    </ctrl-c>
+
+    <tab order="11">
+      Delegated to the completion handler, which triggers or cycles completions.
+    </tab>
+
+    <escape order="12">
+      The current agent state is read atomically. If the agent is in
+      WAITING_FOR_LLM or EXECUTING_TOOL state, an interrupt request is
+      submitted. If the agent is idle and a completion is active with an
+      original input saved, the input buffer is restored to that original text
+      before the completion is dismissed.
+    </escape>
+
+    <viewport-scrolling order="13">
+      Arrow-up and arrow-down (after scroll detection pass-through), page-up,
+      page-down, scroll-up, and scroll-down all delegate to the viewport
+      action handlers.
+    </viewport-scrolling>
+
+    <agent-navigation order="14">
+      Navigation-prev-sibling, navigation-next-sibling, navigation-parent,
+      and navigation-child delegate to the agent tree navigation system.
+    </agent-navigation>
+
+    <unknown-input order="15">
+      Returns success immediately with no action.
+    </unknown-input>
+
+    <interrupt-request order="16">
+      Called from Ctrl+C and the escape key handler. The agent state is read
+      atomically. If the agent is idle, nothing happens. Otherwise, the
+      interrupt-requested flag is set on the agent. Then:
+
+      <llm-cancellation order="1">
+        If the agent is in WAITING_FOR_LLM state and the provider has a cancel
+        operation, that operation is invoked to abort the in-flight HTTP stream.
+      </llm-cancellation>
+
+      <tool-process-termination order="2">
+        If the agent is in EXECUTING_TOOL state and a child process PID is
+        recorded, SIGTERM is sent to the entire process group. The system then
+        polls every 100 milliseconds (up to 2000 milliseconds total) using a
+        non-blocking wait. If the process has not exited after 2000
+        milliseconds, SIGKILL is sent.
+      </tool-process-termination>
+    </interrupt-request>
+
+    <multiline-scrollback-append order="17">
+      A helper operation splits a multi-line string by newline characters and
+      appends each resulting segment to the scrollback as a separate line.
+      Empty segments at boundaries are included when they appear before the
+      end of the string.
+    </multiline-scrollback-append>
+
+  </behavior>
+
+</specification>

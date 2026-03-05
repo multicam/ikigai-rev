@@ -1,0 +1,99 @@
+<specification topic="Pretty-Printing Helpers">
+
+  <topic-statement>
+    The pretty-printing helpers append consistently formatted representations
+    of typed values to a format buffer, producing human-readable indented
+    output for debugging and testing.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Six output operations: structure header, pointer, size_t, uint32_t,
+      string (with character escaping), and boolean.
+    </in-scope>
+
+    <boundary name="Format Buffer">
+      Output is appended to a format buffer. Buffer management, allocation,
+      and write failure handling (panic on OOM) are covered by the format
+      buffer specification.
+    </boundary>
+  </scope>
+
+  <behavior>
+
+    <indentation order="1">
+      Every output operation begins by appending a number of space characters
+      equal to the indent level, producing the visual nesting of fields.
+      An indent level of zero produces no leading spaces.
+    </indentation>
+
+    <structure-header order="2">
+      A header line labels the start of a pretty-printed structure. It outputs
+      the type name followed by the memory address of the structure in
+      hexadecimal, on a single line.
+
+      Format: `<type> @ 0x<address>`
+    </structure-header>
+
+    <pointer-field order="3">
+      A pointer field displays a named pointer value. A null pointer is
+      rendered as the literal token "NULL". A non-null pointer is rendered
+      as its hexadecimal memory address.
+
+      Formats:
+      - `<name>: NULL`
+      - `<name>: 0x<address>`
+    </pointer-field>
+
+    <size-t-field order="4">
+      A size_t field displays a named unsigned size value in decimal.
+
+      Format: `<name>: <decimal>`
+    </size-t-field>
+
+    <uint32-field order="5">
+      A uint32_t field displays a named 32-bit unsigned integer in decimal
+      using a portable format specifier.
+
+      Format: `<name>: <decimal>`
+    </uint32-field>
+
+    <string-field order="6">
+      A string field displays a named string value enclosed in double quotes,
+      with non-printable and special characters escaped. A null string pointer
+      is rendered as the literal token "NULL" without quotes.
+
+      The string is iterated byte-by-byte for the specified length. Each byte
+      is rendered as follows:
+
+      - `\n` → the two-character sequence `\n`
+      - `\r` → the two-character sequence `\r`
+      - `\t` → the two-character sequence `\t`
+      - `\` → the two-character sequence `\\`
+      - `"` → the two-character sequence `\"`
+      - Control characters (0x00–0x1F) and DEL (0x7F) → `\x` followed by
+        two hexadecimal digits
+      - All other bytes → the literal byte character
+
+      Formats:
+      - `<name>: NULL`
+      - `<name>: "<escaped content>"`
+
+      <notable reason="byte-oriented-not-utf8-aware">
+        Escaping operates byte-by-byte. Multi-byte UTF-8 sequences are not
+        treated specially; each byte is examined and escaped independently.
+      </notable>
+    </string-field>
+
+    <bool-field order="7">
+      A boolean field displays a named boolean value as either the literal
+      token "true" or "false".
+
+      Formats:
+      - `<name>: true`
+      - `<name>: false`
+    </bool-field>
+
+  </behavior>
+
+</specification>

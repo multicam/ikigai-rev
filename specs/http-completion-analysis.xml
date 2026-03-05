@@ -1,0 +1,78 @@
+<specification topic="HTTP Completion Analysis">
+
+  <topic-statement>
+    The HTTP completion analyser categorises finished curl requests by HTTP
+    status code, constructs completion descriptors from response bodies and
+    curl error states, and dispatches them to caller-supplied callbacks.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      HTTP status code categorisation, completion descriptor construction for
+      successful and failed requests, callback invocation, and bulk
+      cancellation without callback dispatch.
+    </in-scope>
+
+    <boundary name="HTTP Multiplexer">
+      The multiplexer drives curl's multi-handle event loop and detects when
+      individual transfers complete. This topic handles the analysis that
+      follows completion detection.
+    </boundary>
+
+    <boundary name="Provider Callbacks">
+      The completion callback supplied by each provider receives the
+      descriptor and is responsible for parsing the response body, updating
+      provider state, and emitting stream events. Provider response parsing
+      is out of scope here.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Completion Descriptor">
+      <field name="category" type="enumeration"
+             note="SUCCESS (HTTP 200-299), CLIENT_ERROR (400-499), SERVER_ERROR (500-599), or NETWORK_ERROR (all other HTTP codes or curl failures)" />
+      <field name="http_code" type="integer" note="HTTP status code; zero for network-level errors" />
+      <field name="body" type="bytes or null" note="response body for successful transfers; null for network errors" />
+      <field name="body_length" type="non-negative integer" note="byte count of body" />
+      <field name="error_message" type="text or null" note="human-readable description for network errors; null for HTTP responses" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <status-categorisation order="1">
+      Completed HTTP responses are classified by status code:
+      - 200–299 → SUCCESS
+      - 400–499 → CLIENT_ERROR
+      - 500–599 → SERVER_ERROR
+      - All other codes (including 0 for network errors) → NETWORK_ERROR
+    </status-categorisation>
+
+    <successful-completion order="2">
+      When a transfer completes with a non-zero HTTP status code, the
+      completion descriptor is populated with the status code, the
+      categorisation above, and the accumulated response body. The curl easy
+      handle is removed from the multi handle, headers and the easy handle
+      are freed, and the slot in the active request array is cleared. The
+      caller's completion callback is then invoked with the descriptor.
+    </successful-completion>
+
+    <network-error-completion order="3">
+      When curl itself reports an error (the CURLcode is not CURLE_OK), no
+      HTTP status code is available. The completion descriptor is populated
+      with HTTP code zero, category NETWORK_ERROR, no body, and an error
+      message derived from curl's error description for that code. Cleanup
+      and callback invocation proceed identically to successful completion.
+    </network-error-completion>
+
+    <bulk-cancellation order="4">
+      When all active requests must be abandoned (for example, on shutdown),
+      each active slot is cleaned up — the easy handle is removed from the
+      multi handle, headers are freed, and the slot is cleared — without
+      invoking any completion callback. This terminates in-flight transfers
+      silently.
+    </bulk-cancellation>
+
+  </behavior>
+
+</specification>

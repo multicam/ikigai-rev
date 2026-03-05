@@ -1,0 +1,129 @@
+<specification topic="External Tool Execution">
+
+  <topic-statement>
+    The external tool executor spawns a child process, passes JSON arguments
+    via stdin, collects stdout as the result, and enforces a 30-second
+    execution timeout.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Pipe creation, fork, child process setup (process group isolation,
+      file descriptor redirection, environment variable injection, exec),
+      stdin writing with SIGPIPE protection, stdout and stderr collection
+      into fixed-size buffers, timeout enforcement via alarm(), process wait
+      and exit-code validation, and result allocation.
+    </in-scope>
+
+    <boundary name="Tool Registry">
+      The executable path is provided by the caller. This topic does not
+      look up tools by name.
+    </boundary>
+
+    <boundary name="Result Wrapping">
+      Raw stdout text is returned as-is. JSON success/failure envelope
+      wrapping is applied by the calling layer.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Input">
+      <field name="tool_path" type="text" note="absolute path to executable" />
+      <field name="agent_id" type="text" nullable="true"
+             note="set as IKIGAI_AGENT_ID environment variable if non-null" />
+      <field name="arguments_json" type="text"
+             note="JSON string written to child's stdin" />
+    </contract>
+
+    <contract name="Output">
+      <field name="child_pid_out" type="pid_t" required="false"
+             note="child PID written here if pointer is non-null" />
+      <field name="out_result" type="text"
+             note="null-terminated stdout content; talloc-owned by caller" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <pipe-creation order="1">
+      Three pairs of pipes are created: one for stdin, one for stdout, and
+      one for stderr. If any pipe creation fails, all previously opened file
+      descriptors are closed and an IO error is returned.
+    </pipe-creation>
+
+    <process-fork order="2">
+      The process is forked. If fork fails, all six file descriptors are
+      closed and an IO error is returned.
+    </process-fork>
+
+    <child-process-setup order="3">
+      In the child process:
+      - A new process group is created with the child as leader. This
+        isolates the child from the parent's process group for interrupt
+        handling.
+      - The parent sides of all three pipes are closed.
+      - The child sides are redirected: stdin pipe to fd 0, stdout pipe to
+        fd 1, stderr pipe to fd 2.
+      - If agent_id is non-null, the environment variable IKIGAI_AGENT_ID
+        is set to that value, overwriting any existing value.
+      - The executable at tool_path is executed with no additional arguments
+        (only argv[0] which equals tool_path).
+      - If execution fails, the child exits with status 1 immediately.
+
+      All child-process code is excluded from coverage measurement (it runs
+      in a forked copy of the address space, not the test process).
+    </child-process-setup>
+
+    <parent-process order="4">
+      The child's PID is stored in child_pid_out if that pointer is non-null.
+      The child sides of all three pipes are closed. The parent retains the
+      write end of the stdin pipe and the read ends of the stdout and stderr
+      pipes.
+    </parent-process>
+
+    <stdin-write order="5">
+      SIGPIPE is temporarily suppressed to prevent a crash if the child exits
+      before reading all input. The arguments JSON string is written to the
+      child's stdin pipe. The write end is closed to signal EOF to the child.
+      The original SIGPIPE disposition is restored.
+    </stdin-write>
+
+    <output-collection order="6">
+      A 30-second alarm is set. Stdout is read into a 65,536-byte buffer in
+      a loop until the read returns zero or negative, or the buffer fills to
+      65,535 bytes. Stderr is read into a separate 65,536-byte buffer in the
+      same manner. The alarm is cancelled after both streams are collected.
+
+      <notable reason="silent-truncation">
+        If either stdout or stderr exceeds 65,535 bytes, the remainder is
+        silently discarded. No error is reported for truncation.
+      </notable>
+
+      <notable reason="timeout-behavior">
+        If the child has not produced output within 30 seconds, the alarm
+        signal interrupts the blocking read call. The read returns -1 and
+        the loop exits. Subsequent processing continues with whatever was
+        collected.
+      </notable>
+    </output-collection>
+
+    <wait-and-validate order="7">
+      The child process is waited for. If the child did not exit normally or
+      exited with a non-zero status, an IO error is returned. If stderr
+      content was collected, it is included in the error message; otherwise
+      a generic non-zero-exit message is used.
+
+      If the child exited successfully but produced no stdout output, an IO
+      error is returned ("Tool produced no output").
+    </wait-and-validate>
+
+    <result-allocation order="8">
+      The stdout buffer is null-terminated. Its contents are copied into a
+      talloc allocation owned by the caller's context. If allocation fails,
+      the process aborts. The pointer is written to out_result and success
+      is returned.
+    </result-allocation>
+
+  </behavior>
+
+</specification>

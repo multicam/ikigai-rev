@@ -1,0 +1,130 @@
+<specification topic="Google Streaming Event Processing">
+
+  <topic-statement>
+    The Google streaming event processor translates Gemini SSE response parts
+    into normalized stream events, handling text, thinking, function calls,
+    tool ID generation, thought signature extraction, and finish reason mapping.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Part-type dispatch (text, thinking, function call), random tool call ID
+      generation, finish reason string mapping, thought signature extraction,
+      usage metadata extraction, and error status mapping.
+    </in-scope>
+
+    <boundary name="Provider Serialization">
+      How messages are serialized into the Google request format is covered
+      by the provider serialization specification.
+    </boundary>
+
+    <boundary name="SSE Parser">
+      Raw SSE byte splitting and event framing are covered by the SSE parser
+      specification. This topic processes already-parsed JSON event objects.
+    </boundary>
+  </scope>
+
+  <behavior>
+
+    <tool-id-generation order="1">
+      Google's API does not provide unique identifiers for tool calls. A
+      22-character random identifier is generated for each tool call using
+      the alphabet:
+      ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_
+
+      The random number generator is seeded with the current time once per
+      process (on the first tool call). Subsequent IDs are generated without
+      re-seeding.
+
+      <notable reason="weak-randomness">
+        IDs are generated with rand() seeded once at process startup. They
+        are not cryptographically random and are not guaranteed to be unique
+        across processes or across a large number of calls.
+      </notable>
+    </tool-id-generation>
+
+    <finish-reason-mapping order="2">
+      Google finishReason strings are mapped to internal finish reasons:
+      - "STOP" → STOP
+      - "MAX_TOKENS" → LENGTH
+      - "SAFETY", "BLOCKLIST", "PROHIBITED_CONTENT", "SPII" → CONTENT_FILTER
+      - "MALFORMED_FUNCTION_CALL", "UNEXPECTED_TOOL_CALL" → ERROR
+      - All other values (including absent) → UNKNOWN
+    </finish-reason-mapping>
+
+    <thought-signature-extraction order="3">
+      The thought signature is a provider-opaque value that accompanies
+      Gemini 3 function call results. It is searched for in two locations
+      in the response JSON:
+      1. Directly on the response root object.
+      2. Within candidates[0].
+
+      If found in either location, the signature is serialized as a JSON
+      object with key "thought_signature" and returned as a null-terminated
+      string. If not found or the value is an empty string, null is returned.
+
+      For performance, the signature search is only performed when the model
+      uses the Gemini 3 series.
+    </thought-signature-extraction>
+
+    <parts-iteration order="4">
+      Each streaming chunk contains a parts array within the response content.
+      Parts are processed in order:
+
+      <thinking-part order="1">
+        A part with a "thought" field set to true is a thinking part. Any
+        open tool call is ended before processing. The thinking flag is set.
+        The part's text content is emitted as a THINKING_DELTA event.
+      </thinking-part>
+
+      <text-part order="2">
+        A part with a text field and no "thought" flag is a text part. Any
+        open tool call is ended before processing. If the previous part was
+        a thinking part, the part index is incremented before emission. The
+        text is emitted as a TEXT_DELTA event.
+      </text-part>
+
+      <function-call-part order="3">
+        A part with a functionCall field is a tool invocation. If no tool
+        call is currently open, a new tool call ID is generated, the function
+        name is extracted, and a TOOL_CALL_START event is emitted. The
+        function arguments are serialized from the parsed JSON object back to
+        a string and emitted as a TOOL_CALL_DELTA event. The accumulated
+        arguments string is updated by concatenation.
+
+        On Gemini 3 models, a thoughtSignature field adjacent to the
+        functionCall in the part is also extracted and stored alongside the
+        tool call state.
+      </function-call-part>
+    </parts-iteration>
+
+    <usage-metadata order="5">
+      The final streaming chunk includes a usageMetadata object. The following
+      fields are extracted:
+      - promptTokenCount → input tokens
+      - candidatesTokenCount → raw output tokens
+      - thoughtsTokenCount → thinking tokens
+
+      Output tokens are calculated as candidatesTokenCount minus
+      thoughtsTokenCount (because thinking tokens are counted separately).
+      The cachedContentTokenCount field is not used; cached token count is
+      always reported as zero.
+
+      After extracting usage, any open tool call is ended, and a DONE event
+      is emitted with the finish reason and usage counts.
+    </usage-metadata>
+
+    <error-status-mapping order="6">
+      In-stream error events contain a status string. These are mapped to
+      error categories:
+      - "UNAUTHENTICATED" → AUTH
+      - "RESOURCE_EXHAUSTED" → RATE_LIMIT
+      - "INVALID_ARGUMENT" → INVALID_ARG
+      - All other values → UNKNOWN
+
+      The error message and category are emitted as an ERROR stream event.
+    </error-status-mapping>
+
+  </behavior>
+
+</specification>

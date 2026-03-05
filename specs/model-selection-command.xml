@@ -1,0 +1,174 @@
+<specification topic="Model Selection Command">
+
+  <topic-statement>
+    The model selection command updates the active agent's LLM model,
+    inferred provider, and thinking level with validation and database
+    persistence.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Parsing the model/thinking-level syntax, inferring the provider from
+      the model name, validating thinking level compatibility for Google
+      models, updating in-memory agent state, invalidating the provider
+      instance and token cache, persisting changes to the database, and
+      displaying a confirmation with provider-specific thinking details.
+      Also includes the /system command for setting the global system message.
+    </in-scope>
+
+    <boundary name="Provider Inference">
+      The mapping from model name to provider name is performed by an external
+      function. This topic receives either the provider name or an error.
+    </boundary>
+
+    <boundary name="Google Thinking Validation">
+      Thinking level compatibility checks and budget/level lookups for Google
+      models are performed by external functions. This topic invokes them and
+      handles their results.
+    </boundary>
+
+    <boundary name="Token Cache">
+      Cache invalidation and re-pruning with the new provider's token counters
+      are performed by external operations. This topic calls them in sequence.
+    </boundary>
+
+    <boundary name="Database">
+      The agents table is updated via an external helper. Errors are logged
+      and do not block the command from completing.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Input Syntax">
+      <field name="model_name" type="text" required="true" />
+      <field name="thinking_level" type="text" required="false"
+             note="appended after '/' separator; one of: min, low, med, high" />
+    </contract>
+
+    <contract name="Database Update (agents table)">
+      <field name="provider" type="text" note="inferred from model name" />
+      <field name="model" type="text" />
+      <field name="thinking_level" type="text"
+             note="stored as string: min, low, med, or high" />
+    </contract>
+
+    <contract name="Thinking Level Strings">
+      <field name="min" type="text" note="minimum thinking" />
+      <field name="low" type="text" note="low thinking" />
+      <field name="med" type="text" note="medium thinking (also accepted as input)" />
+      <field name="high" type="text" note="high thinking" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <model-command order="1">
+
+      <argument-validation order="1">
+        If no argument is provided, an error is returned. If the agent is
+        currently in WAITING_FOR_LLM state, an error is returned (model cannot
+        be switched mid-request).
+      </argument-validation>
+
+      <syntax-parsing order="2">
+        The argument is parsed for an optional '/' separator:
+        - If no '/' is present: the entire argument is the model name;
+          thinking level is absent (will use current).
+        - If '/' is present with nothing after it: an error is returned
+          ("trailing '/' with no thinking level").
+        - If '/' is present with an empty model name (slash at position 0):
+          an error is returned ("empty model name").
+        - Otherwise: the portion before '/' is the model name and the
+          portion after is the thinking level string.
+      </syntax-parsing>
+
+      <provider-inference order="3">
+        The model name is mapped to a provider name. Models beginning with
+        "gpt-", "o1", "o3", or "o4" map to "openai"; models beginning with
+        "claude-" map to "anthropic"; models beginning with "gemini-" map to
+        "google". Unrecognized models cause an error.
+      </provider-inference>
+
+      <thinking-level-resolution order="4">
+        If a thinking level string was provided in the argument, it is
+        converted to the internal enum value ("min" → MIN, "low" → LOW,
+        "med" → MED, "high" → HIGH). An unrecognized string causes an error.
+        If no thinking level was provided, the agent's current thinking level
+        is used unchanged.
+      </thinking-level-resolution>
+
+      <google-model-validation order="5">
+        For Google models only: the thinking level is validated against the
+        model's capabilities. If the level is unsupported, an error is
+        returned. For Gemini 2.5 models specifically, the model must also
+        appear in the thinking budget lookup table; if it does not, an error
+        is returned.
+      </google-model-validation>
+
+      <in-memory-state-update order="6">
+        The agent's previous provider string and model string are freed and
+        replaced with newly allocated copies of the inferred provider and
+        parsed model name. The agent's thinking level field is updated to the
+        resolved enum value.
+      </in-memory-state-update>
+
+      <cache-invalidation order="7">
+        The agent's provider instance is invalidated so the next request
+        creates a fresh instance with the new model. The token cache is fully
+        invalidated and immediately re-pruned using the new provider's token
+        counters.
+      </cache-invalidation>
+
+      <database-persistence order="8">
+        If a database context is present, the agents table is updated with
+        the new provider, model, and thinking level (stored as a string).
+        If the update fails, the error is logged via JSONL and freed; the
+        in-memory state remains authoritative.
+      </database-persistence>
+
+      <user-feedback order="9">
+        A confirmation message is appended to the scrollback. The message
+        includes the provider name, model name, and thinking level details:
+
+        - Anthropic models with adaptive thinking: shows the effort string
+          ("low", "medium", or "high").
+        - Anthropic models with budget thinking: shows the token budget with
+          a "K" suffix for values over 1024.
+        - Google Gemini 2.5 models: shows the token budget.
+        - Google Gemini 3 models: shows the level string ("minimal", "low",
+          "medium", or "high").
+        - OpenAI models: shows the effort string ("low", "medium", or "high").
+      </user-feedback>
+
+    </model-command>
+
+    <system-command order="2">
+      The /system command sets or clears the global system message.
+
+      <clearing order="1">
+        If no argument is provided, the current system message is freed and
+        the field is set to null. A "System message cleared" confirmation is
+        appended to the scrollback.
+      </clearing>
+
+      <setting order="2">
+        If an argument is provided, the current system message is freed and
+        replaced with a copy of the argument string. A "System message set
+        to: …" confirmation is appended to the scrollback.
+
+        <notable reason="global config, not per-agent">
+          The system message is stored in the global configuration object,
+          not on the agent. It affects all future requests regardless of
+          which agent submits them.
+        </notable>
+
+        <notable reason="no database persistence">
+          The system message is not persisted to the database and is lost
+          when the process restarts.
+        </notable>
+      </setting>
+    </system-command>
+
+  </behavior>
+
+</specification>

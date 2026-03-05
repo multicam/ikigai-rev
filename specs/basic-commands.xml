@@ -1,0 +1,103 @@
+<specification topic="Basic REPL Commands">
+
+  <topic-statement>
+    The basic REPL commands provide conversation reset, command listing, and
+    application exit as core built-in operations available in every agent session.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      The /clear, /help, and /exit commands: their argument handling, the sequence
+      of side effects each produces, and their error conditions.
+    </in-scope>
+
+    <boundary name="Event Rendering">
+      How system prompt events are formatted and appended to the scrollback is
+      covered by the event rendering specification.
+    </boundary>
+
+    <boundary name="Logger">
+      Log file rotation mechanics are covered by the debug log file specification.
+    </boundary>
+
+    <boundary name="Command Dispatch">
+      How slash commands are parsed, matched by name, and routed to handlers is
+      covered by the command dispatch specification.
+    </boundary>
+  </scope>
+
+  <behavior>
+
+    <clear-command order="1">
+      The `/clear` command resets the active agent's conversation state to the
+      same condition it would be in at the start of a fresh session.
+
+      <log-rotation order="1">
+        The debug log file is rotated: the current log is closed and a new log
+        file is opened in the current working directory. If the current working
+        directory cannot be determined, the command returns an IO error without
+        performing any further steps.
+      </log-rotation>
+
+      <memory-erasure order="2">
+        The following in-memory state is discarded in order:
+        - The scrollback display buffer is cleared of all visible lines.
+        - All messages in the agent's conversation array are freed and the
+          count is reset to zero.
+        - The token cache, if present, is reset (all turn counts cleared).
+        - All conversation marks are freed and the mark count is reset to zero.
+        - Any active autocomplete state is cleared.
+      </memory-erasure>
+
+      <database-boundary order="3">
+        If a database connection and session identifier are present:
+        - A boundary record of kind "clear" with no content is inserted into
+          the messages table.
+        - The agent's effective system prompt is resolved and, if obtained, a
+          record of kind "system" containing that prompt is inserted.
+        Database failures at either step are logged as warnings and do not
+        prevent the command from succeeding; in-memory state is authoritative.
+      </database-boundary>
+
+      <scrollback-rebuild order="4">
+        The agent's effective system prompt is resolved again. If obtained, it
+        is rendered as a system event into the now-empty scrollback. A failure
+        to render to the scrollback is the only error condition that causes the
+        clear command to return an error.
+      </scrollback-rebuild>
+
+      <notable reason="system-prompt-resolved-independently-for-db-and-display">
+        The effective system prompt is resolved once for database persistence
+        and a second time for scrollback rendering. The two calls are
+        independent; each reads from the pinned document list, filesystem, and
+        configuration in turn.
+      </notable>
+    </clear-command>
+
+    <help-command order="2">
+      The `/help` command lists all registered slash commands in alphabetical
+      order. Any arguments provided are ignored.
+
+      A header line "Available commands:" is appended to the scrollback. The
+      command registry is then retrieved and the entries are sorted alphabetically
+      by name using a stable index-based sort. For each entry in sorted order,
+      a line formatted as "  /<name> - <description>" is appended to the
+      scrollback. Errors from any scrollback append operation are returned
+      immediately.
+    </help-command>
+
+    <exit-command order="3">
+      The `/exit` command signals the event loop to terminate and cancels all
+      active LLM requests. Any arguments provided are ignored.
+
+      All agents in the REPL's agent array have their provider instances
+      invalidated, aborting any in-flight HTTP connections. A quit flag on the
+      REPL context is then set. The event loop checks this flag at the top of
+      each iteration and exits when it is set. The exit command always returns
+      success immediately; the process does not terminate until the event loop
+      exits naturally.
+    </exit-command>
+
+  </behavior>
+
+</specification>

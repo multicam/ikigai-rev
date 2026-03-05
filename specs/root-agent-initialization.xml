@@ -1,0 +1,83 @@
+<specification topic="Root Agent Initialization">
+
+  <topic-statement>
+    The root agent initialization ensures that exactly one root agent record
+    exists in the database, creating it on first run and adopting any orphaned
+    messages from pre-agent-table schema versions.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Root agent existence check, new agent record creation, orphan message
+      adoption, and initial fork event insertion for pinned document replay.
+    </in-scope>
+
+    <boundary name="Session Startup">
+      This initialization is called once during application startup as part of
+      the database setup sequence. Startup ordering is covered by the session
+      startup specification.
+    </boundary>
+
+    <boundary name="Database Migration">
+      Schema version detection (checking for the agent_uuid column) relies on
+      the migration system. Schema management is covered by the database
+      migration specification.
+    </boundary>
+  </scope>
+
+  <behavior>
+
+    <existence-check order="1">
+      Queries for any agent record where parent_uuid is null (root agents).
+      If at least one row is returned, the first result's UUID is returned as
+      the existing root agent UUID and no further steps are performed. The
+      operation is idempotent.
+    </existence-check>
+
+    <new-agent-creation order="2">
+      If no root agent exists, a new UUID is generated and a new agent record
+      is inserted with:
+      - parent_uuid: null (marks it as a root agent)
+      - status: 'running'
+      - name: null
+      - created_at: current time
+      - fork_message_id: 0
+      - session_id: the current session identifier
+
+      The new UUID is returned to the caller.
+    </new-agent-creation>
+
+    <orphan-adoption order="3">
+      Before inserting the fork event, the database schema is inspected to
+      determine whether the messages table has an agent_uuid column. This
+      column was added by a later migration; older databases lack it.
+
+      If the column exists, a query counts messages where agent_uuid is null.
+      If any such orphan messages exist, they are updated to reference the
+      new root agent's UUID. This step preserves message history created
+      before the agents table existed.
+
+      If the agent_uuid column does not exist, the adoption step is skipped.
+    </orphan-adoption>
+
+    <fork-event-insertion order="4">
+      A synthetic fork event message is inserted for the root agent with a
+      role of "child". The event's data payload contains a JSON array of
+      pinned paths pre-populated with the path to the system prompt file
+      (system/prompt.md within the application data directory).
+
+      This event is not the result of an actual fork operation. It exists
+      solely to allow the session replay mechanism to reconstruct the root
+      agent's initial pinned document list during restoration, using the same
+      replay path as forked agents.
+
+      <notable reason="synthetic-fork-event">
+        The root agent has no parent and was never forked, but a fork event
+        with role "child" is inserted to bootstrap its pinned document state
+        into the replay system. The fork_message_id in this event is zero.
+      </notable>
+    </fork-event-insertion>
+
+  </behavior>
+
+</specification>

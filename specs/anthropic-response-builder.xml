@@ -1,0 +1,109 @@
+<specification topic="Anthropic Response Builder">
+
+  <topic-statement>
+    The Anthropic response builder assembles the final in-memory response
+    structure from streaming state accumulated during a completed Anthropic
+    streaming response, applying strict content block ordering and defaulting
+    rules.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Content block ordering rules, tool call creation requirements, empty
+      argument defaulting, optional thinking signature handling, text block
+      exclusion from final response, and streaming accumulation patterns for
+      thinking text, thinking signature, and tool arguments.
+    </in-scope>
+
+    <boundary name="Provider Serialization">
+      How streaming events are parsed from the Anthropic SSE stream and
+      dispatched as normalized internal events is covered by the provider
+      serialization specification.
+    </boundary>
+
+    <boundary name="Finish Reason Mapping">
+      Translation of Anthropic stop_reason strings to the internal finish
+      reason enumeration is covered by the finish reason mapping specification.
+    </boundary>
+
+    <boundary name="Anthropic Thinking">
+      Budget and mode selection for extended thinking requests is covered by
+      the Anthropic thinking specification.
+    </boundary>
+  </scope>
+
+  <behavior>
+
+    <streaming-accumulation order="1">
+      During streaming, three pieces of state are accumulated for later
+      assembly into the final response:
+
+      <thinking-accumulation order="1">
+        Thinking text is accumulated by appending each thinking delta to
+        the current thinking text buffer. Multiple deltas across the stream
+        are concatenated in order.
+      </thinking-accumulation>
+
+      <signature-accumulation order="2">
+        When a thinking signature delta arrives, it replaces the current
+        signature value rather than appending to it. Only the most recent
+        signature delta is retained. If no signature delta is ever received,
+        the signature field remains null.
+      </signature-accumulation>
+
+      <tool-argument-accumulation order="3">
+        Tool argument JSON fragments are accumulated by appending each
+        input_json_delta to the current tool arguments buffer. Multiple
+        deltas across the stream are concatenated in order.
+      </tool-argument-accumulation>
+    </streaming-accumulation>
+
+    <tool-state-preservation order="2">
+      When a content_block_stop event is received during streaming, the
+      accumulated tool state (tool ID, tool name, tool arguments) is preserved
+      for use by the response builder. This state remains accessible after
+      the stop event and is consumed when the final response is assembled.
+    </tool-state-preservation>
+
+    <content-block-ordering order="3">
+      The final response content block array is constructed in strict fixed
+      order. Blocks are appended to the array in the following sequence,
+      skipping any block type that has no accumulated state:
+
+      1. Thinking block (if thinking text was accumulated)
+      2. Redacted thinking block (if redacted thinking data was accumulated)
+      3. Tool call block (if both a tool ID and tool name are present)
+
+      <notable reason="text-blocks-excluded">
+        Text content blocks are not materialized in the final response
+        structure. Text deltas are emitted as streaming events for display
+        purposes but are not collected into the response content block array.
+        The final response contains only thinking, redacted thinking, and
+        tool call blocks.
+      </notable>
+    </content-block-ordering>
+
+    <thinking-block-construction order="4">
+      A thinking block is added to the response when thinking text was
+      accumulated during streaming. The block contains the accumulated
+      thinking text and the signature value. If no signature delta was
+      received during the stream, the signature field is null.
+    </thinking-block-construction>
+
+    <tool-call-block-construction order="5">
+      A tool call block is added to the response only when both a tool ID
+      and a tool name are present in the accumulated state. If either the
+      tool ID or the tool name is absent, no tool call block is created and
+      the accumulated tool state is silently discarded.
+
+      <empty-arguments-default order="1">
+        When a tool call block is created and the accumulated tool arguments
+        buffer is null or empty, the arguments field is set to the string
+        "{}" rather than null or an empty string. This ensures a valid JSON
+        object is always present in the tool call arguments field.
+      </empty-arguments-default>
+    </tool-call-block-construction>
+
+  </behavior>
+
+</specification>

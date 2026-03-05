@@ -1,0 +1,134 @@
+<specification topic="Viewport Scroll Actions">
+
+  <topic-statement>
+    The viewport scroll action system adjusts the scrollback viewport offset
+    in response to page, mouse scroll, and arrow input events, and drives
+    completion and cursor navigation when the viewport is at the bottom.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Page-up and page-down actions, scroll-up and scroll-down actions
+      (mouse wheel at 3 lines per event), arrow-up and arrow-down contextual
+      routing, maximum offset calculation, and the scroll detector state
+      machine that distinguishes mouse-wheel bursts from keyboard arrow
+      presses.
+    </in-scope>
+
+    <boundary name="Completion System">
+      When the viewport is at the bottom and a completion is active, arrow
+      keys delegate to the completion navigation system. Completion state
+      management is handled externally.
+    </boundary>
+
+    <boundary name="Input Buffer">
+      When the viewport is at the bottom and no completion is active, arrow
+      keys delegate to input buffer cursor movement. Cursor tracking is
+      handled externally.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Viewport Offset Semantics">
+      <field name="offset = 0" type="numeric"
+             note="bottom of document visible (most recent content)" />
+      <field name="offset = N" type="numeric"
+             note="scrolled N rows upward from the bottom" />
+      <field name="offset = max" type="numeric"
+             note="top of document visible; max = document_height - terminal_height (or 0 if fits)" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <maximum-offset-calculation order="1">
+      Before any scroll action that increases the offset, the maximum
+      allowable offset is calculated. Input buffer and scrollback layouts
+      are synchronized to the current terminal width. The document height
+      is computed as the sum of all layer heights. If the document fits
+      within the terminal, the maximum offset is zero. Otherwise it is
+      document_height minus terminal_height.
+    </maximum-offset-calculation>
+
+    <page-up order="2">
+      One full terminal height (in rows) is added to the current viewport
+      offset. If the result exceeds the maximum offset, it is clamped to
+      the maximum. The viewport now shows content one full screen height
+      higher.
+    </page-up>
+
+    <page-down order="3">
+      One full terminal height is subtracted from the current viewport
+      offset. If the offset is already less than one terminal height, the
+      offset is set to zero. The viewport moves one full screen height
+      toward the bottom.
+    </page-down>
+
+    <scroll-up order="4">
+      Three rows are added to the current viewport offset. If the result
+      exceeds the maximum offset, it is clamped to the maximum. This
+      corresponds to one mouse wheel scroll event upward.
+    </scroll-up>
+
+    <scroll-down order="5">
+      Three rows are subtracted from the current viewport offset. If the
+      offset is less than three, it is set to zero. This corresponds to
+      one mouse wheel scroll event downward.
+    </scroll-down>
+
+    <arrow-up order="6">
+      The action is routed based on the current viewport state:
+
+      - If the viewport offset is greater than zero (the user has scrolled
+        up from the bottom): scroll-up is performed (adds 3 rows to offset).
+      - If the viewport is at the bottom and a completion is active:
+        the completion moves to the previous candidate.
+      - Otherwise: the input buffer cursor moves up one row.
+    </arrow-up>
+
+    <arrow-down order="7">
+      The action is routed based on the current viewport state:
+
+      - If the viewport offset is greater than zero: scroll-down is performed
+        (subtracts 3 rows from offset, clamping to zero).
+      - If the viewport is at the bottom and a completion is active:
+        the completion moves to the next candidate.
+      - Otherwise: the input buffer cursor moves down one row.
+    </arrow-down>
+
+    <scroll-detection order="8">
+      Arrow-up and arrow-down events are intercepted before dispatch and
+      passed through a state machine that detects mouse-wheel scroll bursts.
+      The state machine uses a 5-millisecond threshold between consecutive
+      arrow events:
+
+      <waiting-state order="1">
+        The first arrow event starts a timer. If a second arrow event in
+        the same direction arrives within 5 milliseconds, the state machine
+        enters the absorbing state and emits a scroll event. If 5 milliseconds
+        elapse without a second event, the buffered arrow is released as a
+        keyboard arrow action.
+      </waiting-state>
+
+      <absorbing-state order="2">
+        Additional arrow events within 5 milliseconds of the last absorbed
+        event are silently consumed (the scroll was already emitted). The
+        state machine returns to idle after 5 milliseconds without an event.
+      </absorbing-state>
+
+      <non-arrow-flush order="3">
+        When any non-arrow, non-unknown event arrives, any buffered pending
+        arrow from the waiting state is flushed and processed as a keyboard
+        arrow action before the new event is handled.
+      </non-arrow-flush>
+
+      <select-timeout-flush order="4">
+        When the select() call times out, the scroll detector's timeout check
+        may release a buffered pending arrow and trigger the corresponding
+        viewport action.
+      </select-timeout-flush>
+    </scroll-detection>
+
+  </behavior>
+
+</specification>

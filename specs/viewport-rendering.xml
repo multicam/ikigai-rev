@@ -1,0 +1,221 @@
+<specification topic="Viewport Rendering">
+
+  <topic-statement>
+    The viewport rendering system calculates which portion of the document
+    is visible given the current scroll offset and renders a complete terminal
+    frame using the layer cake.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Document height calculation, viewport window computation, scrollback
+      logical-to-physical row mapping, input buffer screen position
+      calculation, layer cake viewport configuration, framebuffer construction
+      with ANSI cursor control, cursor position calculation, framebuffer
+      storage, and render timing.
+    </in-scope>
+
+    <boundary name="Layer Cake">
+      Individual layer visibility checks, height queries, and render calls
+      are performed by the layer cake. The viewport system sets the viewport
+      row and height on the layer cake and delegates rendering to it.
+    </boundary>
+
+    <boundary name="Scrollback">
+      Physical-to-logical row mapping is computed by the scrollback system.
+      Layout synchronization is requested before any calculations.
+    </boundary>
+
+    <boundary name="Terminal">
+      The framebuffer is written atomically to the terminal file descriptor.
+      In headless mode (file descriptor is -1), write errors are suppressed.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Viewport State">
+      <field name="scrollback_start_line" type="numeric"
+             note="first logical scrollback line visible" />
+      <field name="scrollback_lines_count" type="numeric"
+             note="number of logical scrollback lines to render" />
+      <field name="input_buffer_start_row" type="numeric"
+             note="terminal row where input buffer begins; equals terminal_rows if off-screen" />
+      <field name="separator_visible" type="boolean" />
+    </contract>
+
+    <contract name="Document Layer Order (top to bottom)">
+      <field name="1. Banner" type="0 or 6 rows"
+             note="6 rows when banner_visible is true" />
+      <field name="2. Scrollback" type="sum of physical lines" />
+      <field name="3. Spinner" type="0 or 1 row"
+             note="1 row when spinner_state.visible is true" />
+      <field name="4. Separator" type="1 row (always)" />
+      <field name="5. Input buffer" type="0, 1, or more rows"
+             note="0 when hidden; 1 minimum when visible and empty" />
+      <field name="6. Completion list" type="0 or N rows"
+             note="present only when completion is active" />
+      <field name="7. Status" type="0 or 2 rows"
+             note="2 rows when status_visible is true" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <document-height-calculation order="1">
+      The total document height in rows is the sum of each layer's row count
+      according to the ordering in the data contract above. The input buffer
+      contributes either zero rows (when hidden), one row (when visible and
+      empty), or the actual physical line count of its text. Scrollback
+      contributes its total physical lines (accounting for line wrapping at
+      the current terminal width).
+    </document-height-calculation>
+
+    <viewport-window-computation order="2">
+      Input buffer and scrollback layouts are synchronized to the current
+      terminal width before any computation.
+
+      <entire-document-fits order="1">
+        If the document height is less than or equal to the terminal height,
+        the entire document is visible: the first visible row is 0 and the
+        last visible row is document_height minus 1.
+      </entire-document-fits>
+
+      <document-overflows order="2">
+        If the document height exceeds the terminal height:
+        - The maximum scroll offset is document_height minus terminal_height.
+        - The viewport offset is clamped to the maximum if it exceeds it.
+        - The last visible row is document_height minus 1 minus the (clamped)
+          offset.
+        - The first visible row is last_visible_row plus 1 minus
+          terminal_height.
+
+        A viewport offset of zero shows the bottom of the document (most
+        recent content). Increasing the offset scrolls toward the top.
+      </document-overflows>
+    </viewport-window-computation>
+
+    <scrollback-visibility-mapping order="3">
+      The document row where the scrollback region begins is determined from
+      the banner height. The separator is at banner_rows plus total scrollback
+      physical rows plus spinner rows.
+
+      If the first visible row is at or after the separator row, no scrollback
+      is visible: scrollback_start_line and scrollback_lines_count are both
+      zero.
+
+      Otherwise, the physical row offset within the scrollback region at the
+      first visible document row is computed and converted to a logical line
+      index by the scrollback system. The number of logical lines that fit in
+      the visible range is counted from that starting index.
+    </scrollback-visibility-mapping>
+
+    <input-buffer-screen-position order="4">
+      The input buffer begins one row after the separator in the document.
+
+      - If the input buffer start is within the visible range, its screen row
+        is its document row minus the first visible document row.
+      - If the input buffer start is before the first visible row (scrolled
+        partially out of view), its screen row is zero.
+      - If the input buffer start is after the last visible row (scrolled
+        completely out of view), its screen row is set to terminal_height
+        (a sentinel value indicating off-screen).
+    </input-buffer-screen-position>
+
+    <separator-visibility order="5">
+      The separator is visible if its document row falls within the range
+      [first_visible_row, last_visible_row] inclusive.
+    </separator-visibility>
+
+    <state-based-visibility-overrides order="6">
+      Before rendering, the current agent's state is read atomically and
+      layer visibility flags are set:
+
+      - If the agent is dead: both the spinner and input buffer are hidden.
+      - If the agent is in WAITING_FOR_LLM or EXECUTING_TOOL state: the
+        spinner is shown and the input buffer is hidden.
+      - If the agent is idle: the spinner is hidden and the input buffer
+        visibility follows whether its screen position is on-screen.
+
+      These visibility values are written back to the agent's state fields,
+      causing them to take effect immediately in the layer cake render.
+    </state-based-visibility-overrides>
+
+    <layer-cake-rendering order="7">
+      The layer cake's viewport row is set to the first visible document row
+      and viewport height is set to the terminal height. The layer cake then
+      renders by iterating through all layers in order:
+      - Invisible layers are skipped.
+      - Each visible layer's height is computed.
+      - Only the portion of the layer overlapping the viewport window is
+        rendered; start_row and row_count clip the layer to the visible range.
+      - Rendering stops once past the viewport.
+
+      All rendered output is accumulated in an output buffer initialized to
+      4 KB.
+    </layer-cake-rendering>
+
+    <trailing-crlf-removal order="8">
+      If the document fills or overflows the terminal height, and the output
+      buffer ends with a carriage-return followed by a newline, those two
+      bytes are removed. This prevents the terminal from auto-scrolling when
+      the last rendered row is at the bottom of the screen.
+    </trailing-crlf-removal>
+
+    <cursor-position-calculation order="9">
+      If the input buffer is visible and contains text, the cursor's screen
+      coordinates are computed from the cursor byte offset within the text,
+      the terminal width, and the input buffer's screen row from the viewport
+      calculation. The resulting screen row and column are stored on the REPL
+      context.
+
+      If the input buffer is visible but empty, the cursor is placed at the
+      first column of the input buffer's screen row.
+
+      If the input buffer is hidden, the cursor coordinates are left at zero.
+    </cursor-position-calculation>
+
+    <framebuffer-construction order="10">
+      A framebuffer is built by concatenating:
+      1. Hide cursor escape sequence
+      2. Home cursor escape sequence (move to row 1, column 1)
+      3. The rendered layer cake output
+      4. Erase-to-end-of-screen sequence
+      5. Either show-cursor or hide-cursor sequence depending on whether the
+         input buffer is visible
+      6. If input buffer is visible: cursor positioning escape sequence for
+         the computed row and column
+
+      The complete framebuffer is written to the terminal file descriptor in
+      a single write call. Write errors are returned unless the file
+      descriptor is -1 (headless mode).
+    </framebuffer-construction>
+
+    <framebuffer-storage order="11">
+      The previous framebuffer is freed and replaced with the newly rendered
+      one. The framebuffer length and cursor position are updated on the REPL
+      context. These values are made available to the control socket for the
+      read_framebuffer command.
+    </framebuffer-storage>
+
+    <render-timing order="12">
+      If a render-start timestamp was recorded (set when terminal input was
+      received), the elapsed time from that timestamp to the current
+      CLOCK_MONOTONIC time is computed in microseconds and stored on the REPL
+      context. The start timestamp is cleared after each measurement.
+    </render-timing>
+
+    <legacy-rendering-fallback order="13">
+      If the current agent has no layer cake (used in test mode), a combined
+      legacy renderer is invoked directly with the scrollback and viewport
+      parameters, bypassing the layer cake entirely.
+    </legacy-rendering-fallback>
+
+    <debug-info-recording order="14">
+      The viewport offset, first visible document row, viewport height, and
+      document height are stored on the REPL context for display by the debug
+      viewport layer.
+    </debug-info-recording>
+
+  </behavior>
+
+</specification>

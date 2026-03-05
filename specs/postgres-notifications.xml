@@ -1,0 +1,85 @@
+<specification topic="PostgreSQL Notifications">
+
+  <topic-statement>
+    The PostgreSQL notification subsystem subscribes to and unsubscribes from
+    named channels, sends notifications to channels, and non-blockingly
+    consumes incoming notifications delivered to the connection.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      LISTEN and UNLISTEN command execution, NOTIFY command execution,
+      connection socket file descriptor access for select()-based monitoring,
+      and non-blocking notification consumption with callback dispatch.
+    </in-scope>
+
+    <boundary name="Database Connection">
+      The underlying PostgreSQL connection is managed by the database
+      connection module. This topic uses that connection but does not manage
+      its lifecycle.
+    </boundary>
+  </scope>
+
+  <behavior>
+
+    <listen order="1">
+      Subscribes the connection to a named notification channel by executing
+      a LISTEN statement. The channel name is double-quoted in the SQL text.
+      If the query fails, an IO error is returned. On success, the connection
+      will receive notifications published on that channel.
+    </listen>
+
+    <unlisten order="2">
+      Unsubscribes the connection from a named channel by executing an
+      UNLISTEN statement. Identical error handling to the listen operation.
+      After a successful unlisten, no further notifications from that channel
+      are delivered to the connection.
+    </unlisten>
+
+    <notify order="3">
+      Sends a notification on a named channel with a payload string by
+      executing a NOTIFY statement. The channel name is double-quoted and
+      the payload is single-quoted in the SQL text. If the query fails, an IO
+      error is returned.
+
+      <notable reason="no-payload-escaping">
+        The payload is inserted into the SQL string with single quotes but
+        without escaping. A payload containing a single quote or other special
+        SQL characters will produce a malformed query.
+      </notable>
+    </notify>
+
+    <socket-file-descriptor order="4">
+      Returns the integer file descriptor of the underlying PostgreSQL
+      connection socket. This allows the caller to include the connection in
+      a select() or poll() call, enabling event-driven detection of incoming
+      notifications without busy-polling.
+    </socket-file-descriptor>
+
+    <consume-notifications order="5">
+      Processes all pending notifications on the connection in a non-blocking
+      manner:
+
+      1. Reads any available data from the connection socket without blocking.
+         If this read fails, an IO error is returned immediately.
+      2. Dequeues pending notifications one at a time. For each notification,
+         the caller-supplied callback is invoked with the channel name and
+         payload string as arguments. The notification is freed after the
+         callback returns.
+      3. Continues until no further notifications are queued.
+
+      Returns the count of notifications processed as an unsigned integer in
+      the OK result value.
+
+      <notable reason="non-blocking">
+        The consume operation does not block waiting for new notifications.
+        It only processes notifications that have already arrived on the
+        connection socket. Callers must include the connection file descriptor
+        in a select() or equivalent before calling this function to avoid
+        busy-polling.
+      </notable>
+    </consume-notifications>
+
+  </behavior>
+
+</specification>

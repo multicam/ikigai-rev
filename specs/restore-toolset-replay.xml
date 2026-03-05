@@ -1,0 +1,78 @@
+<specification topic="Restore Toolset Replay">
+
+  <topic-statement>
+    The restore toolset replay reconstructs an agent's toolset filter from
+    the database during session restoration, applying a priority cascade
+    that checks for explicit toolset commands before falling back to fork
+    event inheritance.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      The two-step toolset reconstruction priority cascade (explicit command
+      takes precedence over fork inheritance), string tokenization of the
+      stored argument string, and JSON array extraction from the fork event
+      snapshot.
+    </in-scope>
+
+    <boundary name="Toolset Filter">
+      The /toolset command that sets the filter during a live session, and
+      how the filter is applied to tool registry entries in requests, are
+      covered by the toolset filter specification.
+    </boundary>
+
+    <boundary name="Agent Restoration">
+      The broader agent restoration orchestration is covered by the agent
+      restore specification.
+    </boundary>
+  </scope>
+
+  <behavior>
+
+    <priority-cascade order="1">
+      Toolset replay queries the database for the agent's most recently
+      created explicit toolset command. If found, that command's argument
+      string is used to reconstruct the filter. If no such command exists
+      and the agent has a parent UUID, the fork event snapshot is queried
+      to inherit the toolset. If neither source exists, the toolset filter
+      remains null (all tools allowed).
+
+      <notable reason="most-recent-explicit-command-wins">
+        Only the single most recent toolset command (by creation order)
+        is replayed. Earlier toolset commands in the same session have no
+        effect on the restored state. An explicit command always takes
+        precedence over a fork event snapshot.
+      </notable>
+    </priority-cascade>
+
+    <command-tokenization order="2">
+      When an explicit toolset command is found, its stored argument string
+      is tokenized using both spaces and commas as delimiters. Each non-empty
+      token becomes one entry in the reconstructed toolset filter array. The
+      array starts with capacity 16 and doubles when exhausted.
+    </command-tokenization>
+
+    <fork-event-inheritance order="3">
+      When no explicit toolset command exists and the agent was forked (has
+      a parent UUID), the oldest fork event for this agent is queried. The
+      toolset_filter field in the event's data JSON, if present and a valid
+      array, is iterated. Each string element is appended to the agent's
+      toolset filter array.
+
+      <notable reason="oldest-fork-event">
+        The fork event lookup selects the oldest event by creation order,
+        using ascending sort with a limit of one. This is the event
+        corresponding to the agent's creation, not any subsequent events.
+      </notable>
+    </fork-event-inheritance>
+
+    <boundary-independence order="4">
+      Toolset replay is not bounded by /clear events. The most recent explicit
+      toolset command is found across the agent's entire history, including
+      commands issued before any conversation clear. This ensures the toolset
+      filter persists across clears.
+    </boundary-independence>
+
+  </behavior>
+
+</specification>

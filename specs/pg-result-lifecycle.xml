@@ -1,0 +1,51 @@
+<specification topic="PGresult Lifecycle Management">
+
+  <topic-statement>
+    The PGresult lifecycle manager wraps a PostgreSQL query result in a talloc
+    node so that it is automatically released when the enclosing talloc
+    context is freed.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Talloc wrapper creation for PGresult pointers and automatic PQclear
+      invocation via talloc destructor.
+    </in-scope>
+
+    <boundary name="Database Connection">
+      Query execution and PGresult allocation are performed by the PostgreSQL
+      client library. This topic covers only the talloc integration for
+      automatic cleanup.
+    </boundary>
+  </scope>
+
+  <behavior>
+
+    <wrapper-creation order="1">
+      A talloc node is allocated as a child of the provided context. The
+      PostgreSQL result pointer is stored in the node. A destructor is
+      registered on the node that will be invoked automatically when the node
+      or any of its ancestors is freed.
+
+      If the talloc allocation fails, the process aborts. If a null result
+      pointer is provided, the wrapper is created with a null pointer; the
+      destructor handles this safely.
+    </wrapper-creation>
+
+    <automatic-cleanup order="2">
+      When the wrapper node is freed (directly or because an ancestor context
+      is freed), the destructor calls PQclear on the stored result pointer,
+      returning the PostgreSQL library's internal memory to the C allocator.
+      The destructor then clears the stored pointer and returns zero to satisfy
+      the talloc destructor protocol.
+
+      <notable reason="null-safe">
+        The destructor checks whether the stored pointer is null before calling
+        PQclear, making it safe to create wrappers around null results without
+        risk of a null pointer dereference.
+      </notable>
+    </automatic-cleanup>
+
+  </behavior>
+
+</specification>

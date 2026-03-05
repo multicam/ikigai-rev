@@ -1,0 +1,87 @@
+<specification topic="Status Layer">
+
+  <topic-statement>
+    The status layer renders a 2-row display consisting of a horizontal
+    separator line and the agent's current model identifier with thinking level.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Status visibility determination, fixed height reporting, and rendering
+      of the separator and model/thinking-level content row.
+    </in-scope>
+
+    <boundary name="Layer Cake">
+      This topic provides three callbacks to the layer cake: visibility,
+      height, and render.
+    </boundary>
+
+    <boundary name="Agent Fields">
+      This topic holds live references (raw pointers) to three fields in the
+      agent: a boolean visibility flag, a nullable model string pointer, and
+      an integer thinking-level. Changes to these fields are reflected
+      immediately on the next render call; the layer does not cache copies.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Thinking Level Values">
+      <field name="IK_THINKING_MIN" type="integer constant"
+             note="maps to string 'min'" />
+      <field name="IK_THINKING_LOW" type="integer constant"
+             note="maps to string 'low'" />
+      <field name="IK_THINKING_MED" type="integer constant"
+             note="maps to string 'medium'" />
+      <field name="IK_THINKING_HIGH" type="integer constant"
+             note="maps to string 'high'" />
+      <field name="any other value" type="integer"
+             note="maps to string 'unknown'" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <visibility-check order="1">
+      Returns the current value of the agent's boolean visibility flag.
+      The flag is initialized to true for all newly created agents.
+    </visibility-check>
+
+    <height-reporting order="2">
+      Always returns 2 regardless of terminal width or any other input.
+    </height-reporting>
+
+    <rendering order="3">
+      The start_row and row_count parameters are ignored; both rows are always
+      written unconditionally.
+
+      <row-1-separator order="1">
+        The light horizontal box-drawing character (─, 3 bytes UTF-8) is
+        repeated for the full terminal width. An ANSI erase-to-end-of-line
+        sequence and CRLF follow.
+      </row-1-separator>
+
+      <row-2-model-status order="2">
+        A robot emoji (🤖, 4 bytes UTF-8) followed by a space is appended first.
+        Then a foreground color sequence for 256-color index 153 (soft blue)
+        is generated.
+
+        <no-model-path order="1">
+          If the agent's model pointer is null, the soft blue color sequence,
+          the literal text "(no model)", and an ANSI color reset are appended.
+        </no-model-path>
+
+        <model-set-path order="2">
+          If the agent's model pointer is non-null, the thinking-level integer
+          is converted to a string using the mapping in the data contract above.
+          The soft blue color sequence, the model string, a forward slash,
+          the thinking-level string, and an ANSI color reset are appended.
+          Example output: "claude-sonnet-4/medium".
+        </model-set-path>
+
+        An ANSI erase-to-end-of-line sequence and CRLF follow.
+      </row-2-model-status>
+    </rendering>
+
+  </behavior>
+
+</specification>

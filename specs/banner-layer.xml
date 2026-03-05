@@ -1,0 +1,105 @@
+<specification topic="Banner Layer">
+
+  <topic-statement>
+    The banner layer renders a fixed 6-row ASCII art decorative display with
+    a version identifier and tagline at the top of the terminal.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Banner visibility determination, fixed height reporting, and row-by-row
+      rendering with ANSI 256-color sequences and Unicode box-drawing characters.
+    </in-scope>
+
+    <boundary name="Layer Cake">
+      This topic provides three callbacks to the layer cake: visibility,
+      height, and render. The layer cake controls when these are invoked and
+      how viewport clipping is applied.
+    </boundary>
+
+    <boundary name="Agent Visibility Flag">
+      This topic reads a boolean flag owned by the agent. The flag is
+      initialized to true and this topic never modifies it.
+    </boundary>
+
+    <boundary name="Output Buffer">
+      This topic appends bytes to an externally managed output buffer. Buffer
+      growth and memory management are handled externally.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Render Input">
+      <field name="width" type="numeric" note="terminal width in columns" />
+      <field name="start_row" type="numeric"
+             note="first visible row index for viewport clipping" />
+      <field name="row_count" type="numeric"
+             note="number of rows to render from start_row" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <visibility-check order="1">
+      Returns the current value of the externally owned boolean flag. The flag
+      is true by default for all newly created agents.
+    </visibility-check>
+
+    <height-reporting order="2">
+      Always returns 6 regardless of terminal width or any other input. The
+      banner occupies exactly 6 rows at all times.
+    </height-reporting>
+
+    <rendering order="3">
+      Each of the 6 rows is independently conditioned on whether its row index
+      falls within the range [start_row, start_row + row_count). Rows outside
+      this range produce no output. ANSI 256-color foreground escape sequences
+      are generated at the start of each render call and reused across rows.
+      Every row ends with an ANSI erase-to-end-of-line sequence and CRLF.
+
+      <row-0-top-border order="1">
+        Foreground color 245 (dim gray). The double horizontal box-drawing
+        character (═, 3 bytes UTF-8) is repeated for the full terminal width.
+      </row-0-top-border>
+
+      <row-1-upper-eye-sockets order="2">
+        Foreground color 81 (cyan). One space followed by two pairs of rounded
+        box tops: ╭─╮╭─╮ (rounded-corner + horizontal + rounded-corner,
+        repeated twice).
+      </row-1-upper-eye-sockets>
+
+      <row-2-face-with-pupils-and-version order="3">
+        This row uses multiple color segments with resets between them:
+        - Left ear: coral/pink (color 211), character '(' with reset
+        - Left eye left border: cyan (color 81) with reset
+        - Left pupil: amber/gold (color 214), filled circle (●) with reset
+        - Left eye right border: cyan (color 81), vertical bar with reset
+        - Right eye left border: cyan (color 81), vertical bar with reset
+        - Right pupil: amber/gold (color 214), filled circle (●) with reset
+        - Right eye right border: cyan (color 81), vertical bar with reset
+        - Right ear: coral/pink (color 211), character ')' with reset
+        - Four spaces
+        - Version label: soft blue (color 153), the literal text "Ikigai v"
+          followed by the build version string
+      </row-2-face-with-pupils-and-version>
+
+      <row-3-lower-eye-sockets-and-tagline order="4">
+        Eye lids in cyan (color 81): one space followed by two pairs of rounded
+        box bottoms: ╰─╯╰─╯. Five spaces. Tagline in light gray (color 250):
+        the literal text "Agentic Orchestration" (21 characters).
+      </row-3-lower-eye-sockets-and-tagline>
+
+      <row-4-chin order="5">
+        Coral/pink (color 211): two spaces followed by ╰──╯ (rounded-corner +
+        two horizontals + rounded-corner).
+      </row-4-chin>
+
+      <row-5-bottom-border order="6">
+        Identical to row 0: dim gray (color 245), double horizontal character
+        (═) repeated for the full terminal width.
+      </row-5-bottom-border>
+    </rendering>
+
+  </behavior>
+
+</specification>

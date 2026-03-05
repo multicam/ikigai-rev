@@ -1,0 +1,69 @@
+<specification topic="Database Session Management">
+
+  <topic-statement>
+    The database session management module creates new session records and
+    retrieves the most recently started active session from the sessions table.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Session record insertion with database-generated ID retrieval, and
+      active session lookup with tiebreaking.
+    </in-scope>
+
+    <boundary name="Database Connection">
+      The underlying PostgreSQL connection and query execution are managed
+      externally. This topic only specifies the SQL operations and result
+      handling.
+    </boundary>
+
+    <boundary name="Session Startup">
+      When sessions are created and how they are used during application
+      startup is covered by the session startup specification.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Session Record">
+      <field name="id" type="integer" note="database-generated serial identifier" />
+      <field name="started_at" type="timestamp" note="set to the current time by the database on insert" />
+      <field name="ended_at" type="timestamp or null" note="null for active sessions; set when the session ends" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <session-creation order="1">
+      Inserts a new row into the sessions table using default column values,
+      causing the database to populate the started_at timestamp with the
+      current time and ended_at with null. The generated session ID is
+      retrieved in the same query using a RETURNING clause.
+
+      The returned ID string is parsed as a decimal 64-bit signed integer.
+      If the query returns no rows, the process aborts (this would indicate
+      an internal database invariant violation). The session ID is returned
+      to the caller.
+    </session-creation>
+
+    <active-session-lookup order="2">
+      Queries for the most recently started session whose ended_at column is
+      null. Results are ordered by started_at descending, with the session ID
+      used as a secondary sort key to break ties among sessions created in the
+      same database transaction.
+
+      If no rows are returned, the output session ID is set to zero and
+      success is returned. A session ID of zero is the sentinel indicating
+      that no active session was found.
+
+      If the query returns multiple rows, only the first row (the most recent)
+      is used. The remaining rows are ignored without error.
+
+      <notable reason="zero-as-sentinel">
+        The caller must distinguish session ID zero (no active session) from a
+        valid session ID. Zero is never a valid database-generated session ID.
+      </notable>
+    </active-session-lookup>
+
+  </behavior>
+
+</specification>

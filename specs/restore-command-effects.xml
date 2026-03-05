@@ -1,0 +1,79 @@
+<specification topic="Restore Command Side-Effect Replay">
+
+  <topic-statement>
+    The restore command side-effect replay applies the observable consequences
+    of model-change and fork events to in-memory agent state during scrollback
+    reconstruction, keeping provider configuration and pinned documents
+    synchronized with the replayed display output.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Model command effect application (provider and model field update,
+      provider instance invalidation) and fork event pin/toolset extraction
+      during scrollback replay.
+    </in-scope>
+
+    <boundary name="Agent Restoration">
+      The broader agent restoration orchestration — including pin replay,
+      toolset replay, mark restoration, and token cache pruning — is covered
+      by the agent restore specification.
+    </boundary>
+
+    <boundary name="Restore Pin Replay">
+      The full pin replay pass (replaying all pin/unpin command events from
+      the database across clear boundaries) is covered by the restore pin
+      replay specification.
+    </boundary>
+  </scope>
+
+  <behavior>
+
+    <invocation order="1">
+      This replay step is invoked for each event in the scrollback
+      reconstruction pass. Only two event kinds trigger side effects:
+      "command" events of type "model" and "fork" events with role "child".
+      All other event kinds are ignored.
+    </invocation>
+
+    <model-command-effect order="2">
+      When a model-change command event is encountered, the effect is
+      applied to the agent's in-memory configuration:
+
+      1. The stored argument string is extracted from the event's data JSON.
+      2. The provider is inferred from the model name in the argument string.
+      3. The agent's provider field is updated to the inferred provider.
+      4. The agent's model field is updated to the model name.
+      5. The provider instance is invalidated (set to null) so a fresh
+         connection will be created on the next LLM request.
+
+      If the event's data JSON cannot be parsed or the argument field is
+      absent, no side effect is applied and the event is silently skipped.
+    </model-command-effect>
+
+    <fork-event-effect order="3">
+      When a child-role fork event is encountered, the agent's pinned
+      document list and toolset filter are rebuilt from the event's snapshot:
+
+      1. The pinned_paths JSON array is extracted from the event data.
+      2. Any existing pinned document list on the agent is cleared.
+      3. Each string in the pinned_paths array is appended to the agent's
+         pinned list.
+      4. The toolset_filter JSON array is extracted from the event data.
+      5. Each string in the toolset_filter array is appended to the agent's
+         toolset filter.
+
+      If the event's data JSON cannot be parsed, no changes are applied
+      and the event is silently skipped.
+
+      <notable reason="fork-event-overwrites-earlier-state">
+        Each fork event encountered during replay completely replaces the
+        agent's pinned documents and toolset filter. Because events are
+        replayed in chronological order, only the effects of the most recent
+        fork event survive when the replay pass is complete.
+      </notable>
+    </fork-event-effect>
+
+  </behavior>
+
+</specification>

@@ -1,0 +1,80 @@
+<specification topic="Restore Pin Replay">
+
+  <topic-statement>
+    The restore pin replay reconstructs an agent's pinned document list from
+    database events during session restoration, starting from the fork
+    snapshot and then replaying all subsequent pin and unpin commands in
+    chronological order.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Fork event pinned-path snapshot loading, chronological pin/unpin
+      command replay, duplicate detection on pin, compaction on unpin, and
+      the independence of pin replay from conversation clear boundaries.
+    </in-scope>
+
+    <boundary name="Pinned Documents">
+      The /pin and /unpin commands that modify the list during a live session,
+      and how the pinned list is used to assemble the system prompt, are
+      covered by the pinned documents specification.
+    </boundary>
+
+    <boundary name="Agent Restoration">
+      The broader agent restoration orchestration is covered by the agent
+      restore specification.
+    </boundary>
+  </scope>
+
+  <behavior>
+
+    <fork-snapshot-load order="1">
+      Before replaying individual pin/unpin commands, the agent's fork event
+      is queried to obtain the initial pinned document snapshot. This snapshot
+      represents the parent's pinned list at the moment of forking. Each path
+      in the fork event's pinned_paths JSON array is appended to the agent's
+      pinned list.
+
+      For the root agent, the fork event contains the default initial pinned
+      paths established at database initialization. For forked agents, it
+      reflects the parent's state at fork time.
+    </fork-snapshot-load>
+
+    <command-replay order="2">
+      All pin and unpin command events for the agent are queried and sorted
+      in chronological order. Each event is processed in turn:
+
+      <pin-event order="1">
+        A pin command event adds the stored path to the pinned list. Before
+        adding, the existing list is searched for an exact match. If the
+        path is already present (due to fork snapshot or an earlier pin
+        command), it is not added again. If absent, it is appended and the
+        array reallocated to exact size.
+      </pin-event>
+
+      <unpin-event order="2">
+        An unpin command event removes the stored path from the pinned list.
+        A linear search by exact string match locates the entry. If found,
+        the entry is freed, subsequent entries are shifted to fill the gap,
+        and the array is reallocated to the new exact size. If not found,
+        the event is silently ignored.
+      </unpin-event>
+    </command-replay>
+
+    <boundary-independence order="3">
+      Pin and unpin commands are replayed across the agent's entire event
+      history, regardless of any /clear events that may have occurred. This
+      makes the pinned document list persistent across conversation clears
+      and session restarts.
+
+      <notable reason="cross-clear-persistence">
+        Unlike conversation messages (which are bounded by the most recent
+        /clear), pinned document state accumulates all pin and unpin commands
+        ever issued for the agent. A document pinned before a /clear remains
+        pinned after the /clear.
+      </notable>
+    </boundary-independence>
+
+  </behavior>
+
+</specification>

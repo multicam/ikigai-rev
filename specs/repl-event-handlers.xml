@@ -1,0 +1,183 @@
+<specification topic="REPL Event Handlers">
+
+  <topic-statement>
+    The REPL event handler system drives the select-based event loop by
+    processing terminal input, HTTP completion events, and timer events to
+    advance agent state and update the display.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Select timeout calculation, file descriptor set population, terminal
+      byte reading and action dispatch, HTTP completion event processing per
+      agent (including success, error, and interrupt paths), assistant message
+      persistence, tool loop continuation, select timeout handling for scroll
+      detector flushing, and minimum curl timeout calculation.
+    </in-scope>
+
+    <boundary name="Input Action Dispatcher">
+      Terminal bytes are parsed and dispatched by calling the action
+      dispatcher. Action handling behavior is external to this topic.
+    </boundary>
+
+    <boundary name="Provider vtable">
+      HTTP I/O is driven by calling the provider's perform, info_read, fdset,
+      and timeout operations. Stream and completion callbacks registered
+      earlier fire during info_read. The internal mechanics are external to
+      this topic.
+    </boundary>
+
+    <boundary name="Database">
+      Agent idle flag, message persistence, and LISTEN/NOTIFY broadcasts
+      are performed via database helpers. Errors are silently ignored.
+    </boundary>
+
+    <boundary name="Response Helpers">
+      Rendering individual scrollback events, storing response metadata,
+      rendering usage events, and extracting tool calls are handled by
+      external helpers called during request success processing.
+    </boundary>
+  </scope>
+
+  <behavior>
+
+    <select-timeout-calculation order="1">
+      The minimum positive timeout in milliseconds is chosen from:
+      - 80 ms if the current agent's spinner is visible
+      - 50 ms if any agent is in EXECUTING_TOOL state (agent states read atomically)
+      - The scroll detector's pending-flush window (if a scroll detector exists)
+      - The caller-supplied curl recommended timeout
+
+      If all candidate values are negative (none applicable), 1000 ms is used.
+      Agent states are read atomically to avoid data races.
+    </select-timeout-calculation>
+
+    <fd-set-population order="2">
+      All three fd_sets (read, write, except) are zeroed. The terminal file
+      descriptor is added to the read set if it is non-negative. The control
+      socket adds its own descriptors via its own helper. For each agent with
+      an active provider, that provider's fdset operation populates the sets.
+      The highest file descriptor number seen is reported. If any provider's
+      fdset operation returns an error, the function returns that error without
+      processing remaining agents.
+    </fd-set-population>
+
+    <terminal-input-handling order="3">
+      One byte is read from the terminal file descriptor. If the read is
+      interrupted by a signal (EINTR), the function returns success. If the
+      read returns zero or a negative value not due to a signal, the exit flag
+      is set to true and the function returns success (signaling normal
+      shutdown).
+
+      On a successful byte read, the current CLOCK_MONOTONIC time is recorded
+      as the render start timestamp. The byte is fed to the input parser to
+      produce an action. The action is dispatched. If the action type is not
+      unknown, a full frame render is triggered.
+    </terminal-input-handling>
+
+    <curl-event-processing order="4">
+      For each agent in the agents array, HTTP completion events are processed.
+      After processing the array, the current agent is processed again (to
+      handle cases where it may not be in the array).
+
+      <per-agent-http-processing order="1">
+        If the agent has no active HTTP request or no provider, processing is
+        skipped.
+
+        The previous in-flight count is saved, then the provider's perform
+        operation drives HTTP I/O and updates the in-flight count. The
+        provider's info_read operation processes any completed transfers
+        (invoking the registered completion callback for each).
+
+        If the in-flight count is still positive or it was already zero before
+        the call, no request has just completed — the function returns.
+
+        If the agent's state is not WAITING_FOR_LLM (read atomically), the
+        function returns without handling the completion.
+      </per-agent-http-processing>
+
+      <interrupt-path order="2">
+        If the agent's interrupt-requested flag is true, interrupted LLM
+        completion handling runs:
+        - The interrupt flag is cleared.
+        - Any partial assistant response and error message are freed.
+        - The message array is scanned backward to find the most recent
+          user message. All messages from that point forward are marked as
+          interrupted.
+        - The scrollback is cleared and rebuilt by re-rendering every message
+          in order.
+        - An "interrupted" record is persisted to the database.
+        - The agent transitions to IDLE and the idle notification is broadcast.
+        - If the agent is the current agent, a frame render is triggered.
+      </interrupt-path>
+
+      <error-path order="3">
+        If an HTTP error message is present on the agent, it is prepended with
+        "Error: " and appended to the scrollback as a single line. Both the
+        error message and any partial assistant response are freed and set to
+        null. Error messages are not persisted to the database.
+      </error-path>
+
+      <success-path order="4">
+        If no error message is present:
+
+        <assistant-message-storage order="1">
+          If the agent has a non-empty assistant response string, a text
+          message with assistant role is created and added to the in-memory
+          conversation. The response is then persisted to the database as an
+          "assistant" message with metadata (provider, model, thinking level,
+          finish reason). If token counts are positive, a "usage" record is
+          also persisted. Database errors are silently ignored.
+        </assistant-message-storage>
+
+        <response-buffer-free order="2">
+          The assistant response string is freed and set to null.
+        </response-buffer-free>
+
+        <tool-call-branch order="3">
+          If a pending tool call exists on the agent, tool execution is started
+          and processing returns without continuing to the tool-loop check.
+        </tool-call-branch>
+
+        <tool-loop-continuation order="4">
+          If the tool loop should continue (checked against max iterations and
+          finish reason), the tool iteration counter is incremented and a
+          continuation request is submitted to the provider.
+        </tool-loop-continuation>
+      </success-path>
+
+      <post-completion-state-transition order="5">
+        If the agent's state is still WAITING_FOR_LLM after success or error
+        handling:
+        - Token counts are recorded and the cache is pruned (on success only).
+        - The agent transitions to IDLE.
+        - The idle flag is updated in the database and the idle notification
+          is broadcast.
+        If the agent is the current agent, a frame render is triggered.
+      </post-completion-state-transition>
+    </curl-event-processing>
+
+    <select-timeout-event-handling order="5">
+      If a scroll detector exists, the current CLOCK_MONOTONIC time is read.
+      The scroll detector's timeout check is called. If the result is a
+      pending arrow-up, the arrow-up viewport action is triggered and a frame
+      render follows. If the result is a pending arrow-down, the same for
+      arrow-down.
+    </select-timeout-event-handling>
+
+    <curl-timeout-calculation order="6">
+      All agents with active providers are queried for their recommended HTTP
+      timeout. The minimum non-negative value across all agents is returned.
+      If no agents have active providers, -1 is returned (no timeout needed).
+    </curl-timeout-calculation>
+
+    <idle-notification order="7">
+      After any completion (success, error, or interrupt), if a database
+      context is present, the agent's idle flag is set to true in the database
+      and a notification is broadcast on the channel "agent_event_{uuid}"
+      with the payload "idle". Errors are silently ignored.
+    </idle-notification>
+
+  </behavior>
+
+</specification>

@@ -1,0 +1,168 @@
+<specification topic="Escape Sequence Parser">
+
+  <topic-statement>
+    The escape sequence parser translates raw ANSI CSI byte sequences received
+    from the terminal into semantic input actions, recognising arrow keys, mouse
+    scroll events, function keys, and keyboard shortcuts.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Recognition of plain arrow keys, modifier-qualified arrow keys (Ctrl),
+      mouse SGR scroll events, CSI u encoded keys, tilde-terminated function
+      keys, and Home/End keys; the escape byte buffer and overflow handling.
+    </in-scope>
+
+    <boundary name="Input Parser">
+      The main input parser routes raw bytes to this module once an ESC byte
+      has been seen. Initial ESC detection and UTF-8 decoding are handled by
+      the caller.
+    </boundary>
+
+    <boundary name="Keyboard Layout Translator">
+      Shifted-key codepoint translation for CSI u sequences is delegated to
+      the keyboard layout translator. This module passes through the result.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Escape Buffer">
+      <field name="capacity" type="integer" note="16 bytes; buffer overflow resets state and emits UNKNOWN" />
+      <field name="position" type="non-negative integer" note="zero-based byte count of currently buffered bytes" />
+    </contract>
+
+    <contract name="Action Output">
+      <field name="type" type="enumeration" note="one of the semantic action identifiers below" />
+      <field name="codepoint" type="unicode scalar" note="set only for CHAR actions" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <buffer-management order="1">
+      Each byte of the escape sequence is appended to a 16-byte circular
+      buffer. If the buffer reaches 16 bytes and the sequence has not been
+      resolved, the state is reset and UNKNOWN is emitted. This prevents the
+      parser from becoming stuck on unrecognised or malformed sequences.
+
+      On any resolved or unresolvable sequence the buffer position and
+      in-escape flag are reset before returning.
+    </buffer-management>
+
+    <plain-arrow-keys order="2">
+      Two-byte sequences of the form ESC [ followed by A, B, C, or D are
+      recognised as arrow keys.
+
+      - A → ARROW_UP
+      - B → ARROW_DOWN
+      - C → ARROW_RIGHT
+      - D → ARROW_LEFT
+    </plain-arrow-keys>
+
+    <modified-arrow-keys order="3">
+      Five-byte sequences of the form ESC [ 1 ; M followed by A, B, C, or D
+      are recognised as modifier-qualified arrow keys. The modifier byte M is
+      masked with ~128 to remove the NumLock bit.
+
+      Modifier value 5 (Ctrl) maps the arrow to navigation actions:
+      - Up → NAV_PARENT (navigate to parent agent)
+      - Down → NAV_CHILD (navigate to most recent child agent)
+      - Left → NAV_PREV_SIBLING
+      - Right → NAV_NEXT_SIBLING
+
+      Modifier value 1 (no modifier) maps to the plain arrow actions.
+      Other modifier values emit UNKNOWN.
+    </modified-arrow-keys>
+
+    <mouse-sgr-scroll order="4">
+      Sequences of the form ESC [ &lt; ... M or ESC [ &lt; ... m are the SGR
+      mouse protocol. The button code is extracted from the numeric field
+      between the `&lt;` character and the first `;`.
+
+      - Button 64 → SCROLL_UP
+      - Button 65 → SCROLL_DOWN
+      - All other button codes → UNKNOWN
+
+      Both M (button press) and m (button release) terminators are accepted
+      for the scroll actions.
+    </mouse-sgr-scroll>
+
+    <csi-u-encoded-keys order="5">
+      Sequences ending with `u` of the form ESC [ keycode ; modifiers u are
+      the CSI u extended keyboard protocol. The keycode and modifier are
+      extracted as decimal integers. The modifier is masked with ~128 to
+      remove the NumLock bit.
+
+      Keycodes greater than 50000 are rejected as UNKNOWN.
+
+      With modifier value 1 (no modifier):
+      - Keycode 13 → NEWLINE
+      - Keycode 9 → TAB
+      - Keycode 127 → BACKSPACE
+      - Keycode 27 → ESCAPE
+      - Keycodes 32–126 (printable ASCII) → CHAR with that codepoint
+      - Keycodes 128–1114111 (Unicode range) → CHAR with that codepoint
+      - All other keycodes → UNKNOWN
+
+      With modifier value 2 (Shift):
+      - Keycodes 32–126 → CHAR with the shifted codepoint produced by the
+        keyboard layout translator; if translation fails, the original
+        codepoint is used
+
+      With modifier value 5 (Ctrl):
+      - Keycode 99 (c) → CTRL_C
+      - Keycode 97 (a) → CTRL_A
+      - Keycode 101 (e) → CTRL_E
+      - Keycode 107 (k) → CTRL_K
+      - Keycode 110 (n) → CTRL_N
+      - Keycode 112 (p) → CTRL_P
+      - Keycode 117 (u) → CTRL_U
+      - Keycode 119 (w) → CTRL_W
+      - All other keycodes → UNKNOWN
+
+      With modifier value other than 1, 2, or 5:
+      - Any keycode with modifier 13 (Enter with modifier) → INSERT_NEWLINE
+
+      Other modifier values produce UNKNOWN.
+    </csi-u-encoded-keys>
+
+    <tilde-function-keys order="6">
+      Sequences ending with `~` are tilde-terminated function keys. A single
+      numeric key code precedes the tilde.
+
+      - Code 1 → CTRL_A (Home)
+      - Code 3 → DELETE (forward delete)
+      - Code 4 → CTRL_E (End)
+      - Code 5 → PAGE_UP
+      - Code 6 → PAGE_DOWN
+      - All other codes → UNKNOWN
+    </tilde-function-keys>
+
+    <home-end-keys order="7">
+      Sequences of the form ESC [ H or ESC [ F:
+      - H → CTRL_A (line start)
+      - F → CTRL_E (line end)
+
+      Modified forms ESC [ 1 ; M H and ESC [ 1 ; M F are also recognised;
+      the modifier value is validated but not used — H and F always produce
+      CTRL_A and CTRL_E respectively.
+    </home-end-keys>
+
+    <discardable-sequences order="8">
+      Some CSI sequences are recognised as known-uninteresting and silently
+      discarded:
+      - Byte `m` when one or more bytes are buffered (SGR colour/formatting)
+      - Three-byte sequences ending with `~` for unknown function key codes
+
+      These emit UNKNOWN without further processing.
+
+      <notable reason="NumLock-bit-masking">
+        Modifier bytes in modified arrow keys and CSI u sequences are always
+        masked with ~128 before comparison. This normalises input across
+        terminals that set the high bit to indicate NumLock state.
+      </notable>
+    </discardable-sequences>
+
+  </behavior>
+
+</specification>

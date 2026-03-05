@@ -1,0 +1,107 @@
+<specification topic="Agent Registry">
+
+  <topic-statement>
+    The agent registry maintains the in-memory array of active agents and
+    provides add, remove, and lookup operations over that array.
+  </topic-statement>
+
+  <scope>
+    <in-scope>
+      Adding agents to the array with dynamic capacity growth, removing agents
+      by exact UUID, finding agents by exact or prefix UUID match, and checking
+      whether a UUID prefix matches multiple agents.
+    </in-scope>
+
+    <boundary name="Agent Records">
+      This topic stores pointers to agent records and reads their UUID field
+      for lookup. It does not manage agent lifecycle, memory allocation of the
+      agents themselves, or database persistence.
+    </boundary>
+
+    <boundary name="Navigation">
+      Switching between agents and updating the navigation display context
+      are handled separately. This topic only manages the array contents.
+    </boundary>
+  </scope>
+
+  <data-contracts>
+    <contract name="Agent Record (registry-relevant fields)">
+      <field name="uuid" type="text" note="full UUID string" />
+    </contract>
+
+    <contract name="Find Result">
+      <field name="agent" type="pointer" nullable="true"
+             note="null if not found, ambiguous, or prefix too short" />
+    </contract>
+  </data-contracts>
+
+  <behavior>
+
+    <adding-an-agent order="1">
+      If the current agent count equals the current capacity, the array is
+      resized before insertion:
+      - If capacity is zero, the new capacity is set to 4.
+      - Otherwise, the capacity doubles.
+
+      If the resize allocation fails, the process aborts immediately (no error
+      is returned). After ensuring capacity, the agent pointer is appended to
+      the array and the count is incremented. This operation never returns an
+      error.
+    </adding-an-agent>
+
+    <removing-an-agent order="2">
+      The array is scanned linearly using exact string comparison against each
+      agent's UUID. If no match is found, an AGENT_NOT_FOUND error is returned
+      with the requested UUID included in the message.
+
+      If a match is found:
+      - If the matched agent is the current agent, the current pointer is set
+        to null.
+      - All agents after the matched index are shifted down by one position
+        (compaction preserving order).
+      - The count is decremented.
+
+      <notable reason="null current hazard">
+        If the removed agent was the current agent, the REPL's current agent
+        pointer becomes null after this operation. No automatic switch to
+        another agent occurs. Any subsequent access to the current agent by
+        a caller that does not check for null will dereference a null pointer.
+        Callers are responsible for detecting and resolving this state.
+      </notable>
+    </removing-an-agent>
+
+    <finding-an-agent-by-uuid-prefix order="3">
+      If the prefix length is less than 4 characters, null is returned
+      immediately.
+
+      Otherwise, a first pass scans the array for an exact match using full
+      string comparison. If an exact match is found, it is returned
+      immediately without proceeding to prefix matching.
+
+      If no exact match exists, a second pass scans for prefix matches using
+      a comparison bounded to the prefix length. The number of matches is
+      counted:
+      - If exactly one match is found after the full scan, it is returned.
+      - If a second match is found during scanning, null is returned
+        immediately (ambiguous prefix).
+      - If no matches are found, null is returned.
+    </finding-an-agent-by-uuid-prefix>
+
+    <checking-prefix-ambiguity order="4">
+      If the prefix length is less than 4 characters, returns false.
+
+      Otherwise, counts all agents whose UUID begins with the prefix. If two
+      or more matches are found, returns true immediately. Returns false if
+      fewer than two agents match.
+
+      <notable reason="short-prefix semantics">
+        A prefix shorter than 4 characters returns false (not ambiguous)
+        rather than an error. Callers that rely on ambiguity detection must
+        separately validate that the prefix meets the minimum length before
+        interpreting a false result as "unambiguous."
+      </notable>
+    </checking-prefix-ambiguity>
+
+  </behavior>
+
+</specification>
